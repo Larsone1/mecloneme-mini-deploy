@@ -1,20 +1,18 @@
 import asyncio, json, time, os, base64
-from typing import List, Dict, Any
-from fastapi import WebSocket, WebSocketDisconnect
-from pydantic import BaseModel
-
-def b64u_decode(s: str) -> bytes:
-    s += "=" * (-len(s) % 4)
-    return base64.urlsafe_b64decode(s.encode())
-
-def b64u_encode(b: bytes) -> str:
-    return base64.urlsafe_b64encode(b).decode().rstrip("=")
-
+from typing import List, Dict, Any, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-import os, time, json, asyncio, base64, hashlib
+
+from nacl.signing import VerifyKey
+from nacl.exceptions import BadSignatureError
+
+def b64u_encode(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).decode().rstrip("=")
+
+def b64u_decode(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
 # ---- Ed25519 (NaCl)
 from nacl.signing import VerifyKey
