@@ -2,3 +2,4 @@ fastapi
 uvicorn[standard]
 pydantic
 pynacl
+websockets>=10,<13
