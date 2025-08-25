@@ -79,7 +79,11 @@ class VerifyReq(BaseModel):
     jws: str
 
 @app.post("/guardian/verify")
-def guardian_verify(req: VerifyReq):
+async def guardian_verify(req: VerifyReq):
+    ...
+    # jeżeli wysyłasz coś do live logu:
+    await ws_manager.broadcast({"ts": int(time.time()), "kid": req.kid, "vec": payload["vec"]})
+    return {"ok": True, "aud": "mobile"}
     """
     Oczekujemy compact JWS: header.payload.signature (base64url),
     gdzie alg=EdDSA i podpis to Ed25519.
