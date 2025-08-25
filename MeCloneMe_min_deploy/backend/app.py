@@ -151,34 +151,32 @@ def register_pubkey(req: PubReq):
     PUBKEYS[req.kid] = req.pub
     return {"ok": True, "registered": list(PUBKEYS.keys())}
 
-# ---- WebSocket + ingest (jak wcześniej)
+# --- WebSocket manager (prosta wersja bez locka)
 class WSManager:
     def __init__(self):
         self.active = []
-        self.lock = asyncio.Lock()
 
     async def connect(self, ws: WebSocket):
         await ws.accept()
-        async with self.lock:
-            self.active.append(ws)
+        self.active.append(ws)
 
     async def disconnect(self, ws: WebSocket):
-        async with self.lock:
-            if ws in self.active:
-                self.active.remove(ws)
+        if ws in self.active:
+            self.active.remove(ws)
 
     async def broadcast(self, data: dict):
         text = json.dumps(data)
-        dead = []
+        stale = []
         for ws in list(self.active):
             try:
                 await ws.send_text(text)
             except Exception:
-                dead.append(ws)
-        for ws in dead:
+                stale.append(ws)
+        for ws in stale:
             await self.disconnect(ws)
 
 ws_manager = WSManager()
+
 
 @app.websocket("/shadow/ws")
 async def shadow_ws(ws: WebSocket):
