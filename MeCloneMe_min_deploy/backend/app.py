@@ -51,7 +51,7 @@ class ChallengeResp(BaseModel):
 
 # prosta „pamięć” nounce → expiry (60s)
 NONCES = {}
-NONCE_TTL = 60
+NONCE_TTL = 180
 
 @app.get("/auth/challenge", response_model=ChallengeResp)
 def challenge(aud: str = "mobile"):
