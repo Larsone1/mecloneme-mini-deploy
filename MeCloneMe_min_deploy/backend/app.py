@@ -200,3 +200,120 @@ async def shadow_ingest(frame: ShadowFrame):
     await ws_manager.broadcast(frame.dict())
     return {"ok": True}
 
+@app.get("/mobile")
+def mobile_page():
+    return HTMLResponse("""
+<!doctype html>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Guardian – Mobile Signer</title>
+<style>
+  body{font-family:ui-sans-serif,system-ui;margin:16px;line-height:1.4}
+  h1{font-size:20px;margin:0 0 12px}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .card{border:1px solid #eee;border-radius:12px;padding:12px}
+  textarea,input,button{width:100%;padding:8px;border:1px solid #ddd;border-radius:8px}
+  pre{background:#f7f7f7;border:1px solid #eee;border-radius:8px;padding:8px;white-space:pre-wrap}
+  .muted{color:#666;font-size:12px}
+</style>
+<h1>Guardian — Mobile Signer</h1>
+
+<div class="row">
+  <div class="card">
+    <b>1) Klucz prywatny (PRIV, seed 32B)</b>
+    <input id="kid" placeholder="kid" value="dev-key-1" style="margin:8px 0">
+    <textarea id="priv" rows="3" placeholder="Wklej PRIV z terminala"></textarea>
+    <div class="muted">PRIV to seed 32B w base64url (z terminala). Strona zapisuje go lokalnie w przeglądarce.</div>
+    <button id="save" style="margin-top:8px">💾 Zapisz w przeglądarce</button>
+  </div>
+  <div class="card">
+    <b>2) Rejestracja PUB</b>
+    <button id="register">📡 Zarejestruj PUB na serwerze</button>
+    <pre id="regOut"></pre>
+  </div>
+</div>
+
+<div class="row" style="margin-top:12px">
+  <div class="card">
+    <b>3) Challenge</b>
+    <button id="getCh">🎯 Pobierz /auth/challenge</button>
+    <pre id="chOut"></pre>
+  </div>
+  <div class="card">
+    <b>4) Podpisz JWS i zweryfikuj</b>
+    <button id="verify">🔐 Podpisz &amp; /guardian/verify</button>
+    <pre id="verOut"></pre>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/tweetnacl@1.0.3/nacl.min.js"></script>
+<script>
+const enc = new TextEncoder(), dec = new TextDecoder();
+const b64u = b => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');
+const fromB64u = s => {
+  s = s.replace(/-/g,'+').replace(/_/g,'/'); while(s.length%4) s+='=';
+  const bin = atob(s), out = new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) out[i]=bin.charCodeAt(i); return out;
+};
+
+const LS_KEY = "guardian_priv_seed";
+const $ = id => document.getElementById(id);
+$("priv").value = localStorage.getItem(LS_KEY)||"";
+
+$("save").onclick = () => {
+  localStorage.setItem(LS_KEY, $("priv").value.trim());
+  alert("Zapisano PRIV w przeglądarce.");
+};
+
+function getKeypair(){
+  const seed = $("priv").value.trim();
+  if(!seed) throw new Error("Brak PRIV");
+  const seedBytes = fromB64u(seed);           // 32B
+  if(seedBytes.length !== 32) throw new Error("PRIV musi być 32B (base64url)");
+  return nacl.sign.keyPair.fromSeed(seedBytes); // {publicKey(32B), secretKey(64B)}
+}
+
+$("register").onclick = async () => {
+  try{
+    const kp = getKeypair();
+    const pubB64u = b64u(kp.publicKey);
+    const kid = $("kid").value.trim() || "dev-key-1";
+    const resp = await fetch("/admin/register_pubkey", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({kid, pub: pubB64u})
+    });
+    $("regOut").textContent = await resp.text();
+  }catch(e){ $("regOut").textContent = "ERR: "+e.message; }
+};
+
+let lastChallenge = null;
+$("getCh").onclick = async () => {
+  const r = await fetch("/auth/challenge");
+  lastChallenge = await r.json();
+  $("chOut").textContent = JSON.stringify(lastChallenge,null,2);
+};
+
+$("verify").onclick = async () => {
+  try{
+    if(!lastChallenge) throw new Error("Najpierw pobierz challenge.");
+    const kid = $("kid").value.trim() || "dev-key-1";
+    const hdr = {alg:"EdDSA",typ:"JWT",kid};
+    const pld = {aud:lastChallenge.aud, nonce:lastChallenge.nonce, ts: Math.floor(Date.now()/1000)};
+
+    const h_b = b64u(enc.encode(JSON.stringify(hdr)));
+    const p_b = b64u(enc.encode(JSON.stringify(pld)));
+    const msg = enc.encode(h_b+"."+p_b);
+
+    const kp = getKeypair();
+    const sig = nacl.sign.detached(msg, kp.secretKey);
+    const jws = h_b+"."+p_b+"."+b64u(sig);
+
+    const r = await fetch("/guardian/verify", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({jws})
+    });
+    $("verOut").textContent = await r.text();
+  }catch(e){ $("verOut").textContent = "ERR: "+e.message; }
+};
+</script>
+""")
