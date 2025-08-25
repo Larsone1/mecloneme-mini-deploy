@@ -51,7 +51,7 @@ class ChallengeResp(BaseModel):
 
 # prosta „pamięć” nounce → expiry (60s)
 NONCES = {}
-NONCE_TTL = 180
+NONCE_TTL = int(os.getenv("NONCE_TTL", "300"))  # 300s = 5 min
 
 @app.get("/auth/challenge", response_model=ChallengeResp)
 def challenge(aud: str = "mobile"):
@@ -111,8 +111,8 @@ def guardian_verify(req: VerifyReq):
 
         # proste sprawdzenia aplikacyjne
         now = int(time.time())
-        if abs(now - int(payload.get("ts", 0))) > 120:
-            return {"ok": False, "reason": "stale-ts"}
+        if abs(int(time.time()) - int(payload["ts"])) > NONCE_TTL:
+    return {"ok": False, "reason": "nonce-expired"}
 
         aud = payload.get("aud")
         nonce = payload.get("nonce")
