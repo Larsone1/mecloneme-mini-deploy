@@ -1,3 +1,16 @@
+import asyncio, json, time, os, base64
+from typing import List, Dict, Any
+from fastapi import WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
+
+def b64u_decode(s: str) -> bytes:
+    s += "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s.encode())
+
+def b64u_encode(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).decode().rstrip("=")
+
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -6,6 +19,57 @@ import os, time, json, asyncio, base64, hashlib
 # ---- Ed25519 (NaCl)
 from nacl.signing import VerifyKey
 from nacl.exceptions import BadSignatureError
+
+NONCES: Dict[str, int] = {}
+NONCE_TTL = int(os.getenv("NONCE_TTL", "300"))  # 5 min
+
+class VerifyReq(BaseModel):
+    jws: str
+    kid: str | None = None  # opcjonalnie – używamy z headera
+
+class ShadowFrame(BaseModel):
+    ts: int
+    kid: str
+    vec: Dict[str, Any]
+
+class WSManager:
+    def __init__(self):
+        self.active: List[WebSocket] = []
+
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+        self.active.append(ws)
+
+    def disconnect(self, ws: WebSocket):
+        if ws in self.active:
+            self.active.remove(ws)
+
+    async def broadcast(self, data: Dict[str, Any]):
+        dead = []
+        for ws in self.active:
+            try:
+                await ws.send_text(json.dumps(data))
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.disconnect(ws)
+
+ws_manager = WSManager()
+
+@app.websocket("/shadow/ws")
+async def ws_shadow(ws: WebSocket):
+    await ws_manager.connect(ws)
+    try:
+        while True:
+            await ws.receive_text()  # nic nie robimy z wejściem
+    except WebSocketDisconnect:
+        ws_manager.disconnect(ws)
+
+@app.post("/shadow/ingest")
+async def shadow_ingest(frame: ShadowFrame):
+    await ws_manager.broadcast(frame.dict())
+    return {"ok": True}
+
 
 app = FastAPI(title="MeCloneMe API (mini)")
 
