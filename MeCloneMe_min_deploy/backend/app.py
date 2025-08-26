@@ -1,5 +1,5 @@
-import os, time, json, base64, secrets, asyncio, io, statistics
-from typing import Dict, Any, List, Optional, Tuple
+import os, time, json, base64, secrets, io, statistics
+from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Query
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,15 +16,13 @@ def b64u_encode(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode().rstrip("=")
 
 # ===== Config (ENV) =====
-API_VERSION = os.getenv("API_VERSION","0.1.5")
-NONCE_TTL   = int(os.getenv("NONCE_TTL", "300"))   # s
-SESSION_TTL = int(os.getenv("SESSION_TTL", "900")) # s
-RATE_MAX    = int(os.getenv("RATE_MAX", "30"))     # max calls / window
-RATE_WINDOW = int(os.getenv("RATE_WINDOW", "10"))  # s
-
-# Alert progi dla p95 (ms)
-P95_WARN = int(os.getenv("P95_WARN", "300"))
-P95_CRIT = int(os.getenv("P95_CRIT", "800"))
+API_VERSION = os.getenv("API_VERSION","0.1.6")
+NONCE_TTL   = int(os.getenv("NONCE_TTL", "300"))        # s
+SESSION_TTL = int(os.getenv("SESSION_TTL", "900"))      # s
+RATE_MAX    = int(os.getenv("RATE_MAX", "30"))          # max calls / window
+RATE_WINDOW = int(os.getenv("RATE_WINDOW", "10"))       # s
+P95_WARN    = int(os.getenv("P95_WARN", "300"))         # ms
+P95_CRIT    = int(os.getenv("P95_CRIT", "800"))         # ms
 
 # ===== In-memory stores (demo) =====
 NONCES: Dict[str, int] = {}                 # nonce -> expiry ts
@@ -35,8 +33,11 @@ RATE: Dict[str, List[int]] = {}             # ip -> [timestamps]
 # ===== Simple persistence (best-effort) =====
 DATA_DIR = "data"
 LOG_DIR  = "logs"
+SNAPS_DIR = os.path.join(LOG_DIR,"snaps")
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(LOG_DIR,  exist_ok=True)
+os.makedirs(SNAPS_DIR, exist_ok=True)
+
 PUBKEYS_PATH   = os.path.join(DATA_DIR, "pubkeys.json")
 SESSIONS_PATH  = os.path.join(DATA_DIR, "sessions.json")
 EVENTS_JSONL   = os.path.join(LOG_DIR,  "events.jsonl")  # audit/admin
@@ -109,15 +110,12 @@ def rate_check(ip: str) -> bool:
 class WSManager:
     def __init__(self) -> None:
         self.active: List[WebSocket] = []
-
     async def connect(self, ws: WebSocket):
         await ws.accept()
         self.active.append(ws)
-
     async def disconnect(self, ws: WebSocket):
         if ws in self.active:
             self.active.remove(ws)
-
     async def broadcast(self, data: Dict[str, Any]):
         msg = json.dumps(data)
         stale: List[WebSocket] = []
@@ -127,10 +125,8 @@ class WSManager:
             except Exception:
                 stale.append(ws)
         for ws in stale:
-            try:
-                await ws.close()
-            except Exception:
-                pass
+            try: await ws.close()
+            except Exception: pass
             await self.disconnect(ws)
 
 ws_manager = WSManager()
@@ -161,425 +157,82 @@ async def audit_mw(request: Request, call_next):
         REQ_COUNT += 1
         write_event("http", ip=ip, ua=ua, method=method, path=path, status=status, ms=ms)
 
-# ===== Mini panel (admin + progress + quick tests + N18) =====
-PANEL_HTML = """<!doctype html>
-<meta charset="utf-8"><title>Guardian — mini panel</title>
-<style>
-  :root{
-    --ok:#2e7d32; --warn:#e09100; --crit:#c62828; --btn:#f3f3f3; --bd:#e5e5e5;
-  }
-  body{font-family: system-ui,-apple-system,Segoe UI,Roboto;margin:16px}
-  .card{border:1px solid var(--bd);border-radius:8px;padding:12px}
-  .btn{padding:6px 10px;border:1px solid var(--bd);border-radius:8px;background:var(--btn);cursor:pointer}
-  .btn[disabled]{opacity:.6;cursor:not-allowed}
-  .btn.active{outline:2px solid #2e7d32;background:#edf7ed}
-  .btn.danger{border-color:var(--crit);color:var(--crit)}
-  .btn.danger.active{outline:2px solid var(--crit);background:#fdeaea}
-  #alert{display:none;border-radius:8px;padding:10px;margin:8px 0}
-  #alert.warn{display:block;background:#fff4e5;border:1px solid #ffe3b3}
-  #alert.crit{display:block;background:#fdeaea;border:1px solid #f5b7b1}
-  #toast{position:fixed;right:16px;bottom:16px;background:#111;color:#fff;padding:8px 12px;border-radius:8px;opacity:0;transition:opacity .2s}
-  #toast.show{opacity:.9}
-  pre{background:#f7f7f7;border:1px solid #eee;border-radius:8px;padding:12px}
-</style>
-<body>
-<h1>Guardian — mini panel</h1>
+# ===== Helpers (computations shared by endpoints) =====
+def _quantiles(vals: List[int]) -> Dict[str, int]:
+    if not vals: return {"p50":0,"p95":0,"avg":0,"max":0}
+    p50 = int(statistics.quantiles(vals, n=100)[49]) if len(vals) >= 2 else vals[0]
+    p95_idx = max(0, int(len(vals)*0.95) - 1)
+    p95 = sorted(vals)[p95_idx]
+    avg = int(sum(vals)/len(vals))
+    return {"p50":p50, "p95":p95, "avg":avg, "max":max(vals)}
 
-<div id="alert"><b>STATUS:</b> <span id="alertText"></span></div>
-
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
-  <div class="card">
-    <h2>Challenge</h2>
-    <pre id="challenge" style="min-height:120px"></pre>
-  </div>
-  <div class="card">
-    <h2>Live log <span id="ws" style="color:var(--ok)">WS: connected</span></h2>
-    <pre id="log" style="height:220px;overflow:auto"></pre>
-  </div>
-</div>
-
-<div class="card" style="margin-top:16px">
-  <h2>Postęp projektu (tylko lokalnie — zapis w przeglądarce)</h2>
-  <div id="bars"></div>
-  <div style="margin-top:8px">
-    <button id="save" class="btn">💾 Zapisz</button>
-    <button id="reset" class="btn">↩︎ Reset</button>
-  </div>
-</div>
-
-<div class="card" style="margin-top:16px">
-  <h2>CEO — N18 widżet (live)</h2>
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
-    <div>
-      <canvas id="spark" width="640" height="90" style="width:100%;border:1px solid #eee;border-radius:6px"></canvas>
-      <div style="font-size:12px;color:#666;margin-top:4px">Sparkline: p95/ms per-minute (ostatnie 60 min). Auto-refresh 5s.</div>
-      <div style="display:flex;gap:8px;margin-top:8px">
-        <button id="start" class="btn">▶︎ Start</button>
-        <button id="stop" class="btn">⏸ Stop</button>
-        <button id="once" class="btn">↻ Odśwież teraz</button>
-      </div>
-      <pre id="healthOut" style="min-height:80px;margin-top:8px"></pre>
-    </div>
-    <div>
-      <div style="display:flex;gap:16px;align-items:center;margin-bottom:6px">
-        <div><b>Uptime:</b> <span id="uptime">-</span></div>
-        <div><b>p95:</b> <span id="p95">-</span> ms</div>
-        <div><b>4xx:</b> <span id="e4">0</span></div>
-        <div><b>5xx:</b> <span id="e5">0</span></div>
-      </div>
-      <b>Top ścieżki</b>
-      <ol id="topPaths" style="margin-top:6px"></ol>
-      <b>Statusy</b>
-      <pre id="codes" style="min-height:60px"></pre>
-      <b>Latencja (ms)</b>
-      <div id="latStats" style="font-family:ui-monospace, Menlo, monospace;"></div>
-    </div>
-  </div>
-</div>
-
-<div class="card" style="margin-top:16px">
-  <h2>Admin — szybkie testy</h2>
-  <div style="margin:6px 0">
-    Token (Bearer) z <code>/mobile</code> po <i>verify</i> (zapamięta się lokalnie):
-    <input id="admTok" placeholder="sess_xxx" style="width:320px">
-  </div>
-  <div id="adminBtns" style="display:flex;gap:8px;flex-wrap:wrap;margin:6px 0">
-    <button id="btnTail" class="btn" data-group="admin">📜 Tail (50)</button>
-    <button id="btnTailCurl" class="btn" data-group="admin">📋 Copy cURL: Tail</button>
-    <button id="btnCSV" class="btn" data-group="admin">⬇️ CSV (200)</button>
-    <button id="btnCSVCurl" class="btn" data-group="admin">📋 Copy cURL: CSV</button>
-    <button id="btnSummary" class="btn" data-group="admin">📊 Summary (500)</button>
-    <button id="btnHealth" class="btn" data-group="admin">🩺 Health detail</button>
-    <button id="btnPurge" class="btn danger" data-group="admin">🧹 Purge log</button>
-    <button id="btnPurgeCurl" class="btn danger" data-group="admin">📋 Copy cURL: Purge</button>
-  </div>
-  <pre id="admOut" style="min-height:120px"></pre>
-</div>
-
-<div id="toast"></div>
-
-<script>
-const $=id=>document.getElementById(id);
-
-// ---- Toast
-function toast(msg){ const t=$("toast"); t.textContent=msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"), 1200); }
-
-// ---- Active buttons
-function setActive(button){ 
-  const group = button.getAttribute("data-group"); 
-  if(!group) return;
-  document.querySelectorAll('[data-group="'+group+'"]').forEach(b=>b.classList.remove("active"));
-  button.classList.add("active");
-}
-
-// ---- Progress bars (local only)
-const LS_KEY="guardian_progress";
-const FIELDS=[["Guardian/Auth","ga"],["AR Engine (R&D)","ar"],["App Shell / UI","ui"],["Cloud & Deploy","cd"],["MVP (całość)","mvp"]];
-function renderBars(state){
-  const root=$("bars"); root.innerHTML="";
-  FIELDS.forEach(([label,key])=>{
-    const wrap=document.createElement("div");
-    wrap.style.display="grid";wrap.style.gridTemplateColumns="200px 1fr 42px 42px";wrap.style.gap="8px";wrap.style.alignItems="center";wrap.style.margin="6px 0";
-    const lab=document.createElement("div"); lab.textContent=label;
-    const bar=document.createElement("div"); bar.style.height="8px";bar.style.background="#eee";bar.style.borderRadius="4px";
-    const inner=document.createElement("div"); inner.style.height="100%";inner.style.width=(state[key]||0)+"%";inner.style.background="var(--ok)";inner.style.borderRadius="4px";
-    bar.appendChild(inner);
-    const input=document.createElement("input"); input.type="number";input.min=0;input.max=100;input.value=state[key]||0;input.style.width="42px";
-    const pct=document.createElement("div"); pct.textContent=(state[key]||0)+"%";
-    input.oninput=()=>{let v=Math.max(0,Math.min(100,parseInt(input.value||"0",10)));inner.style.width=v+"%";pct.textContent=v+"%";state[key]=v;};
-    wrap.append(lab,bar,input,pct); root.appendChild(wrap);
-  });
-}
-
-// ---- N18 widget — sparkline (per-minute p95)
-let timer=null; const series=[];
-function drawSpark(values){
-  const cv=$("spark"); const ctx=cv.getContext("2d"); ctx.clearRect(0,0,cv.width,cv.height);
-  if(values.length<2) return;
-  const pad=6, w=cv.width-pad*2, h=cv.height-pad*2;
-  const min=Math.min(...values), max=Math.max(...values);
-  const norm=v => (max===min?0.5:(v-min)/(max-min));
-  ctx.beginPath();
-  values.forEach((v,i)=>{
-    const x=pad + (i/(values.length-1))*w;
-    const y=pad + (1-norm(v))*h;
-    if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
-  });
-  ctx.lineWidth=2; ctx.strokeStyle="var(--ok)"; ctx.stroke();
-}
-
-async function loadRollup(){
-  const r=await fetch('/api/logs/rollup?minutes=60'); const j=await r.json();
-  const vals=(j.series||[]).map(pt=>pt.p95||0);
-  if(vals.length){ series.length=0; vals.forEach(v=>series.push(v)); drawSpark(series); }
-}
-
-async function loadSummary(){
-  const r=await fetch('/api/logs/summary?n=500'); const j=await r.json();
-  const ul=$("topPaths"); ul.innerHTML=""; (j.paths_top5||[]).forEach(([p,c])=>{ const li=document.createElement('li'); li.textContent=p+"  ("+c+")"; ul.appendChild(li); });
-  $("codes").textContent=JSON.stringify(j.statuses||{},null,2);
-  const lat=j.latency_ms||{}; $("latStats").textContent=`p50=${lat.p50||0}ms  p95=${lat.p95||0}ms  avg=${lat.avg||0}ms  max=${lat.max||0}ms`;
-  $("p95").textContent = lat.p95||0;
-  $("e4").textContent = (j.errors&&j.errors["4xx"])||0;
-  $("e5").textContent = (j.errors&&j.errors["5xx"])||0;
-}
-
-async function loadHealth(){
-  const r=await fetch('/api/health/detail?n=200'); const j=await r.json();
-  $("healthOut").textContent=JSON.stringify({ts:j.ts, uptime_s:j.uptime_s, codes:j.codes, latency_ms:j.latency_ms, sample:j.sample_size},null,2);
-  $("uptime").textContent = j.uptime_s+"s";
-  const p95=(j.latency_ms&&j.latency_ms.p95)||0;
-  // Alert banner
-  const alert=$("alert"), txt=$("alertText");
-  alert.className=""; if(p95>=j.thresholds.crit){ alert.classList.add("crit"); txt.textContent=`CRIT: p95=${p95}ms (>= ${j.thresholds.crit})`; }
-  else if(p95>=j.thresholds.warn){ alert.classList.add("warn"); txt.textContent=`WARN: p95=${p95}ms (>= ${j.thresholds.warn})`; }
-  else { alert.style.display="none"; txt.textContent=""; }
-}
-
-function start(){ if(timer) return; timer=setInterval(async()=>{ try{ await loadHealth(); await loadSummary(); await loadRollup(); }catch(e){} }, 5000); $("start").classList.add("active"); $("stop").classList.remove("active"); }
-function stop(){ if(timer){ clearInterval(timer); timer=null; } $("stop").classList.add("active"); $("start").classList.remove("active"); }
-
-(async function init(){
-  // challenge preview
-  try{ const r=await fetch('/auth/challenge'); $("challenge").textContent=JSON.stringify(await r.json(),null,2); }
-  catch(e){ $("challenge").textContent="API offline"; }
-
-  // WS live log
-  try{
-    const wsUrl=(location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/shadow/ws";
-    const ws=new WebSocket(wsUrl);
-    ws.onmessage=(ev)=>{ try{ const j=JSON.parse(ev.data); const el=$("log"); el.textContent+=JSON.stringify(j)+"\\n"; el.scrollTop=el.scrollHeight; }catch(e){ } };
-  }catch(e){ const el=document.querySelector("#ws"); el.textContent="WS: error"; el.style.color="#c62828"; }
-
-  // progress bars state
-  const state=JSON.parse(localStorage.getItem(LS_KEY)||"{}"); renderBars(state);
-  $("save").onclick=()=>{ localStorage.setItem(LS_KEY,JSON.stringify(state)); toast("Zapisano"); };
-  $("reset").onclick=()=>{ localStorage.removeItem(LS_KEY); location.reload(); };
-
-  // Admin quick tests — token persistence
-  const TOKKEY="guardian_session";
-  $("admTok").value=localStorage.getItem(TOKKEY)||""; $("admTok").oninput=()=>localStorage.setItem(TOKKEY,$("admTok").value.trim());
-  function tok(){ return $("admTok").value.trim(); }
-  const origin=location.origin;
-  async function copy(text){ try{ await navigator.clipboard.writeText(text); toast("Skopiowano"); }catch(e){ toast("Nie udało się skopiować"); } }
-  async function withBusy(btn, fn){
-    try{ btn.setAttribute("disabled",""); setActive(btn); await fn(); }
-    finally{ btn.removeAttribute("disabled"); }
-  }
-
-  // Admin buttons
-  $("btnTail").onclick=()=>withBusy($("btnTail"), async()=>{ const r=await fetch('/admin/events/tail?n=50',{headers:{Authorization:'Bearer '+tok()}}); $("admOut").textContent=await r.text(); });
-  $("btnCSV").onclick=()=>withBusy($("btnCSV"), async()=>{
-    const r=await fetch('/admin/events/export.csv?n=200',{headers:{Authorization:'Bearer '+tok()}});
-    const blob=await r.blob(); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='events.csv'; a.click(); URL.revokeObjectURL(url); $("admOut").textContent="Pobrano events.csv";
-  });
-  $("btnSummary").onclick=()=>withBusy($("btnSummary"), async()=>{ const r=await fetch('/api/logs/summary?n=500'); $("admOut").textContent=JSON.stringify(await r.json(),null,2); });
-  $("btnHealth").onclick=()=>withBusy($("btnHealth"), async()=>{ const r=await fetch('/api/health/detail?n=200'); $("admOut").textContent=JSON.stringify(await r.json(),null,2); });
-  $("btnPurge").onclick=()=>withBusy($("btnPurge"), async()=>{ if(!confirm('Na pewno usunąć zawartość events.jsonl?')) return; const r=await fetch('/admin/events/purge',{method:'POST',headers:{Authorization:'Bearer '+tok()}}); $("admOut").textContent=await r.text(); });
-  $("btnTailCurl").onclick=()=>{ setActive($("btnTailCurl")); copy(`curl -H "Authorization: Bearer ${tok()}" "${origin}/admin/events/tail?n=50"`); };
-  $("btnCSVCurl").onclick=()=>{ setActive($("btnCSVCurl")); copy(`curl -H "Authorization: Bearer ${tok()}" -o events.csv "${origin}/admin/events/export.csv?n=200"`); };
-  $("btnPurgeCurl").onclick=()=>{ setActive($("btnPurgeCurl")); copy(`curl -X POST -H "Authorization: Bearer ${tok()}" "${origin}/admin/events/purge"`); };
-
-  // N18 controls
-  $("start").onclick=()=>{ setActive($("start")); start(); };
-  $("stop").onclick=()=>{ setActive($("stop")); stop(); };
-  $("once").onclick=()=>withBusy($("once"), async()=>{ await loadHealth(); await loadSummary(); await loadRollup(); });
-
-  await loadHealth(); await loadSummary(); await loadRollup(); start();
-})();
-</script>
-</body>
-"""
-
-# ===== Mobile demo (Signer) =====
-MOBILE_HTML = """<!doctype html>
-<meta charset="utf-8"><title>Guardian — Mobile Signer</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-  body{font-family:system-ui,-apple-system,Segoe UI,Roboto;margin:16px;line-height:1.25}
-  .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-  .card{border:1px solid #ddd;border-radius:10px;padding:10px}
-  pre,textarea,input{width:100%;box-sizing:border-box}
-  pre{background:#f7f7f7;border:1px solid #eee;border-radius:8px;white-space:pre-wrap;min-height:80px;padding:10px}
-  button{padding:8px 10px;border-radius:8px;border:1px solid #ddd;background:#f9f9f9}
-</style>
-<h1>Guardian — Mobile Signer</h1>
-
-<div class="row">
-  <div class="card">
-    <b>1) Klucz prywatny (PRIV, seed 32B)</b>
-    <input id="kid" placeholder="dev-key-1" style="margin:8px 0">
-    <textarea id="priv" rows="3" placeholder="Wklej PRIV z terminala (base64url)"></textarea>
-    <div class="muted">PRIV to seed 32B w base64url. Strona zapisuje go lokalnie w przeglądarce.</div>
-    <button id="save" style="margin-top:8px">💾 Zapisz w przeglądarce</button>
-  </div>
-
-  <div class="card">
-    <b>2) Rejestracja PUB</b>
-    <button id="register">🪪 Zarejestruj PUB na serwerze</button>
-    <pre id="regOut"></pre>
-  </div>
-</div>
-
-<div class="row" style="margin-top:10px">
-  <div class="card">
-    <b>3) Challenge</b>
-    <button id="getCh">🎯 Pobierz /auth/challenge</button>
-    <pre id="chOut"></pre>
-  </div>
-
-  <div class="card">
-    <b>4) Podpisz JWS i zweryfikuj</b>
-    <button id="verify">🔐 Podpisz & /guardian/verify</button>
-    <pre id="verOut"></pre>
-  </div>
-</div>
-
-<div class="card" style="margin-top:10px">
-  <b>5) Token (Bearer)</b><br><br>
-  <button id="ping">🔎 /protected/hello</button>
-  <button id="refresh">🔁 /guardian/refresh</button>
-  <button id="logout">🚪 /guardian/logout</button>
-  <pre id="pingOut"></pre>
-  <div>ETA tokenu: <span id="eta">-</span></div>
-</div>
-
-<script src="https://cdn.jsdelivr.net/npm/tweetnacl@1.0.3/nacl.min.js"></script>
-<script>
-const $=id=>document.getElementById(id);
-const enc = new TextEncoder();
-
-const b64u = b => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
-const fromB64u = s => {
-  s = s.replace(/-/g,'+').replace(/_/g,'/'); while(s.length%4) s+='=';
-  const bin = atob(s), out = new Uint8Array(bin.length);
-  for(let i=0;i<bin.length;i++) out[i]=bin.charCodeAt(i);
-  return out;
-};
-
-const LS_KEY="guardian_priv_seed";
-$("priv").value = localStorage.getItem(LS_KEY)||"";
-$("save").onclick = ()=>{ localStorage.setItem(LS_KEY, $("priv").value.trim()); alert("Zapisano PRIV w przeglądarce."); };
-
-function getKeypair(){
-  const seedB64u = $("priv").value.trim();
-  if(!seedB64u) throw new Error("Brak PRIV");
-  const seed = fromB64u(seedB64u);
-  if(seed.length!==32) throw new Error("PRIV (seed) musi być 32 bajty!");
-  return nacl.sign.keyPair.fromSeed(seed);
-}
-
-$("register").onclick = async ()=>{
-  try{
-    const kp = getKeypair();
-    const pub = b64u(kp.publicKey);
-    const kid = $("kid").value.trim() || "dev-key-1";
-    const r = await fetch("/guardian/register_pubkey",{
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({kid, pub})
-    });
-    $("regOut").textContent = await r.text();
-  }catch(e){ $("regOut").textContent = "ERR: "+e.message; }
-};
-
-let last = null, session = null, exp=0, ticker=null;
-function tick(){ const eta = Math.max(0, exp - Math.floor(Date.now()/1000)); $("eta").textContent = eta+"s"; }
-
-$("getCh").onclick = async ()=>{
-  const r = await fetch("/auth/challenge");
-  last = await r.json();
-  $("chOut").textContent = JSON.stringify(last,null,2);
-};
-
-$("verify").onclick = async ()=>{
-  try{
-    if(!last) throw new Error("Najpierw pobierz challenge.");
-    const kid = $("kid").value.trim() || "dev-key-1";
-    const hdr = {alg:"EdDSA", typ:"JWT", kid};
-    const pld = {aud:last.aud, nonce:last.nonce, ts: Math.floor(Date.now()/1000)};
-    const h = b64u(enc.encode(JSON.stringify(hdr)));
-    const p = b64u(enc.encode(JSON.stringify(pld)));
-    const msg = enc.encode(h+"."+p);
-    const kp = getKeypair();
-    const sig = nacl.sign.detached(msg, kp.secretKey);
-    const jws = h+"."+p+"."+b64u(sig);
-    const r = await fetch("/guardian/verify",{method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({jws})});
-    const j = await r.json();
-    $("verOut").textContent = JSON.stringify(j,null,2);
-    if(j.ok && j.session){
-      session=j.session; exp=j.exp;
-      localStorage.setItem("guardian_session", session);
-      clearInterval(ticker); ticker=setInterval(tick,1000); tick();
+def _compute_summary(n: int) -> Dict[str, Any]:
+    rows = [r for r in tail_jsonl(EVENTS_JSONL, n) if r.get("kind")=="http"]
+    total = len(rows)
+    by_path: Dict[str,int] = {}
+    by_method: Dict[str,int] = {}
+    by_status: Dict[str,int] = {}
+    lat: List[int] = []
+    for r in rows:
+        p=r.get("path","?"); by_path[p] = by_path.get(p,0)+1
+        m=r.get("method","?"); by_method[m] = by_method.get(m,0)+1
+        s=str(r.get("status","?")); by_status[s] = by_status.get(s,0)+1
+        if isinstance(r.get("ms"), int): lat.append(r["ms"])
+    top_paths = sorted(by_path.items(), key=lambda x: x[1], reverse=True)[:5]
+    lat_q = _quantiles(lat)
+    err4 = sum(v for k,v in by_status.items() if k.startswith("4"))
+    err5 = sum(v for k,v in by_status.items() if k.startswith("5"))
+    return {
+        "ok": True, "total": total,
+        "paths_top5": top_paths,
+        "methods": by_method,
+        "statuses": by_status,
+        "latency_ms": lat_q,
+        "errors": {"4xx": err4, "5xx": err5}
     }
-  }catch(e){ $("verOut").textContent = "ERR: "+e.message; }
-};
 
-$("ping").onclick = async ()=>{
-  const r = await fetch("/protected/hello",{ headers:{"Authorization":"Bearer "+(session||"")}});
-  $("pingOut").textContent = await r.text();
-};
+def _compute_rollup(minutes: int, n: int) -> Dict[str, Any]:
+    now = int(time.time())
+    floor_start = now - minutes*60
+    rows = [r for r in tail_jsonl(EVENTS_JSONL, n) if r.get("kind")=="http" and r.get("ts",0)>=floor_start]
+    buckets: Dict[int, List[int]] = {}
+    counts: Dict[int, int] = {}
+    for r in rows:
+        t = int(r.get("ts",0))
+        m = (t // 60) * 60
+        buckets.setdefault(m, []).append(int(r.get("ms",0)))
+        counts[m] = counts.get(m,0)+1
+    series = []
+    for m in range((floor_start//60)*60, (now//60)*60 + 60, 60):
+        vals = buckets.get(m, [])
+        q = _quantiles(vals) if vals else {"p50":0,"p95":0,"avg":0,"max":0}
+        series.append({"t": m, "p95": q["p95"], "count": counts.get(m,0)})
+    return {"ok": True, "series": series[-minutes:]}
 
-$("refresh").onclick = async ()=>{
-  const r = await fetch("/guardian/refresh",{ method:"POST", headers:{"Authorization":"Bearer "+(session||"")}});
-  const j = await r.json();
-  if(j.ok){ exp = j.exp; }
-  $("pingOut").textContent = JSON.stringify(j,null,2);
-};
+def _compute_health(n: int) -> Dict[str, Any]:
+    rows = [r for r in tail_jsonl(EVENTS_JSONL, n) if r.get("kind")=="http"]
+    lat = [r["ms"] for r in rows if isinstance(r.get("ms"), int)]
+    lat_q = _quantiles(lat)
+    codes: Dict[str,int] = {}
+    for r in rows:
+        k = str(r.get("status","?")); codes[k] = codes.get(k,0)+1
+    level = "ok"
+    if lat_q["p95"] >= P95_CRIT: level = "crit"
+    elif lat_q["p95"] >= P95_WARN: level = "warn"
+    return {
+        "ok": True, "ts": int(time.time()),
+        "version": API_VERSION,
+        "uptime_s": int(time.time()) - BOOT_TS,
+        "req_count": REQ_COUNT,
+        "rate_window_s": RATE_WINDOW,
+        "latency_ms": lat_q,
+        "codes": codes,
+        "sample_size": len(rows),
+        "level": level,
+        "thresholds": {"warn": P95_WARN, "crit": P95_CRIT}
+    }
 
-$("logout").onclick = async ()=>{
-  const r = await fetch("/guardian/logout",{ method:"POST", headers:{"Authorization":"Bearer "+(session||"")}});
-  const j = await r.json();
-  session=null; exp=0; tick();
-  $("pingOut").textContent = JSON.stringify(j,null,2);
-};
-</script>
-"""
-
-# ===== Pydantic models =====
-class PubKeyReq(BaseModel):
-    kid: str
-    pub: str
-
-class VerifyReq(BaseModel):
-    jws: str
-
-class ShadowFrame(BaseModel):
-    ts: int
-    vec: Dict[str, Any]
-
-# ===== Utilities =====
-def bad(reason: str, **extra):
-    data = {"ok": False, "reason": reason}
-    if extra: data.update(extra)
-    return JSONResponse(data)
-
-def ok(**payload):
-    data = {"ok": True}
-    if payload: data.update(payload)
-    return JSONResponse(data)
-
-def require_session(token: str) -> Optional[Dict[str, Any]]:
-    if not token or not token.startswith("sess_"):
-        return None
-    s = SESSIONS.get(token)
-    if not s:
-        return None
-    if s["exp"] < int(time.time()):
-        SESSIONS.pop(token, None)
-        save_sessions()
-        return None
-    return s
-
-async def emit(kind: str, **vec):
-    frame = {"ts": int(time.time()), "vec": {kind: vec}}
-    await ws_manager.broadcast(frame)
-
-def _auth_token(request: Request) -> str:
-    auth = request.headers.get("authorization") or ""
-    return auth.split(" ",1)[1] if auth.lower().startswith("bearer ") else ""
-
-# ===== Routes: UI roots =====
+# ===== UI roots =====
 @app.get("/", response_class=HTMLResponse)
 def root():
     return HTMLResponse(PANEL_HTML)
@@ -596,9 +249,7 @@ def healthz():
 @app.get("/api/health")
 def api_health():
     return {
-        "ok": True,
-        "version": API_VERSION,
-        "ts": int(time.time()),
+        "ok": True, "version": API_VERSION, "ts": int(time.time()),
         "uptime": int(time.time()) - BOOT_TS,
         "counts": {
             "requests": REQ_COUNT,
@@ -619,6 +270,10 @@ def api_metrics():
     return {"ok": True, "rate": {"window_s": RATE_WINDOW, "max": RATE_MAX}, "counts": {"ip_slots": len(RATE)}}
 
 # ===== WS + Shadow ingest =====
+class ShadowFrame(BaseModel):
+    ts: int
+    vec: Dict[str, Any]
+
 @app.websocket("/shadow/ws")
 async def ws_shadow(ws: WebSocket):
     await ws_manager.connect(ws)
@@ -637,9 +292,46 @@ async def shadow_ingest(frame: ShadowFrame):
         pass
     await ws_manager.broadcast(frame.dict())
     write_event("shadow", **frame.dict())
-    return ok()
+    return {"ok": True}
 
 # ===== Auth flow =====
+class PubKeyReq(BaseModel):
+    kid: str
+    pub: str
+
+class VerifyReq(BaseModel):
+    jws: str
+
+def bad(reason: str, **extra):
+    data = {"ok": False, "reason": reason}
+    if extra: data.update(extra)
+    return JSONResponse(data)
+
+def ok(**payload):
+    data = {"ok": True}
+    if payload: data.update(payload)
+    return JSONResponse(data)
+
+def require_session(token: str) -> Optional[Dict[str, Any]]:
+    if not token or not token.startswith("sess_"): 
+        return None
+    s = SESSIONS.get(token)
+    if not s: 
+        return None
+    if s["exp"] < int(time.time()):
+        SESSIONS.pop(token, None)
+        save_sessions()
+        return None
+    return s
+
+async def emit(kind: str, **vec):
+    frame = {"ts": int(time.time()), "vec": {kind: vec}}
+    await ws_manager.broadcast(frame)
+
+def _auth_token(request: Request) -> str:
+    auth = request.headers.get("authorization") or ""
+    return auth.split(" ",1)[1] if auth.lower().startswith("bearer ") else ""
+
 @app.get("/auth/challenge")
 async def challenge(request: Request, aud: str = "mobile"):
     ip = request.client.host if request.client else "?"
@@ -823,77 +515,87 @@ def admin_purge(request: Request):
     except Exception as e:
         return bad("purge-failed", error=str(e))
 
-# ===== Logs summary, rollup & health detail =====
-def _quantiles(vals: List[int]) -> Dict[str, int]:
-    if not vals: return {"p50":0,"p95":0,"avg":0,"max":0}
-    p50 = int(statistics.quantiles(vals, n=100)[49]) if len(vals) >= 2 else vals[0]
-    p95_idx = max(0, int(len(vals)*0.95) - 1)
-    p95 = sorted(vals)[p95_idx]
-    avg = int(sum(vals)/len(vals))
-    return {"p50":p50, "p95":p95, "avg":avg, "max":max(vals)}
+# ===== Admin: snapshots („notebooks”) =====
+@app.post("/admin/snaps/save")
+def snaps_save(request: Request, minutes: int = Query(60, ge=5, le=1440), n: int = Query(5000, ge=200, le=50000)):
+    token = _auth_token(request)
+    if not require_session(token): return bad("unauthorized")
+    snap = {
+        "ts": int(time.time()),
+        "version": API_VERSION,
+        "summary": _compute_summary(min(n, 10000)),
+        "rollup": _compute_rollup(minutes, n),
+        "health": _compute_health( max(200, min(n, 5000)) )
+    }
+    name = time.strftime("snap-%Y%m%d-%H%M%S.json", time.gmtime(snap["ts"]))
+    path = os.path.join(SNAPS_DIR, name)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(snap, f, ensure_ascii=False)
+        write_event("admin.snap_save", file=name)
+        return ok(file=name)
+    except Exception as e:
+        return bad("snap-save-failed", error=str(e))
 
+@app.get("/admin/snaps/list")
+def snaps_list(request: Request):
+    token = _auth_token(request)
+    if not require_session(token): return bad("unauthorized")
+    files = sorted([fn for fn in os.listdir(SNAPS_DIR) if fn.endswith(".json")])
+    return ok(files=files)
+
+@app.get("/admin/snaps/get")
+def snaps_get(request: Request, name: str):
+    token = _auth_token(request)
+    if not require_session(token): return bad("unauthorized")
+    safe = os.path.basename(name)
+    path = os.path.join(SNAPS_DIR, safe)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return JSONResponse(data)
+    except Exception as e:
+        return bad("snap-not-found", error=str(e))
+
+# ===== Logs summary, rollup, heatmap & health detail =====
 @app.get("/api/logs/summary")
 def logs_summary(n: int = Query(1000, ge=10, le=10000)):
-    rows = [r for r in tail_jsonl(EVENTS_JSONL, n) if r.get("kind")=="http"]
-    total = len(rows)
-    by_path: Dict[str,int] = {}
-    by_method: Dict[str,int] = {}
-    by_status: Dict[str,int] = {}
-    lat: List[int] = []
-    for r in rows:
-        by_path[r.get("path","?")] = by_path.get(r.get("path","?"),0)+1
-        by_method[r.get("method","?")] = by_method.get(r.get("method","?"),0)+1
-        by_status[str(r.get("status","?"))] = by_status.get(str(r.get("status","?")),0)+1
-        if isinstance(r.get("ms"), int): lat.append(r["ms"])
-    top_paths = sorted(by_path.items(), key=lambda x: x[1], reverse=True)[:5]
-    lat_q = _quantiles(lat)
-    err4 = sum(v for k,v in by_status.items() if k.startswith("4"))
-    err5 = sum(v for k,v in by_status.items() if k.startswith("5"))
-    return {"ok": True,"total": total,"paths_top5": top_paths,"methods": by_method,"statuses": by_status,"latency_ms": lat_q,"errors": {"4xx": err4, "5xx": err5}}
+    return _compute_summary(n)
 
 @app.get("/api/logs/rollup")
 def logs_rollup(minutes: int = Query(60, ge=5, le=1440), n: int = Query(10000, ge=100, le=50000)):
-    """Per-minute p95 + count for last <minutes>. Reads last N lines best-effort."""
-    now = int(time.time())
-    floor_start = now - minutes*60
-    rows = [r for r in tail_jsonl(EVENTS_JSONL, n) if r.get("kind")=="http" and r.get("ts",0)>=floor_start]
-    buckets: Dict[int, List[int]] = {}
-    counts: Dict[int, int] = {}
-    for r in rows:
-        t = int(r.get("ts",0))
-        m = (t // 60) * 60
-        buckets.setdefault(m, []).append(int(r.get("ms",0)))
-        counts[m] = counts.get(m,0)+1
-    series = []
-    for m in range((floor_start//60)*60, (now//60)*60 + 60, 60):
-        vals = buckets.get(m, [])
-        q = _quantiles(vals) if vals else {"p50":0,"p95":0,"avg":0,"max":0}
-        series.append({"t": m, "p95": q["p95"], "count": counts.get(m,0)})
-    return {"ok": True, "series": series[-minutes:]}
+    return _compute_rollup(minutes, n)
+
+@app.get("/api/logs/heatmap")
+def logs_heatmap(minutes: int = Query(60, ge=5, le=1440), n: int = Query(20000, ge=200, le=60000)):
+    roll = _compute_rollup(minutes, n)["series"]
+    maxc = max([c["count"] for c in roll], default=0)
+    cells = [{"t": c["t"], "count": c["count"]} for c in roll]
+    return {"ok": True, "minutes": minutes, "max": maxc, "cells": cells}
 
 @app.get("/api/health/detail")
 def health_detail(n: int = Query(200, ge=20, le=5000)):
-    rows = [r for r in tail_jsonl(EVENTS_JSONL, n) if r.get("kind")=="http"]
-    lat = [r["ms"] for r in rows if isinstance(r.get("ms"), int)]
-    lat_q = _quantiles(lat)
-    codes: Dict[str,int] = {}
-    for r in rows:
-        k = str(r.get("status","?")); codes[k] = codes.get(k,0)+1
-    level = "ok"
-    if lat_q["p95"] >= P95_CRIT: level = "crit"
-    elif lat_q["p95"] >= P95_WARN: level = "warn"
+    return _compute_health(n)
+
+# ===== DIAG: echo =====
+@app.get("/api/diag/echo")
+def diag_echo(request: Request):
+    headers = {}
+    for k,v in request.headers.items():
+        kl = k.lower()
+        if kl in ("authorization","cookie"):
+            headers[k] = "***"
+        else:
+            headers[k] = v
     return {
         "ok": True,
         "ts": int(time.time()),
-        "version": API_VERSION,
-        "uptime_s": int(time.time()) - BOOT_TS,
-        "req_count": REQ_COUNT,
-        "rate_window_s": RATE_WINDOW,
-        "latency_ms": lat_q,
-        "codes": codes,
-        "sample_size": len(rows),
-        "level": level,
-        "thresholds": {"warn": P95_WARN, "crit": P95_CRIT}
+        "ip": request.client.host if request.client else "?",
+        "method": request.method,
+        "path": request.url.path,
+        "query": dict(request.query_params),
+        "headers": headers,
+        "ua": request.headers.get("user-agent","")
     }
 
 # ===== AR engine (stub / R&D) =====
@@ -901,3 +603,338 @@ def health_detail(n: int = Query(200, ge=20, le=5000)):
 def ar_ping():
     return {"ok": True, "engine":"stub", "ts": int(time.time())}
 
+# ===== HTML (panel + mobile) =====
+PANEL_HTML = """<!doctype html>
+<meta charset="utf-8"><title>Guardian — mini panel</title>
+<style>
+  :root{
+    --ok:#2e7d32; --warn:#e09100; --crit:#c62828; --btn:#f3f3f3; --bd:#e5e5e5;
+  }
+  body{font-family: system-ui,-apple-system,Segoe UI,Roboto;margin:16px}
+  .card{border:1px solid var(--bd);border-radius:8px;padding:12px}
+  .btn{padding:6px 10px;border:1px solid var(--bd);border-radius:8px;background:var(--btn);cursor:pointer}
+  .btn[disabled]{opacity:.6;cursor:not-allowed}
+  .btn.active{outline:2px solid var(--ok);background:#edf7ed}
+  .btn.danger{border-color:var(--crit);color:var(--crit)}
+  .btn.danger.active{outline:2px solid var(--crit);background:#fdeaea}
+  #alert{display:none;border-radius:8px;padding:10px;margin:8px 0}
+  #alert.warn{display:block;background:#fff4e5;border:1px solid #ffe3b3}
+  #alert.crit{display:block;background:#fdeaea;border:1px solid #f5b7b1}
+  #toast{position:fixed;right:16px;bottom:16px;background:#111;color:#fff;padding:8px 12px;border-radius:8px;opacity:0;transition:opacity .2s}
+  #toast.show{opacity:.9}
+  pre{background:#f7f7f7;border:1px solid #eee;border-radius:8px;padding:12px}
+  .grid{display:grid;grid-template-columns:repeat(60,1fr);gap:2px}
+  .cell{height:18px;border-radius:3px;background:#eef5ee}
+</style>
+<body>
+<h1>Guardian — mini panel</h1>
+
+<div id="alert"><b>STATUS:</b> <span id="alertText"></span></div>
+
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+  <div class="card">
+    <h2>Challenge</h2>
+    <pre id="challenge" style="min-height:120px"></pre>
+  </div>
+  <div class="card">
+    <h2>Live log <span id="ws" style="color:var(--ok)">WS: connected</span></h2>
+    <pre id="log" style="height:220px;overflow:auto"></pre>
+  </div>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <h2>Postęp projektu (tylko lokalnie — zapis w przeglądarce)</h2>
+  <div id="bars"></div>
+  <div style="margin-top:8px">
+    <button id="save" class="btn" data-group="progress">💾 Zapisz</button>
+    <button id="reset" class="btn" data-group="progress">↩︎ Reset</button>
+  </div>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <h2>CEO — N18 widżet (live)</h2>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+    <div>
+      <canvas id="spark" width="640" height="90" style="width:100%;border:1px solid #eee;border-radius:6px"></canvas>
+      <div style="font-size:12px;color:#666;margin-top:4px">Sparkline: p95/ms per-minute (ostatnie 60 min). Auto-refresh 5s.</div>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button id="start" class="btn" data-group="n18">▶︎ Start</button>
+        <button id="stop" class="btn" data-group="n18">⏸ Stop</button>
+        <button id="once" class="btn" data-group="n18">↻ Odśwież teraz</button>
+      </div>
+      <pre id="healthOut" style="min-height:80px;margin-top:8px"></pre>
+    </div>
+    <div>
+      <div style="display:flex;gap:16px;align-items:center;margin-bottom:6px">
+        <div><b>Uptime:</b> <span id="uptime">-</span></div>
+        <div><b>p95:</b> <span id="p95">-</span> ms</div>
+        <div><b>4xx:</b> <span id="e4">0</span></div>
+        <div><b>5xx:</b> <span id="e5">0</span></div>
+      </div>
+      <b>Top ścieżki</b>
+      <ol id="topPaths" style="margin-top:6px"></ol>
+      <b>Statusy</b>
+      <pre id="codes" style="min-height:60px"></pre>
+      <b>Latencja (ms)</b>
+      <div id="latStats" style="font-family:ui-monospace, Menlo, monospace;"></div>
+    </div>
+  </div>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <h2>Rate heatmap (60m)</h2>
+  <div id="heatmap" class="grid"></div>
+  <div style="font-size:12px;color:#666;margin-top:6px">Intensywność = liczba żądań/min. Najciemniejsze = max w oknie.</div>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <h2>Diag & Snapshots</h2>
+  <div style="margin:6px 0">
+    Token (Bearer) do snapshotów (z <code>/mobile</code> po verify):
+    <input id="admTok" placeholder="sess_xxx" style="width:320px">
+  </div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin:6px 0">
+    <button id="btnEcho" class="btn" data-group="diag">🔎 Echo</button>
+    <button id="btnEchoCurl" class="btn" data-group="diag">📋 Copy cURL: Echo</button>
+    <button id="btnSnapSave" class="btn" data-group="diag">💾 Save snapshot</button>
+    <button id="btnSnapList" class="btn" data-group="diag">📚 List snapshots</button>
+    <button id="btnSnapGet" class="btn" data-group="diag">⬇️ Download last</button>
+  </div>
+  <pre id="diagOut" style="min-height:120px"></pre>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <h2>Admin — szybkie testy</h2>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin:6px 0">
+    <button id="btnTail" class="btn" data-group="admin">📜 Tail (50)</button>
+    <button id="btnTailCurl" class="btn" data-group="admin">📋 Copy cURL: Tail</button>
+    <button id="btnCSV" class="btn" data-group="admin">⬇️ CSV (200)</button>
+    <button id="btnCSVCurl" class="btn" data-group="admin">📋 Copy cURL: CSV</button>
+    <button id="btnSummary" class="btn" data-group="admin">📊 Summary (500)</button>
+    <button id="btnHealth" class="btn" data-group="admin">🩺 Health detail</button>
+    <button id="btnPurge" class="btn danger" data-group="admin">🧹 Purge log</button>
+    <button id="btnPurgeCurl" class="btn danger" data-group="admin">📋 Copy cURL: Purge</button>
+  </div>
+  <pre id="admOut" style="min-height:120px"></pre>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const $=id=>document.getElementById(id);
+
+// Toast
+function toast(msg){ const t=$("toast"); t.textContent=msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"), 1200); }
+
+// Active buttons
+function setActive(button){ const group=button.getAttribute("data-group"); if(!group) return;
+  document.querySelectorAll('[data-group="'+group+'"]').forEach(b=>b.classList.remove("active")); button.classList.add("active"); }
+
+// Progress bars (local only)
+const LS_KEY="guardian_progress";
+const FIELDS=[["Guardian/Auth","ga"],["AR Engine (R&D)","ar"],["App Shell / UI","ui"],["Cloud & Deploy","cd"],["MVP (całość)","mvp"]];
+function renderBars(state){
+  const root=$("bars"); root.innerHTML="";
+  FIELDS.forEach(([label,key])=>{
+    const wrap=document.createElement("div");
+    wrap.style.display="grid";wrap.style.gridTemplateColumns="200px 1fr 42px 42px";wrap.style.gap="8px";wrap.style.alignItems="center";wrap.style.margin="6px 0";
+    const lab=document.createElement("div"); lab.textContent=label;
+    const bar=document.createElement("div"); bar.style.height="8px";bar.style.background="#eee";bar.style.borderRadius="4px";
+    const inner=document.createElement("div"); inner.style.height="100%";inner.style.width=(state[key]||0)+"%";inner.style.background="var(--ok)";inner.style.borderRadius="4px";
+    bar.appendChild(inner);
+    const input=document.createElement("input"); input.type="number";input.min=0;input.max=100;input.value=state[key]||0;input.style.width="42px";
+    const pct=document.createElement("div"); pct.textContent=(state[key]||0)+"%";
+    input.oninput=()=>{let v=Math.max(0,Math.min(100,parseInt(input.value||"0",10)));inner.style.width=v+"%";pct.textContent=v+"%";state[key]=v;};
+    wrap.append(lab,bar,input,pct); root.appendChild(wrap);
+  });
+}
+
+// N18 sparkline
+let timer=null; const series=[];
+function drawSpark(values){
+  const cv=$("spark"); const ctx=cv.getContext("2d"); ctx.clearRect(0,0,cv.width,cv.height);
+  if(values.length<2) return;
+  const pad=6, w=cv.width-pad*2, h=cv.height-pad*2;
+  const min=Math.min(...values), max=Math.max(...values);
+  const norm=v => (max===min?0.5:(v-min)/(max-min));
+  ctx.beginPath();
+  values.forEach((v,i)=>{ const x=pad + (i/(values.length-1))*w; const y=pad + (1-norm(v))*h; if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y); });
+  ctx.lineWidth=2; ctx.strokeStyle="var(--ok)"; ctx.stroke();
+}
+
+// Heatmap
+function renderHeatmap(cells,max){
+  const root=$("heatmap"); root.innerHTML="";
+  if(!cells.length){ root.textContent="No data"; return; }
+  cells.forEach(c=>{
+    const div=document.createElement("div"); div.className="cell";
+    const a=max? (c.count/max):0;
+    div.style.background = `rgba(46,125,50, ${0.1 + 0.9*a})`;
+    const dt = new Date(c.t*1000).toLocaleTimeString();
+    div.title = `${dt} – ${c.count} req/min`;
+    root.appendChild(div);
+  });
+}
+
+// State + helpers
+const TOKKEY="guardian_session";
+$("admTok").value=localStorage.getItem(TOKKEY)||"";
+$("admTok").oninput=()=>localStorage.setItem(TOKKEY,$("admTok").value.trim());
+function tok(){ return $("admTok").value.trim(); }
+function copy(text){ navigator.clipboard.writeText(text).then(()=>toast("Skopiowano")).catch(()=>toast("Nie udało się skopiować")); }
+async function withBusy(btn, fn){ try{ btn.setAttribute("disabled",""); setActive(btn); await fn(); } finally{ btn.removeAttribute("disabled"); } }
+
+// Data loaders
+async function loadSummary(){ const r=await fetch('/api/logs/summary?n=500'); const j=await r.json();
+  const ul=$("topPaths"); ul.innerHTML=""; (j.paths_top5||[]).forEach(([p,c])=>{ const li=document.createElement('li'); li.textContent=p+"  ("+c+")"; ul.appendChild(li); });
+  $("codes").textContent=JSON.stringify(j.statuses||{},null,2);
+  const lat=j.latency_ms||{}; $("latStats").textContent=`p50=${lat.p50||0}ms  p95=${lat.p95||0}ms  avg=${lat.avg||0}ms  max=${lat.max||0}ms`;
+  $("p95").textContent=lat.p95||0; $("e4").textContent=(j.errors&&j.errors["4xx"])||0; $("e5").textContent=(j.errors&&j.errors["5xx"])||0; }
+async function loadHealth(){ const r=await fetch('/api/health/detail?n=200'); const j=await r.json();
+  $("healthOut").textContent=JSON.stringify({ts:j.ts, uptime_s:j.uptime_s, codes:j.codes, latency_ms:j.latency_ms, sample:j.sample_size},null,2);
+  $("uptime").textContent=j.uptime_s+"s"; const p95=(j.latency_ms&&j.latency_ms.p95)||0;
+  const alert=$("alert"), txt=$("alertText"); alert.className=""; alert.style.display="block";
+  if(p95>=j.thresholds.crit){ alert.classList.add("crit"); txt.textContent=`CRIT: p95=${p95}ms (>= ${j.thresholds.crit})`; }
+  else if(p95>=j.thresholds.warn){ alert.classList.add("warn"); txt.textContent=`WARN: p95=${p95}ms (>= ${j.thresholds.warn})`; }
+  else { alert.style.display="none"; txt.textContent=""; } }
+async function loadRollup(){ const r=await fetch('/api/logs/rollup?minutes=60'); const j=await r.json();
+  const vals=(j.series||[]).map(pt=>pt.p95||0); if(vals.length){ series.length=0; vals.forEach(v=>series.push(v)); drawSpark(series); } }
+async function loadHeat(){ const r=await fetch('/api/logs/heatmap?minutes=60'); const j=await r.json(); renderHeatmap(j.cells||[], j.max||0); }
+
+// Init
+(async function init(){
+  try{ const r=await fetch('/auth/challenge'); $("challenge").textContent=JSON.stringify(await r.json(),null,2); } catch(e){ $("challenge").textContent="API offline"; }
+  try{ const wsUrl=(location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/shadow/ws"; const ws=new WebSocket(wsUrl);
+    ws.onmessage=(ev)=>{ try{ const j=JSON.parse(ev.data); const el=$("log"); el.textContent+=JSON.stringify(j)+"\\n"; el.scrollTop=el.scrollHeight; }catch(e){} }; }
+  catch(e){ const el=document.querySelector("#ws"); el.textContent="WS: error"; el.style.color="#c62828"; }
+
+  const state=JSON.parse(localStorage.getItem(LS_KEY)||"{}"); renderBars(state);
+  $("save").onclick=()=>{ localStorage.setItem(LS_KEY,JSON.stringify(state)); toast("Zapisano"); };
+  $("reset").onclick=()=>{ localStorage.removeItem(LS_KEY); location.reload(); };
+
+  // CEO controls
+  $("start").onclick=()=>{ if(!window._n18){ window._n18=setInterval(async()=>{ await loadHealth(); await loadSummary(); await loadRollup(); await loadHeat(); },5000); } setActive($("start")); };
+  $("stop").onclick=()=>{ if(window._n18){ clearInterval(window._n18); window._n18=null; } setActive($("stop")); };
+  $("once").onclick=()=>withBusy($("once"), async()=>{ await loadHealth(); await loadSummary(); await loadRollup(); await loadHeat(); });
+
+  // Diag & snapshots
+  $("btnEcho").onclick=()=>withBusy($("btnEcho"), async()=>{ const r=await fetch('/api/diag/echo'); $("diagOut").textContent=JSON.stringify(await r.json(),null,2); });
+  $("btnEchoCurl").onclick=()=>{ setActive($("btnEchoCurl")); copy(`curl "${location.origin}/api/diag/echo"`); };
+  $("btnSnapSave").onclick=()=>withBusy($("btnSnapSave"), async()=>{ const r=await fetch('/admin/snaps/save',{method:'POST',headers:{Authorization:'Bearer '+tok()}}); const j=await r.json(); $("diagOut").textContent=JSON.stringify(j,null,2); if(j.file) toast("Snapshot zapisany: "+j.file); });
+  $("btnSnapList").onclick=()=>withBusy($("btnSnapList"), async()=>{ const r=await fetch('/admin/snaps/list',{headers:{Authorization:'Bearer '+tok()}}); $("diagOut").textContent=JSON.stringify(await r.json(),null,2); });
+  $("btnSnapGet").onclick=()=>withBusy($("btnSnapGet"), async()=>{
+    const list=await (await fetch('/admin/snaps/list',{headers:{Authorization:'Bearer '+tok()}})).json();
+    const files=(list.files||[]); if(!files.length){ $("diagOut").textContent="Brak snapshotów."; return; }
+    const last=files[files.length-1]; const r=await fetch('/admin/snaps/get?name='+encodeURIComponent(last),{headers:{Authorization:'Bearer '+tok()}});
+    const j=await r.json(); $("diagOut").textContent=JSON.stringify(j,null,2);
+    const blob=new Blob([JSON.stringify(j,null,2)],{type:'application/json'}); const url=URL.createObjectURL(blob);
+    const a=document.createElement('a'); a.href=url; a.download=last; a.click(); URL.revokeObjectURL(url); toast("Pobrano "+last);
+  });
+
+  // Admin quick tests
+  const origin=location.origin;
+  $("btnTail").onclick=()=>withBusy($("btnTail"), async()=>{ const r=await fetch('/admin/events/tail?n=50',{headers:{Authorization:'Bearer '+tok()}}); $("admOut").textContent=await r.text(); });
+  $("btnCSV").onclick=()=>withBusy($("btnCSV"), async()=>{ const r=await fetch('/admin/events/export.csv?n=200',{headers:{Authorization:'Bearer '+tok()}}); const blob=await r.blob(); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='events.csv'; a.click(); URL.revokeObjectURL(url); $("admOut").textContent="Pobrano events.csv"; });
+  $("btnSummary").onclick=()=>withBusy($("btnSummary"), async()=>{ const r=await fetch('/api/logs/summary?n=500'); $("admOut").textContent=JSON.stringify(await r.json(),null,2); });
+  $("btnHealth").onclick=()=>withBusy($("btnHealth"), async()=>{ const r=await fetch('/api/health/detail?n=200'); $("admOut").textContent=JSON.stringify(await r.json(),null,2); });
+  $("btnPurge").onclick=()=>withBusy($("btnPurge"), async()=>{ if(!confirm('Na pewno usunąć zawartość events.jsonl?')) return; const r=await fetch('/admin/events/purge',{method:'POST',headers:{Authorization:'Bearer '+tok()}}); $("admOut").textContent=await r.text(); });
+  $("btnTailCurl").onclick=()=>{ setActive($("btnTailCurl")); copy(`curl -H "Authorization: Bearer ${tok()}" "${origin}/admin/events/tail?n=50"`); };
+  $("btnCSVCurl").onclick=()=>{ setActive($("btnCSVCurl")); copy(`curl -H "Authorization: Bearer ${tok()}" -o events.csv "${origin}/admin/events/export.csv?n=200"`); };
+  $("btnPurgeCurl").onclick=()=>{ setActive($("btnPurgeCurl")); copy(`curl -X POST -H "Authorization: Bearer ${tok()}" "${origin}/admin/events/purge"`); };
+
+  // First load
+  await loadHealth(); await loadSummary(); await loadRollup(); await loadHeat(); $("start").click();
+})();
+</script>
+</body>
+"""
+
+MOBILE_HTML = """<!doctype html>
+<meta charset="utf-8"><title>Guardian — Mobile Signer</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto;margin:16px;line-height:1.25}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .card{border:1px solid #ddd;border-radius:10px;padding:10px}
+  pre,textarea,input{width:100%;box-sizing:border-box}
+  pre{background:#f7f7f7;border:1px solid #eee;border-radius:8px;white-space:pre-wrap;min-height:80px;padding:10px}
+  button{padding:8px 10px;border-radius:8px;border:1px solid #ddd;background:#f9f9f9}
+</style>
+<h1>Guardian — Mobile Signer</h1>
+
+<div class="row">
+  <div class="card">
+    <b>1) Klucz prywatny (PRIV, seed 32B)</b>
+    <input id="kid" placeholder="dev-key-1" style="margin:8px 0">
+    <textarea id="priv" rows="3" placeholder="Wklej PRIV z terminala (base64url)"></textarea>
+    <div class="muted">PRIV to seed 32B w base64url. Strona zapisuje go lokalnie w przeglądarce.</div>
+    <button id="save" style="margin-top:8px">💾 Zapisz w przeglądarce</button>
+  </div>
+
+  <div class="card">
+    <b>2) Rejestracja PUB</b>
+    <button id="register">🪪 Zarejestruj PUB na serwerze</button>
+    <pre id="regOut"></pre>
+  </div>
+</div>
+
+<div class="row" style="margin-top:10px">
+  <div class="card">
+    <b>3) Challenge</b>
+    <button id="getCh">🎯 Pobierz /auth/challenge</button>
+    <pre id="chOut"></pre>
+  </div>
+
+  <div class="card">
+    <b>4) Podpisz JWS i zweryfikuj</b>
+    <button id="verify">🔐 Podpisz & /guardian/verify</button>
+    <pre id="verOut"></pre>
+  </div>
+</div>
+
+<div class="card" style="margin-top:10px">
+  <b>5) Token (Bearer)</b><br><br>
+  <button id="ping">🔎 /protected/hello</button>
+  <button id="refresh">🔁 /guardian/refresh</button>
+  <button id="logout">🚪 /guardian/logout</button>
+  <pre id="pingOut"></pre>
+  <div>ETA tokenu: <span id="eta">-</span></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/tweetnacl@1.0.3/nacl.min.js"></script>
+<script>
+const $=id=>document.getElementById(id);
+const enc = new TextEncoder();
+const b64u = b => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+const fromB64u = s => { s=s.replace(/-/g,'+').replace(/_/g,'/'); while(s.length%4) s+='='; const bin=atob(s), out=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) out[i]=bin.charCodeAt(i); return out; };
+
+const LS_KEY="guardian_priv_seed";
+$("priv").value = localStorage.getItem(LS_KEY)||"";
+$("save").onclick = ()=>{ localStorage.setItem(LS_KEY, $("priv").value.trim()); alert("Zapisano PRIV w przeglądarce."); };
+
+function getKeypair(){ const seedB64u=$("priv").value.trim(); if(!seedB64u) throw new Error("Brak PRIV"); const seed=fromB64u(seedB64u); if(seed.length!==32) throw new Error("PRIV (seed) musi być 32 bajty!"); return nacl.sign.keyPair.fromSeed(seed); }
+
+$("register").onclick = async ()=>{ try{ const kp=getKeypair(); const pub=b64u(kp.publicKey); const kid=$("kid").value.trim()||"dev-key-1";
+  const r=await fetch("/guardian/register_pubkey",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({kid,pub})}); $("regOut").textContent=await r.text();
+}catch(e){ $("regOut").textContent="ERR: "+e.message; }};
+
+let last=null, session=null, exp=0, ticker=null;
+function tick(){ const eta=Math.max(0, exp - Math.floor(Date.now()/1000)); $("eta").textContent=eta+"s"; }
+
+$("getCh").onclick = async ()=>{ const r=await fetch("/auth/challenge"); last=await r.json(); $("chOut").textContent=JSON.stringify(last,null,2); };
+
+$("verify").onclick = async ()=>{ try{
+  if(!last) throw new Error("Najpierw pobierz challenge."); const kid=$("kid").value.trim()||"dev-key-1";
+  const hdr={alg:"EdDSA", typ:"JWT", kid}; const pld={aud:last.aud, nonce:last.nonce, ts: Math.floor(Date.now()/1000)};
+  const h=b64u(enc.encode(JSON.stringify(hdr))); const p=b64u(enc.encode(JSON.stringify(pld))); const msg=enc.encode(h+"."+p);
+  const kp=getKeypair(); const sig=nacl.sign.detached(msg, kp.secretKey); const jws=h+"."+p+"."+b64u(sig);
+  const r=await fetch("/guardian/verify",{method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({jws})});
+  const j=await r.json(); $("verOut").textContent=JSON.stringify(j,null,2);
+  if(j.ok && j.session){ session=j.session; exp=j.exp; localStorage.setItem("guardian_session", session); clearInterval(ticker); ticker=setInterval(tick,1000); tick(); }
+}catch(e){ $("verOut").textContent="ERR: "+e.message; }};
+
+$("ping").onclick = async ()=>{ const r=await fetch("/protected/hello",{ headers:{"Authorization":"Bearer "+(session||"")}}); $("pingOut").textContent=await r.text(); };
+$("refresh").onclick = async ()=>{ const r=await fetch("/guardian/refresh",{ method:"POST", headers:{"Authorization":"Bearer "+(session||"")}}); const j=await r.json(); if(j.ok){ exp=j.exp; } $("pingOut").textContent=JSON.stringify(j,null,2); };
+$("logout").onclick = async ()=>{ const r=await fetch("/guardian/logout",{ method:"POST", headers:{"Authorization":"Bearer "+(session||"")}}); const j=await r.json(); session=null; exp=0; tick(); $("pingOut").textContent=JSON.stringify(j,null,2); };
+</script>
+"""
