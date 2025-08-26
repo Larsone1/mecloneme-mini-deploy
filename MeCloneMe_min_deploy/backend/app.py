@@ -17,20 +17,57 @@ def b64u_encode(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode().rstrip("=")
 
 # ===== Config (ENV) =====
-API_VERSION = os.getenv("API_VERSION", "0.3.1")
+API_VERSION = os.getenv("API_VERSION", "0.3.2")
 NONCE_TTL   = int(os.getenv("NONCE_TTL", "300"))
-SESSION_TTL = int(os.getenv("SESSION_TTL", "900"))
-RATE_MAX    = int(os.getenv("RATE_MAX", "30"))
-RATE_WINDOW = int(os.getenv("RATE_WINDOW", "10"))
+SESSION_TTL = int(os.getenv("SESSION_TTL", "3600"))
 P95_WARN    = int(os.getenv("P95_WARN", "300"))
 P95_CRIT    = int(os.getenv("P95_CRIT", "800"))
+RATE_WINDOW = int(os.getenv("RATE_WINDOW", "60"))
+RATE_MAX    = int(os.getenv("RATE_MAX", "120"))
 
-# ===== In-memory stores (demo) =====
-NONCES: Dict[str, int] = {}                 # nonce -> expiry ts
-PUBKEYS: Dict[str, str] = {}                # kid -> public key (base64url 32B)
-SESSIONS: Dict[str, Dict[str, Any]] = {}    # sid -> {kid, exp}
-RATE: Dict[str, List[int]] = {}             # ip -> [timestamps]
-ALERTS: List[Dict[str, Any]] = []           # rolling alerts
+# ===== Models =====
+class PubKey(BaseModel):
+    kid: str
+    key: str  # base64url-encoded public key (Ed25519)
+
+class Challenge(BaseModel):
+    aud: str
+    nonce: str
+    ts: int
+
+class SignedJWS(BaseModel):
+    jws: str
+
+class SessionInfo(BaseModel):
+    kid: str
+    sid: str
+    exp: int
+
+class Snapshot(BaseModel):
+    tag: str
+    payload: Dict[str, Any]
+
+class Alert(BaseModel):
+    level: str  # ok|warn|crit
+    msg: str
+    ts: int
+    extra: Optional[Dict[str, Any]] = None
+
+# ===== App =====
+app = FastAPI(title="MeCloneMe Mini API", version=API_VERSION)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ===== Stores =====
+PUBKEYS: Dict[str, str] = {}              # kid -> base64url(pubkey)
+SESSIONS: Dict[str, Dict[str, Any]] = {}  # sid -> {kid, exp}
+RATE: Dict[str, List[int]] = {}           # ip -> [timestamps]
+ALERTS: List[Dict[str, Any]] = []         # rolling alerts
 
 # ===== Simple persistence =====
 DATA_DIR = "data"
@@ -39,6 +76,11 @@ SNAPS_DIR = os.path.join(LOG_DIR, "snaps")
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(SNAPS_DIR, exist_ok=True)
+# ===== Lightweight tuning (Render-friendly) =====
+METRICS_TTL = float(os.getenv("METRICS_TTL", "2"))  # seconds to cache /metrics
+AUDIT_SAMPLE_N = int(os.getenv("AUDIT_SAMPLE_N", "1"))  # 1 = log every request; 10 = ~10% sampled
+SKIP_AUDIT_PATHS = set((os.getenv("SKIP_AUDIT_PATHS", "/metrics,/health,/ar/ping").split(",")))
+METRICS_CACHE = {"ts": 0.0, "body": ""}
 PUBKEYS_PATH = os.path.join(DATA_DIR, "pubkeys.json")
 SESSIONS_PATH = os.path.join(DATA_DIR, "sessions.json")
 EVENTS_JSONL = os.path.join(LOG_DIR, "events.jsonl")
@@ -48,6 +90,7 @@ BOOT_TS = int(time.time())
 REQ_COUNT = 0
 LAST_ALERT_TS: Dict[str, int] = {}  # throttling
 
+# ===== Utils =====
 def _load_json(path: str, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -55,77 +98,84 @@ def _load_json(path: str, default):
     except Exception:
         return default
 
-def _save_json(path: str, data) -> None:
+def _save_json(path: str, obj: Any):
     try:
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-        os.replace(tmp, path)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f)
     except Exception:
         pass
+
+def write_event(kind: str, **fields):
+    fields["kind"] = kind
+    fields["ts"] = int(time.time())
+    try:
+        with open(EVENTS_JSONL, "a", encoding="utf-8") as f:
+            f.write(json.dumps(fields, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+def write_shadow(**fields):
+    fields["ts"] = int(time.time())
+    try:
+        with open(SHADOW_JSONL, "a", encoding="utf-8") as f:
+            f.write(json.dumps(fields, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def tail_jsonl(path: str, n: int) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f.readlines()[-n:]:
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return rows
+
 
 def load_stores():
     global PUBKEYS, SESSIONS
     PUBKEYS = _load_json(PUBKEYS_PATH, {})
     SESSIONS = _load_json(SESSIONS_PATH, {})
 
-def save_pubkeys(): _save_json(PUBKEYS_PATH, PUBKEYS)
-def save_sessions(): _save_json(SESSIONS_PATH, SESSIONS)
+def save_sessions():
+    _save_json(SESSIONS_PATH, SESSIONS)
 
-# ===== Events (JSONL) =====
-def write_event(kind: str, **data) -> None:
-    """Append event to JSONL; allow 'ts' override (for ingest)."""
-    ts_override = data.pop("ts", None)
-    rec = {
-        "ts": ts_override if isinstance(ts_override, int) else int(time.time()),
-        "kind": kind,
-        **data,
-    }
-    try:
-        with open(EVENTS_JSONL, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
+# ===== Nonces =====
+NONCES: Dict[str, int] = {}  # nonce -> exp
 
-def tail_jsonl(path: str, n: int) -> List[Dict[str, Any]]:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            lines = f.readlines()[-n:]
-        out = []
-        for ln in lines:
-            try:
-                out.append(json.loads(ln))
-            except Exception:
-                pass
-        return out
-    except FileNotFoundError:
-        return []
+def new_nonce(aud: str) -> Challenge:
+    nonce = base64.urlsafe_b64encode(secrets.token_bytes(24)).decode().rstrip("=")
+    ts = int(time.time())
+    NONCES[nonce] = ts + NONCE_TTL
+    return Challenge(aud=aud, nonce=nonce, ts=ts)
 
-# ===== Alerts =====
-def _throttle(key: str, cooldown_s: int) -> bool:
-    now = int(time.time())
-    last = LAST_ALERT_TS.get(key, 0)
-    if now - last < cooldown_s:
-        return False
-    LAST_ALERT_TS[key] = now
-    return True
+# ===== Sessions =====
 
-async def emit(kind: str, **vec):
-    frame = {"ts": int(time.time()), "vec": {kind: vec}}
-    await ws_manager.broadcast(frame)
+def new_session(kid: str) -> SessionInfo:
+    sid = base64.urlsafe_b64encode(secrets.token_bytes(18)).decode().rstrip("=")
+    exp = int(time.time()) + SESSION_TTL
+    SESSIONS[sid] = {"kid": kid, "exp": exp}
+    save_sessions()
+    return SessionInfo(kid=kid, sid=sid, exp=exp)
 
-async def emit_alert(level: str, title: str, cooldown_s: int = 20, **meta):
-    key = f"{level}:{title}"
-    if not _throttle(key, cooldown_s):
-        return
-    rec = {"ts": int(time.time()), "level": level, "title": title, "meta": meta}
-    ALERTS.append(rec)
-    del ALERTS[:-200]  # keep last 200
-    write_event("alert", level=level, title=title, **meta)
-    await ws_manager.broadcast({"ts": rec["ts"], "vec": {"alert": rec}})
+def get_session(sid: str) -> Optional[SessionInfo]:
+    s = SESSIONS.get(sid)
+    if not s:
+        return None
+    if s["exp"] < int(time.time()):
+        SESSIONS.pop(sid, None)
+        save_sessions()
+        return None
+    return SessionInfo(kid=s["kid"], sid=sid, exp=s["exp"])
 
 # ===== Rate limiting =====
-def rate_check(ip: str) -> bool:
+
+def rate_allow(ip: str) -> bool:
     now = int(time.time())
     buf = RATE.get(ip, [])
     buf = [t for t in buf if t > now - RATE_WINDOW]
@@ -134,51 +184,22 @@ def rate_check(ip: str) -> bool:
     RATE[ip] = buf
     return allowed
 
+
 def rate_is_hot(ip: str) -> Optional[int]:
     """Return current count if window usage >= 80% of limit."""
     cnt = len(RATE.get(ip, []))
     return cnt if cnt >= int(RATE_MAX * 0.8) else None
 
-# ===== WS manager =====
-class WSManager:
-    def __init__(self) -> None:
-        self.active: List[WebSocket] = []
-
-    async def connect(self, ws: WebSocket):
-        await ws.accept()
-        self.active.append(ws)
-
-    async def disconnect(self, ws: WebSocket):
-        if ws in self.active:
-            self.active.remove(ws)
-
-    async def broadcast(self, data: Dict[str, Any]):
-        msg = json.dumps(data)
-        stale: List[WebSocket] = []
-        for ws in self.active:
-            try:
-                await ws.send_text(msg)
-            except Exception:
-                stale.append(ws)
-        for ws in stale:
-            try:
-                await ws.close()
-            except Exception:
-                pass
-            await self.disconnect(ws)
-
-ws_manager = WSManager()
-
-# ===== FastAPI =====
-app = FastAPI(title="MeCloneMe API (mini)")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-load_stores()
+# ===== WS (echo stub) =====
+@app.websocket("/ws/echo")
+async def ws_echo(ws: WebSocket):
+    await ws.accept()
+    try:
+        while True:
+            msg = await ws.receive_text()
+            await ws.send_text(msg)
+    except WebSocketDisconnect:
+        pass
 
 # ===== HTTP middleware: audit + metrics =====
 @app.middleware("http")
@@ -197,6 +218,13 @@ async def audit_mw(request: Request, call_next):
     finally:
         ms = int((time.perf_counter() - t0) * 1000)
         REQ_COUNT += 1
+        reqno = REQ_COUNT
+        # Fast bypass for light paths
+        if path in SKIP_AUDIT_PATHS:
+            return
+        # Sampling to reduce IO/CPU
+        if AUDIT_SAMPLE_N > 1 and (reqno % AUDIT_SAMPLE_N) != 0:
+            return
         write_event("http", ip=ip, ua=ua, method=method, path=path, status=status, ms=ms)
         if status >= 500:
             await emit_alert("crit", "HTTP 5xx", cooldown_s=10, path=path, code=status)
@@ -205,6 +233,7 @@ async def audit_mw(request: Request, call_next):
             await emit_alert("warn", "Rate hot", cooldown_s=15, ip=ip, count=hot, limit=RATE_MAX)
 
 # ===== Percentiles (robust) =====
+
 def _percentile(values: List[int], p: float) -> int:
     if not values:
         return 0
@@ -216,9 +245,10 @@ def _percentile(values: List[int], p: float) -> int:
     c = min(f + 1, len(xs) - 1)
     if f == c:
         return xs[f]
-    lo = xs[f]
-    hi = xs[c]
-    return int(round(lo + (hi - lo) * (k - f)))
+    d0 = xs[f] * (c - k)
+    d1 = xs[c] * (k - f)
+    return int(d0 + d1)
+
 
 def _lat_stats(vals: List[int]) -> Dict[str, int]:
     if not vals:
@@ -231,6 +261,7 @@ def _lat_stats(vals: List[int]) -> Dict[str, int]:
     }
 
 # ===== Metrics builders =====
+
 def _compute_summary(n: int) -> Dict[str, Any]:
     rows = [r for r in tail_jsonl(EVENTS_JSONL, n) if r.get("kind") == "http"]
     total = len(rows)
@@ -257,23 +288,23 @@ def _compute_summary(n: int) -> Dict[str, Any]:
         "paths_top5": top_paths,
         "methods": by_method,
         "statuses": by_status,
-        "latency_ms": lat_q,
         "errors": {"4xx": err4, "5xx": err5},
+        "latency_ms": lat_q,
     }
 
-def _compute_rollup(minutes: int, n: int) -> Dict[str, Any]:
-    now = int(time.time())
-    floor_start = now - minutes * 60
-    rows = [
-        r
-        for r in tail_jsonl(EVENTS_JSONL, n)
-        if r.get("kind") == "http" and r.get("ts", 0) >= floor_start
-    ]
+
+def _compute_series(minutes: int = 30) -> Dict[str, Any]:
+    rows = [r for r in tail_jsonl(EVENTS_JSONL, minutes * 60) if r.get("kind") == "http"]
     buckets: Dict[int, List[int]] = {}
     counts: Dict[int, int] = {}
+    now = int(time.time())
+    floor_start = now - minutes * 60
     for r in rows:
-        m = (int(r.get("ts", 0)) // 60) * 60
-        buckets.setdefault(m, []).append(int(r.get("ms", 0)))
+        t = r.get("ts", now)
+        m = (t // 60) * 60
+        ms = r.get("ms")
+        if isinstance(ms, int):
+            buckets.setdefault(m, []).append(ms)
         counts[m] = counts.get(m, 0) + 1
     series = []
     for m in range((floor_start // 60) * 60, (now // 60) * 60 + 60, 60):
@@ -281,6 +312,7 @@ def _compute_rollup(minutes: int, n: int) -> Dict[str, Any]:
         q = _lat_stats(vals) if vals else {"p50": 0, "p95": 0, "avg": 0, "max": 0}
         series.append({"t": m, "p95": q["p95"], "count": counts.get(m, 0)})
     return {"ok": True, "series": series[-minutes:]}
+
 
 def _compute_health(n: int) -> Dict[str, Any]:
     rows = [r for r in tail_jsonl(EVENTS_JSONL, n) if r.get("kind") == "http"]
@@ -318,533 +350,66 @@ def root():
 def mobile_page():
     return HTMLResponse(MOBILE_HTML)
 
-# ===== Simple health/metrics =====
-@app.get("/healthz")
-def healthz():
-    return {"ok": True, "ts": int(time.time())}
-
+# ===== Simple health =====
 @app.get("/api/health")
-def api_health():
-    return {
-        "ok": True,
-        "version": API_VERSION,
-        "ts": int(time.time()),
-        "uptime": int(time.time()) - BOOT_TS,
-        "counts": {
-            "requests": REQ_COUNT,
-            "nonces": len(NONCES),
-            "pubkeys": len(PUBKEYS),
-            "sessions": len(SESSIONS),
-        },
-    }
+def health():
+    return {"ok": True, "version": API_VERSION, "ts": int(time.time())}
 
-@app.get("/api/health/detail")
-def health_detail(n: int = Query(300, ge=50, le=10000)):
-    return _compute_health(n)
+# ===== Pubkeys API =====
+@app.get("/auth/keys")
+def list_keys():
+    return {"ok": True, "keys": [{"kid": k, "key": v} for k, v in PUBKEYS.items()]}
 
-@app.get("/api/version")
-def api_version():
-    git = os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_SHA") or ""
-    svc = os.getenv("RENDER_SERVICE_NAME") or ""
-    return {"ok": True, "version": API_VERSION, "boot_ts": BOOT_TS, "git": git[:12], "service": svc}
-
-@app.get("/api/metrics")
-def api_metrics():
-    return {
-        "ok": True,
-        "rate": {"window_s": RATE_WINDOW, "max": RATE_MAX},
-        "counts": {"ip_slots": len(RATE)},
-    }
-
-# ===== WS + Shadow ingest =====
-class ShadowFrame(BaseModel):
-    ts: int
-    vec: Dict[str, Any]
-
-@app.websocket("/shadow/ws")
-async def ws_shadow(ws: WebSocket):
-    await ws_manager.connect(ws)
-    try:
-        while True:
-            await ws.receive_text()
-    except WebSocketDisconnect:
-        await ws_manager.disconnect(ws)
-
-@app.post("/shadow/ingest")
-async def shadow_ingest(frame: ShadowFrame):
-    try:
-        with open(SHADOW_JSONL, "a", encoding="utf-8") as f:
-            f.write(json.dumps(frame.dict()) + "\n")
-    except Exception:
-        pass
-    await ws_manager.broadcast(frame.dict())
-    write_event("shadow", **frame.dict())
+@app.post("/auth/keys")
+def add_key(k: PubKey):
+    PUBKEYS[k.kid] = k.key
+    _save_json(PUBKEYS_PATH, PUBKEYS)
+    write_event("keys", action="add", kid=k.kid)
     return {"ok": True}
 
-# ===== Auth flow =====
-class PubKeyReq(BaseModel):
-    kid: str
-    pub: str
+@app.delete("/auth/keys/{kid}")
+def del_key(kid: str):
+    PUBKEYS.pop(kid, None)
+    _save_json(PUBKEYS_PATH, PUBKEYS)
+    write_event("keys", action="del", kid=kid)
+    return {"ok": True}
 
-class VerifyReq(BaseModel):
-    jws: str
-
-def bad(reason: str, **extra):
-    data = {"ok": False, "reason": reason}
-    data.update(extra)
-    return JSONResponse(data)
-
-def ok(**payload):
-    data = {"ok": True}
-    data.update(payload)
-    return JSONResponse(data)
-
-def require_session(token: str) -> Optional[Dict[str, Any]]:
-    if not token or not token.startswith("sess_"):
-        return None
-    s = SESSIONS.get(token)
-    if not s:
-        return None
-    if s["exp"] < int(time.time()):
-        SESSIONS.pop(token, None)
-        save_sessions()
-        return None
-    return s
-
-def _auth_token(request: Request) -> str:
-    auth = request.headers.get("authorization") or ""
-    return auth.split(" ", 1)[1] if auth.lower().startswith("bearer ") else ""
-
+# ===== Auth (JWS diag) =====
 @app.get("/auth/challenge")
-async def challenge(request: Request, aud: str = "mobile"):
-    ip = request.client.host if request.client else "?"
-    if not rate_check(ip):
-        await emit("rate", ip=ip, status="limit")
-        write_event("rate_limit", ip=ip, path="/auth/challenge")
-        await emit_alert("crit", "Rate limit", path="/auth/challenge", ip=ip)
-        return bad("rate-limit")
-    now = int(time.time())
-    nonce = secrets.token_hex(16)
-    NONCES[nonce] = now + NONCE_TTL
-    # cleanup
-    for n, exp in list(NONCES.items()):
-        if exp < now:
-            NONCES.pop(n, None)
-    await emit("challenge", aud=aud, nonce=nonce)
-    write_event("auth.challenge", ip=ip, aud=aud, nonce=nonce)
-    hot = rate_is_hot(ip)
-    if hot is not None:
-        await emit_alert("warn", "Rate hot", ip=ip, count=hot, limit=RATE_MAX)
-    return ok(aud=aud, nonce=nonce, ttl=NONCE_TTL)
+def get_challenge(aud: str = Query("diag")):
+    ch = new_nonce(aud)
+    return ch.dict()
 
-@app.post("/guardian/register_pubkey")
-async def register_pubkey(req: PubKeyReq, request: Request):
-    ip = request.client.host if request.client else "?"
-    if not rate_check(ip):
-        await emit("rate", ip=ip, status="limit")
-        write_event("rate_limit", ip=ip, path="/guardian/register_pubkey")
-        await emit_alert("crit", "Rate limit", path="/guardian/register_pubkey", ip=ip)
-        return bad("rate-limit")
-    try:
-        if len(b64u_decode(req.pub)) != 32:
-            return bad("bad-pubkey")
-    except Exception:
-        return bad("bad-pubkey")
-    PUBKEYS[req.kid] = req.pub
-    save_pubkeys()
-    await emit("admin", action="register_pubkey", kid=req.kid)
-    write_event("auth.register_pubkey", kid=req.kid)
-    return ok(registered=list(PUBKEYS.keys()))
-
-@app.post("/guardian/verify")
-async def guardian_verify(request: Request, req: VerifyReq):
-    ip = request.client.host if request.client else "?"
-    if not rate_check(ip):
-        await emit("rate", ip=ip, status="limit")
-        write_event("rate_limit", ip=ip, path="/guardian/verify")
-        await emit_alert("crit", "Rate limit", path="/guardian/verify", ip=ip)
-        return bad("rate-limit")
-    try:
-        parts = req.jws.split(".")
-        if len(parts) != 3:
-            return bad("bad-format")
-        h_b, p_b, s_b = parts
-        header = json.loads(b64u_decode(h_b))
-        payload = json.loads(b64u_decode(p_b))
-        sig = b64u_decode(s_b)
-    except Exception:
-        return bad("bad-jws")
-    kid = header.get("kid")
-    alg = header.get("alg")
-    if alg != "EdDSA" or not kid or kid not in PUBKEYS:
-        return bad("bad-header")
-    try:
-        vk = VerifyKey(b64u_decode(PUBKEYS[kid]))
-        vk.verify((h_b + "." + p_b).encode(), sig)
-    except BadSignatureError:
-        return bad("bad-signature")
-    now = int(time.time())
-    try:
-        if abs(now - int(payload["ts"])) > NONCE_TTL:
-            return bad("nonce-expired")
-        aud = payload.get("aud")
-        nonce = payload.get("nonce")
-        if (not aud) or (not nonce):
-            return bad("missing-claims")
-        exp = NONCES.get(nonce)
-        if not exp or exp < now:
-            return bad("nonce-expired")
-        NONCES.pop(nonce, None)
-    except Exception:
-        return bad("bad-payload")
-    sid = "sess_" + secrets.token_hex(16)
-    sess_exp = now + SESSION_TTL
-    SESSIONS[sid] = {"kid": kid, "exp": sess_exp}
-    save_sessions()
-    await emit("auth", status="ok", aud=aud, kid=kid)
-    write_event("auth.verify_ok", kid=kid, aud=aud, sid=sid)
-    return ok(payload=payload, session=sid, exp=sess_exp)
-
-@app.get("/protected/hello")
-async def protected_hello(request: Request):
-    ip = request.client.host if request.client else "?"
-    if not rate_check(ip):
-        await emit("rate", ip=ip, status="limit")
-        write_event("rate_limit", ip=ip, path="/protected/hello")
-        await emit_alert("crit", "Rate limit", path="/protected/hello", ip=ip)
-        return bad("rate-limit")
-    token = _auth_token(request)
-    sess = require_session(token)
-    if not sess:
-        await emit("unauth", path="/protected/hello", ip=ip)
-        write_event("auth.unauthorized", ip=ip, path="/protected/hello")
-        return bad("unauthorized")
-    await emit("hello", kid=sess["kid"])
-    write_event("hello", kid=sess["kid"])
-    return ok(msg="hello dev-user", kid=sess["kid"], exp=sess["exp"])
-
-@app.post("/guardian/refresh")
-async def refresh(request: Request):
-    token = _auth_token(request)
-    sess = require_session(token)
-    if not sess:
-        await emit("unauth", path="/guardian/refresh")
-        return bad("unauthorized")
-    sess["exp"] = int(time.time()) + SESSION_TTL
-    save_sessions()
-    await emit("session", action="refresh", kid=sess["kid"], exp=sess["exp"])
-    write_event("auth.refresh", kid=sess["kid"], exp=sess["exp"])
-    return ok(exp=sess["exp"])
-
-@app.post("/guardian/logout")
-async def logout(request: Request):
-    token = _auth_token(request)
-    s = SESSIONS.pop(token, None)
-    save_sessions()
-    if s:
-        await emit("session", action="logout", kid=s["kid"])
-        write_event("auth.logout", kid=s["kid"])
-    return ok()
-
-# ===== Admin: events =====
-@app.get("/admin/events/tail")
-def admin_tail(request: Request, n: int = Query(200, ge=1, le=2000)):
-    token = _auth_token(request)
-    if not require_session(token):
-        return bad("unauthorized")
-    return {"ok": True, "items": tail_jsonl(EVENTS_JSONL, n)}
-
-def _flatten(d: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    for k, v in d.items():
-        kk = f"{prefix}.{k}" if prefix else k
-        if isinstance(v, dict):
-            out.update(_flatten(v, kk))
-        else:
-            out[kk] = v
-    return out
-
-@app.get("/admin/events/export.csv")
-def admin_csv(request: Request, n: int = Query(500, ge=1, le=5000)):
-    token = _auth_token(request)
-    if not require_session(token):
-        return bad("unauthorized")
-    rows = tail_jsonl(EVENTS_JSONL, n)
-    headers: List[str] = []
-    flat_rows: List[Dict[str, Any]] = []
-    for r in rows:
-        fr = _flatten(r)
-        flat_rows.append(fr)
-        for k in fr.keys():
-            if k not in headers:
-                headers.append(k)
-    buf = io.StringIO()
-    buf.write(",".join(headers) + "\n")
-    for fr in flat_rows:
-        vals: List[str] = []
-        for h in headers:
-            v = fr.get(h, "")
-            if isinstance(v, (dict, list)):
-                v = json.dumps(v, ensure_ascii=False)
-            s = str(v).replace('"', '""')
-            if any(c in s for c in [",", "\n", '"']):
-                s = f'"{s}"'
-            vals.append(s)
-        buf.write(",".join(vals) + "\n")
-    return PlainTextResponse(buf.getvalue(), media_type="text/csv")
-
-@app.get("/admin/events/search")
-def admin_search(
-    request: Request,
-    n: int = Query(1000, ge=10, le=10000),
-    path_re: str = "",
-    status: str = "",
-    method: str = "",
-):
-    token = _auth_token(request)
-    if not require_session(token):
-        return bad("unauthorized")
-    rows = tail_jsonl(EVENTS_JSONL, n)
-    rex = re.compile(path_re) if path_re else None
-
-    def status_match(code: int) -> bool:
-        if not status:
-            return True
-        s = str(status).lower()
-        if s in ("2xx", "4xx", "5xx"):
-            return str(code).startswith(s[0])
-        try:
-            return int(s) == int(code)
-        except Exception:
-            return False
-
-    out = []
-    for r in rows:
-        if r.get("kind") != "http":
-            continue
-        if method and r.get("method", "").upper() != method.upper():
-            continue
-        if rex and not rex.search(r.get("path", "")):
-            continue
-        if not status_match(int(r.get("status", 0))):
-            continue
-        out.append(r)
-    return {"ok": True, "items": out}
-
-@app.post("/admin/events/purge")
-def admin_purge(request: Request):
-    token = _auth_token(request)
-    if not require_session(token):
-        return bad("unauthorized")
-    try:
-        if os.path.exists(EVENTS_JSONL):
-            ts = int(time.time())
-            os.replace(EVENTS_JSONL, f"{EVENTS_JSONL}.{ts}.bak")
-        open(EVENTS_JSONL, "w", encoding="utf-8").close()
-        write_event("admin.purge")
-        return ok(msg="purged")
-    except Exception as e:
-        return bad("purge-failed", error=str(e))
-
-# NEW: ingest (single or batch)
-@app.post("/admin/events/ingest")
-async def admin_ingest(request: Request):
-    token = _auth_token(request)
-    if not require_session(token):
-        return bad("unauthorized")
-    try:
-        body = await request.json()
-    except Exception:
-        return bad("bad-json")
-
-    def store(evt: Dict[str, Any]):
-        if not isinstance(evt, dict):
-            return
-        kind = evt.get("kind", "ext")
-        data = dict(evt)
-        data.pop("kind", None)
-        write_event(kind, **data)
-
-    if isinstance(body, list):
-        for e in body:
-            store(e)
-        return ok(stored=len(body))
-    store(body)
-    return ok(stored=1)
-
-# ===== Snapshots =====
-@app.post("/admin/snaps/save")
-def snaps_save(
-    request: Request,
-    minutes: int = Query(60, ge=5, le=1440),
-    n: int = Query(5000, ge=200, le=50000),
-):
-    token = _auth_token(request)
-    if not require_session(token):
-        return bad("unauthorized")
-    snap = {
-        "ts": int(time.time()),
-        "version": API_VERSION,
-        "summary": _compute_summary(min(n, 10000)),
-        "rollup": _compute_rollup(minutes, n),
-        "health": _compute_health(max(200, min(n, 5000))),
-    }
-    name = time.strftime("snap-%Y%m%d-%H%M%S.json", time.gmtime(snap["ts"]))
-    path = os.path.join(SNAPS_DIR, name)
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(snap, f, ensure_ascii=False)
-        write_event("admin.snap_save", file=name)
-        return ok(file=name)
-    except Exception as e:
-        return bad("snap-save-failed", error=str(e))
-
-@app.get("/admin/snaps/list")
-def snaps_list(request: Request):
-    token = _auth_token(request)
-    if not require_session(token):
-        return bad("unauthorized")
-    files = sorted([fn for fn in os.listdir(SNAPS_DIR) if fn.endswith(".json")])
-    return ok(files=files)
-
-@app.get("/admin/snaps/get")
-def snaps_get(request: Request, name: str):
-    token = _auth_token(request)
-    if not require_session(token):
-        return bad("unauthorized")
-    safe = os.path.basename(name)
-    path = os.path.join(SNAPS_DIR, safe)
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return JSONResponse(data)
-    except Exception as e:
-        return bad("snap-not-found", error=str(e))
-
-# ===== Logs APIs =====
-@app.get("/api/logs/summary")
-def logs_summary(n: int = Query(1000, ge=10, le=10000)):
-    return _compute_summary(n)
-
-@app.get("/api/logs/rollup")
-def logs_rollup(
-    minutes: int = Query(60, ge=5, le=1440),
-    n: int = Query(10000, ge=100, le=50000),
-):
-    return _compute_rollup(minutes, n)
-
-@app.get("/api/logs/heatmap")
-def logs_heatmap(
-    minutes: int = Query(60, ge=5, le=1440),
-    n: int = Query(20000, ge=200, le=60000),
-):
-    roll = _compute_rollup(minutes, n)["series"]
-    maxc = max([c["count"] for c in roll], default=0)
-    cells = [{"t": c["t"], "count": c["count"]} for c in roll]
-    return {"ok": True, "minutes": minutes, "max": maxc, "cells": cells}
-
-@app.get("/api/logs/heatmap_status")
-def logs_heatmap_status(
-    minutes: int = Query(60, ge=5, le=1440),
-    n: int = Query(30000, ge=200, le=80000),
-):
-    now = int(time.time())
-    floor_start = now - minutes * 60
-    rows = [
-        r
-        for r in tail_jsonl(EVENTS_JSONL, n)
-        if r.get("kind") == "http" and r.get("ts", 0) >= floor_start
-    ]
-    idx: Dict[int, Dict[str, int]] = {}
-    for r in rows:
-        m = (int(r.get("ts", 0)) // 60) * 60
-        idx.setdefault(m, {"2": 0, "4": 0, "5": 0, "T": 0})
-        code = str(r.get("status", "200"))
-        if code.startswith("5"):
-            idx[m]["5"] += 1
-        elif code.startswith("4"):
-            idx[m]["4"] += 1
-        else:
-            idx[m]["2"] += 1
-        idx[m]["T"] += 1
-    series = []
-    maxc = 0
-    for m in range((floor_start // 60) * 60, (now // 60) * 60 + 60, 60):
-        b = idx.get(m, {"2": 0, "4": 0, "5": 0, "T": 0})
-        series.append(
-            {"t": m, "count": b["T"], "c2xx": b["2"], "c4xx": b["4"], "c5xx": b["5"]}
-        )
-        maxc = max(maxc, b["T"])
-    return {"ok": True, "minutes": minutes, "max": maxc, "cells": series[-minutes:]}
-
-# ===== Rate window stats =====
-@app.get("/api/rate/window_stats")
-def rate_window_stats(top: int = Query(10, ge=1, le=100)):
-    now = int(time.time())
-    out = []
-    for ip, buf in list(RATE.items()):
-        pruned = [t for t in buf if t > now - RATE_WINDOW]
-        RATE[ip] = pruned
-        if pruned:
-            out.append({"ip": ip, "count": len(pruned)})
-    out.sort(key=lambda x: x["count"], reverse=True)
-    return {
-        "ok": True,
-        "now": now,
-        "window_s": RATE_WINDOW,
-        "max": RATE_MAX,
-        "total_ips": len(out),
-        "ips": out[:top],
-    }
-
-# ===== Alerts polling =====
-@app.get("/api/alerts/poll")
-def alerts_poll(since: int = 0, limit: int = Query(30, ge=1, le=100)):
-    items = [a for a in ALERTS if a["ts"] > since]
-    return {"ok": True, "items": items[-limit:]}
-
-# ===== DIAG: echo public + signed =====
-class JWSReq(BaseModel):
-    jws: str
-
-@app.get("/api/diag/echo")
+@app.post("/api/diag/echo")
 def diag_echo(request: Request):
-    headers = {}
-    for k, v in request.headers.items():
-        kl = k.lower()
-        headers[k] = "***" if kl in ("authorization", "cookie") else v
     return {
         "ok": True,
-        "ts": int(time.time()),
         "ip": request.client.host if request.client else "?",
-        "method": request.method,
-        "path": request.url.path,
-        "query": dict(request.query_params),
-        "headers": headers,
-        "ua": request.headers.get("user-agent", ""),
+        "headers": {"user-agent": (request.headers.get("user-agent") or "")[:120]},
+        "ts": int(time.time()),
     }
 
 @app.post("/api/diag/echo_signed")
-def diag_echo_signed(req: JWSReq, request: Request):
+def diag_echo_signed(req: SignedJWS, request: Request):
+    def bad(code: str):
+        return JSONResponse({"ok": False, "err": code}, status_code=400)
     try:
-        h_b, p_b, s_b = req.jws.split(".")
-        header = json.loads(b64u_decode(h_b))
-        payload = json.loads(b64u_decode(p_b))
-        sig = b64u_decode(s_b)
-    except Exception:
-        return bad("bad-jws")
-    kid = header.get("kid")
-    alg = header.get("alg")
-    if alg != "EdDSA" or not kid or kid not in PUBKEYS:
-        return bad("bad-header")
-    try:
-        vk = VerifyKey(b64u_decode(PUBKEYS[kid]))
-        vk.verify((h_b + "." + p_b).encode(), sig)
-    except BadSignatureError:
-        return bad("bad-signature")
-    now = int(time.time())
-    try:
-        if abs(now - int(payload["ts"])) > NONCE_TTL:
+        parts = (req.jws or "").split(".")
+        if len(parts) != 3:
+            return bad("bad-jws")
+        h, p, s = parts
+        hdr = json.loads(b64u_decode(h))
+        kid = hdr.get("kid")
+        if not kid or kid not in PUBKEYS:
+            return bad("unknown-kid")
+        sig = b64u_decode(s)
+        msg = (h + "." + p).encode()
+        pk = b64u_decode(PUBKEYS[kid])
+        VerifyKey(pk).verify(msg, sig)
+        payload = json.loads(b64u_decode(p))
+        now = int(time.time())
+        nonce = payload.get("nonce")
+        if not nonce or nonce not in NONCES:
             return bad("nonce-expired")
         if payload.get("aud") != "diag":
             return bad("bad-aud")
@@ -864,6 +429,11 @@ def diag_echo_signed(req: JWSReq, request: Request):
 # ===== Prometheus exporter =====
 @app.get("/metrics")
 def metrics():
+    now = time.time()
+    # Lightweight cache to avoid recomputing on hot scrapes
+    if (now - METRICS_CACHE["ts"]) < METRICS_TTL and METRICS_CACHE["body"]:
+        return PlainTextResponse(METRICS_CACHE["body"], media_type="text/plain; version=0.0.4")
+
     summ = _compute_summary(1000)
     health = _compute_health(300)
     lines: List[str] = []
@@ -891,12 +461,93 @@ def metrics():
     for code, count in (summ["statuses"] or {}).items():
         h(f'mecloneme_http_status_recent_total{{code="{code}"}} {count}')
     body = "\n".join(lines) + "\n"
+    METRICS_CACHE["ts"] = now
+    METRICS_CACHE["body"] = body
     return PlainTextResponse(body, media_type="text/plain; version=0.0.4")
 
 # ===== AR engine (stub) =====
 @app.get("/ar/ping")
 def ar_ping():
     return {"ok": True, "engine": "stub", "ts": int(time.time())}
+
+@app.get("/ar/stub/avatar.svg", response_class=PlainTextResponse)
+def ar_stub_avatar(mood: str = Query("neutral"), scale: int = Query(64, ge=32, le=256)):
+    """Ultra-lekki SVG awatara (oczy + łuk ust). Zero bibliotek."""
+    size = scale
+    eye_dx = size*0.22
+    eye_y = size*0.38
+    mouth_y = size*0.68
+    # Mouth curvature by mood
+    k = {"happy": -0.18, "neutral": 0.0, "sad": 0.18}.get(mood, 0.0)
+    mouth = f"M {size*0.25} {mouth_y} Q {size*0.5} {mouth_y + size*k} {size*0.75} {mouth_y}"
+    svg = f"""
+<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 {size} {size}">
+  <circle cx="{size/2 - eye_dx}" cy="{eye_y}" r="{size*0.06}" fill="#111"/>
+  <circle cx="{size/2 + eye_dx}" cy="{eye_y}" r="{size*0.06}" fill="#111"/>
+  <path d="{mouth}" stroke="#111" stroke-width="{size*0.04}" fill="none" stroke-linecap="round"/>
+</svg>"""
+    return PlainTextResponse(svg, media_type="image/svg+xml")
+
+@app.get("/ar/stub/state")
+def ar_stub_state():
+    return {"ok": True, "mood": "neutral", "ts": int(time.time())}
+
+# ===== Export / Telemetry =====
+class ExportWebhook(BaseModel):
+    url: str
+    payload: Optional[Dict[str, Any]] = None
+    headers: Optional[Dict[str, str]] = None
+
+def _http_post_json(url: str, payload: Dict[str, Any], headers: Optional[Dict[str, str]] = None, timeout_s: int = 3) -> Dict[str, Any]:
+    import urllib.request, json as _json
+    data = _json.dumps(payload).encode()
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
+    if headers:
+        for k, v in headers.items():
+            req.add_header(k, v)
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        body = resp.read().decode("utf-8", "ignore")
+        return {"status": resp.status, "body": body}
+
+@app.post("/export/webhook")
+def export_webhook(inp: ExportWebhook):
+    """Forward JSON payload to an external webhook with tiny retry logic."""
+    payload = inp.payload or {"ok": True, "src": "mecloneme"}
+    tries = [0.0, 0.5, 1.0]
+    last = {"status": 0, "body": ""}
+    for backoff in tries:
+        try:
+            last = _http_post_json(inp.url, payload, headers=inp.headers)
+            if 200 <= last["status"] < 300:
+                break
+        except Exception as e:
+            last = {"status": 0, "body": f"err: {e}"}
+        time.sleep(backoff)
+    return {"ok": 200 <= (last.get("status") or 0) < 300, "last": last}
+
+class ExportS3Like(BaseModel):
+    url: str
+    content_b64: Optional[str] = None
+    text: Optional[str] = None
+    content_type: Optional[str] = "application/octet-stream"
+    method: Optional[str] = "PUT"
+
+@app.post("/export/s3")
+def export_s3_like(inp: ExportS3Like):
+    """Upload to a pre-signed URL (S3-compatible). No external deps."""
+    import urllib.request
+    if not (inp.content_b64 or inp.text):
+        return JSONResponse({"ok": False, "err": "no-content"}, status_code=400)
+    data = base64.b64decode(inp.content_b64) if inp.content_b64 else inp.text.encode()
+    req = urllib.request.Request(inp.url, data=data, method=inp.method or "PUT")
+    if inp.content_type:
+        req.add_header("Content-Type", inp.content_type)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return {"ok": 200 <= resp.status < 400, "status": resp.status}
+    except Exception as e:
+        return JSONResponse({"ok": False, "err": str(e)}, status_code=502)
 
 # ===== HTML (panel + mobile) =====
 PANEL_HTML = """<!doctype html>
@@ -906,429 +557,125 @@ PANEL_HTML = """<!doctype html>
   body{font-family: system-ui,-apple-system,Segoe UI,Roboto;margin:16px}
   .card{border:1px solid var(--bd);border-radius:8px;padding:12px}
   .btn{padding:6px 10px;border:1px solid var(--bd);border-radius:8px;background:var(--btn);cursor:pointer}
-  .btn[disabled]{opacity:.6;cursor:not-allowed}
-  .btn.active{outline:2px solid var(--ok);background:#edf7ed}
-  .btn.danger{border-color:var(--crit);color:var(--crit)}
-  .btn.danger.active{outline:2px solid var(--crit);background:#fdeaea}
-  #alert{display:none;border-radius:8px;padding:10px;margin:8px 0}
-  #alert.warn{display:block;background:#fff4e5;border:1px solid #ffe3b3}
-  #alert.crit{display:block;background:#fdeaea;border:1px solid #f5b7b1}
-  #toast{position:fixed;right:16px;bottom:16px;background:#111;color:#fff;padding:8px 12px;border-radius:8px;opacity:0;transition:opacity .2s}
-  #toast.show{opacity:.9}
-  pre{background:#f7f7f7;border:1px solid #eee;border-radius:8px;padding:12px}
-  .grid{display:grid;grid-template-columns:repeat(60,1fr);gap:2px}
-  .cell{height:18px;border-radius:3px;background:#eef5ee}
-  .pill{display:inline-block;padding:2px 6px;border-radius:10px;font-size:12px;color:#fff}
-  .pill.warn{background:#e09100}.pill.crit{background:#c62828}.pill.info{background:#2e7d32}
+  .btn[disabled]{opacity:.5}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .kv{font:12px/1.1 monospace}
+  .meter{height:6px;background:#eee;border-radius:8px;position:relative}
+  .meter>i{position:absolute;left:0;top:0;bottom:0;background:var(--ok);border-radius:8px}
+  .ok{color:var(--ok)} .warn{color:var(--warn)} .crit{color:var(--crit)}
+  #heatmap,#heatmapS{display:grid;grid-template-columns: repeat(10, 1fr);gap:4px}
+  .cell{height:22px;background:#eee;border-radius:3px;text-align:center;font:11px/22px system-ui}
 </style>
-<body>
-<h1>Guardian — mini panel</h1>
-
-<div id="alert"><b>STATUS:</b> <span id="alertText"></span></div>
-
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
-  <div class="card">
-    <h2>Challenge</h2>
-    <pre id="challenge" style="min-height:120px"></pre>
+<div class=card>
+  <div class=row>
+    <button id=ping class=btn>Ping API</button>
+    <button id=getDiag class=btn>Diag challenge</button>
+    <button id=echoSigned class=btn>Echo (signed)</button>
+    <button id=logout class=btn>Logout</button>
   </div>
-  <div class="card">
-    <h2>Live log <span id="ws" style="color:var(--ok)">WS: connected</span></h2>
-    <pre id="log" style="height:220px;overflow:auto"></pre>
+  <pre id=out class=kv></pre>
+</div>
+<div class=card>
+  <div class=row>
+    <button id=metrics class=btn>Metrics</button>
+    <button id=health class=btn>Health</button>
+    <button id=spark class=btn>Series</button>
   </div>
+  <pre id=metOut class=kv></pre>
+  <canvas id=sparkCanvas width=360 height=80 style="width:360px;height:80px;border:1px solid #eee;border-radius:6px"></canvas>
+  <div id=heatmap style="margin-top:8px"></div>
 </div>
-
-<div class="card" style="margin-top:16px">
-  <h2>Postęp projektu (tylko lokalnie — zapis w przeglądarce)</h2>
-  <div id="bars"></div>
-  <div style="margin-top:8px">
-    <button id="save" class="btn" data-group="progress">💾 Zapisz</button>
-    <button id="reset" class="btn" data-group="progress">↩︎ Reset</button>
+<div class=card>
+  <div class=row>
+    <input id=kid placeholder="kid" value="dev-key-1" class=btn>
+    <button id=arPing class=btn>AR /ping</button>
+    <a href="/ar/stub/avatar.svg?mood=happy" class=btn target=_blank>AR avatar (SVG)</a>
   </div>
+  <pre id=arOut class=kv></pre>
 </div>
-
-<div class="card" style="margin-top:16px">
-  <h2>CEO — N18 widżet (live) <span style="font-size:12px;color:#666">(Kiosk mode + autorefresh)</span></h2>
-  <div style="display:flex;gap:8px;flex-wrap:wrap;margin:6px 0">
-    <button id="kiosk" class="btn" data-group="n18">🖥️ Kiosk: OFF</button>
-    <button id="fs" class="btn" data-group="n18">⛶ Fullscreen</button>
-  </div>
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
-    <div>
-      <canvas id="spark" width="640" height="90" style="width:100%;border:1px solid #eee;border-radius:6px"></canvas>
-      <div style="font-size:12px;color:#666;margin-top:4px">Sparkline: p95/ms per-minute (ostatnie 60 min). Auto-refresh 5s.</div>
-      <div style="display:flex;gap:8px;margin-top:8px">
-        <button id="start" class="btn" data-group="n18">▶︎ Start</button>
-        <button id="stop" class="btn" data-group="n18">⏸ Stop</button>
-        <button id="once" class="btn" data-group="n18">↻ Odśwież teraz</button>
-      </div>
-      <pre id="healthOut" style="min-height:80px;margin-top:8px"></pre>
-    </div>
-    <div>
-      <div style="display:flex;gap:16px;align-items:center;margin-bottom:6px">
-        <div><b>Uptime:</b> <span id="uptime">-</span></div>
-        <div><b>p95:</b> <span id="p95">-</span> ms</div>
-        <div><b>4xx:</b> <span id="e4">0</span></div>
-        <div><b>5xx:</b> <span id="e5">0</span></div>
-      </div>
-      <b>Top ścieżki</b>
-      <ol id="topPaths" style="margin-top:6px"></ol>
-      <b>Statusy</b>
-      <pre id="codes" style="min-height:60px"></pre>
-      <b>Latencja (ms)</b>
-      <div id="latStats" style="font-family:ui-monospace, Menlo, monospace;"></div>
-    </div>
-  </div>
-</div>
-
-<div class="card" style="margin-top:16px">
-  <h2>Rate heatmap (60m)</h2>
-  <div id="heatmap" class="grid"></div>
-  <div style="font-size:12px;color:#666;margin-top:6px">Intensywność = liczba żądań/min. Najciemniejsze = max w oknie.</div>
-</div>
-
-<div class="card" style="margin-top:16px">
-  <h2>Heatmap status (60m)</h2>
-  <div id="heatmapS" class="grid"></div>
-  <div style="font-size:12px;color:#666;margin-top:6px">Kolor: zielony=2xx, pomarańczowy=4xx, czerwony=5xx (intensywność ~ liczba żądań).</div>
-</div>
-
-<div class="card" style="margin-top:16px">
-  <h2>Rate-limiter monitor</h2>
-  <div id="rateBox" style="font-family:ui-monospace,Menlo,monospace"></div>
-</div>
-
-<div class="card" style="margin-top:16px">
-  <h2>Alerts & signals <small>(WS + poll)</small>
-    <button id="mute" class="btn" data-group="alerts">🔈 Mute: OFF</button>
-  </h2>
-  <ol id="alerts"></ol>
-</div>
-
-<div class="card" style="margin-top:16px">
-  <h2>Diag & Snapshots</h2>
-  <div style="margin:6px 0">
-    <div>Token (Bearer) do snapshotów (z <code>/mobile</code> po verify):</div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:6px">
-      <input id="admTok" placeholder="sess_xxx" style="width:320px">
-      <button id="tokLoad" class="btn" data-group="diag">📥 Use stored</button>
-      <button id="tokSave" class="btn" data-group="diag">💾 Save</button>
-      <button id="tokClear" class="btn" data-group="diag">🗑️ Clear</button>
-    </div>
-  </div>
-  <div style="display:flex;gap:8px;flex-wrap:wrap;margin:6px 0">
-    <button id="btnEcho" class="btn" data-group="diag">🔎 Echo</button>
-    <button id="btnEchoCurl" class="btn" data-group="diag">📋 Copy cURL: Echo</button>
-    <button id="btnSnapSave" class="btn" data-group="diag">💾 Save snapshot</button>
-    <button id="btnSnapList" class="btn" data-group="diag">📚 List snapshots</button>
-    <button id="btnSnapGet" class="btn" data-group="diag">⬇️ Download last</button>
-    <button id="btnMetricsCurl" class="btn" data-group="diag">📋 Copy cURL: /metrics</button>
-    <button id="btnMetricsOpen" class="btn" data-group="diag">🔗 Open /metrics</button>
-  </div>
-  <pre id="diagOut" style="min-height:120px"></pre>
-</div>
-
-<div class="card" style="margin-top:16px">
-  <h2>Admin — szybkie testy</h2>
-  <div style="display:flex;gap:8px;flex-wrap:wrap;margin:6px 0">
-    <button id="btnTail" class="btn" data-group="admin">📜 Tail (50)</button>
-    <button id="btnTailCurl" class="btn" data-group="admin">📋 Copy cURL: Tail</button>
-    <button id="btnCSV" class="btn" data-group="admin">⬇️ CSV (200)</button>
-    <button id="btnCSVCurl" class="btn" data-group="admin">📋 Copy cURL: CSV</button>
-    <button id="btnSummary" class="btn" data-group="admin">📊 Summary (500)</button>
-    <button id="btnHealth" class="btn" data-group="admin">🩺 Health detail</button>
-    <button id="btnPurge" class="btn danger" data-group="admin">🧹 Purge log</button>
-    <button id="btnPurgeCurl" class="btn danger" data-group="admin">📋 Copy cURL: Purge</button>
-  </div>
-  <div style="display:flex;gap:8px;align-items:center;margin:6px 0">
-    <input id="re" placeholder="path regex (np. ^/api/)" style="width:240px">
-    <input id="st" placeholder="status (2xx|4xx|5xx|200)" style="width:160px">
-    <input id="md" placeholder="method (GET|POST)" style="width:140px">
-    <input id="nSearch" type="number" value="500" style="width:90px">
-    <button id="btnSearch" class="btn" data-group="admin">🔍 Search</button>
-    <button id="btnSearchCurl" class="btn" data-group="admin">📋 Copy cURL: Search</button>
-  </div>
-  <pre id="admOut" style="min-height:120px"></pre>
-</div>
-
-<div id="toast"></div>
-
 <script>
 const $=id=>document.getElementById(id);
-function toast(msg){ const t=$("toast"); t.textContent=msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"), 1200); }
-function setActive(button){ const group=button.getAttribute("data-group"); if(!group) return; document.querySelectorAll('[data-group="'+group+'"]').forEach(b=>b.classList.remove("active")); button.classList.add("active"); }
+const enc = new TextEncoder();
 
-// === Token store (multi-env) ===
-const TOK_SINGLE="guardian_session";
-const TOKMAP_KEY="guardian_tokens";
-function getTokMap(){ try{return JSON.parse(localStorage.getItem(TOKMAP_KEY)||"{}")}catch(_){return{}} }
-function setTokForOrigin(token){ const m=getTokMap(); m[location.origin]=token; localStorage.setItem(TOKMAP_KEY, JSON.stringify(m)); }
-function getTokForOrigin(){ return getTokMap()[location.origin] || "" }
+$("ping").onclick=async()=>{
+  const r=await fetch("/api/health");
+  $("out").textContent=JSON.stringify(await r.json(),null,2);
+};
 
-// === Kiosk helpers ===
-let wake=null;
-async function wakeOn(){ try{ if("wakeLock" in navigator){ wake = await navigator.wakeLock.request("screen"); wake.addEventListener?.("release",()=>{});} }catch(e){} }
-async function goFullscreen(){ try{ await (document.documentElement.requestFullscreen?.()||Promise.resolve()); }catch(e){} }
+$("metrics").onclick=async()=>{
+  const r=await fetch("/metrics");
+  $("metOut").textContent=await r.text();
+};
 
-// === Progress bars ===
-const LS_KEY="guardian_progress";
-const FIELDS=[["Guardian/Auth","ga"],["AR Engine (R&D)","ar"],["App Shell / UI","ui"],["Cloud & Deploy","cd"],["MVP (całość)","mvp"]];
-function renderBars(state){ const root=$("bars"); root.innerHTML="";
-  FIELDS.forEach(([label,key])=>{ const wrap=document.createElement("div");
-    wrap.style.display="grid";wrap.style.gridTemplateColumns="200px 1fr 42px 42px";wrap.style.gap="8px";wrap.style.alignItems="center";wrap.style.margin="6px 0";
-    const lab=document.createElement("div"); lab.textContent=label;
-    const bar=document.createElement("div"); bar.style.height="8px";bar.style.background="#eee";bar.style.borderRadius="4px";
-    const inner=document.createElement("div"); inner.style.height="100%";inner.style.width=(state[key]||0)+"%";inner.style.background="var(--ok)";inner.style.borderRadius="4px";bar.appendChild(inner);
-    const input=document.createElement("input"); input.type="number";input.min=0;input.max=100;input.value=state[key]||0;input.style.width="42px";
-    const pct=document.createElement("div"); pct.textContent=(state[key]||0)+"%";
-    input.oninput=()=>{let v=Math.max(0,Math.min(100,parseInt(input.value||"0",10)));inner.style.width=v+"%";pct.textContent=v+"%";state[key]=v;};
-    wrap.append(lab,bar,input,pct); root.appendChild(wrap); });
-}
+$("health").onclick=async()=>{
+  const r=await fetch("/api/health");
+  $("metOut").textContent=JSON.stringify(await r.json(),null,2);
+};
 
-// Sparkline + loaders
-let timer=null; const series=[];
-function drawSpark(values){ const cv=$("spark"); const ctx=cv.getContext("2d"); ctx.clearRect(0,0,cv.width,cv.height);
-  if(values.length<2) return; const pad=6, w=cv.width-pad*2, h=cv.height-pad*2; const min=Math.min(...values), max=Math.max(...values);
-  const norm=v => (max===min?0.5:(v-min)/(max-min)); ctx.beginPath();
-  values.forEach((v,i)=>{ const x=pad + (i/(values.length-1))*w; const y=pad + (1-norm(v))*h; if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y); });
-  ctx.lineWidth=2; ctx.strokeStyle="var(--ok)"; ctx.stroke(); }
+$("spark").onclick=async()=>{
+  const r=await fetch("/api/series");
+  const j=await r.json();
+  const cv=$("sparkCanvas"); const ctx=cv.getContext("2d");
+  ctx.clearRect(0,0,cv.width,cv.height);
+  const s=j.series||[]; if(!s.length) return;
+  const pad=6,w=cv.width-pad*2,h=cv.height-pad*2;
+  const maxC=Math.max(...s.map(x=>x.count));
+  ctx.beginPath();
+  s.forEach((x,i)=>{const y=h*(1-(x.count/(maxC||1)));const X=pad+i*(w/(s.length-1)); if(i)ctx.lineTo(X,y); else ctx.moveTo(X,y);});
+  ctx.lineWidth=2; ctx.strokeStyle="#2e7d32"; ctx.stroke();
+};
 
-function renderHeatmap(cells,max){ const root=$("heatmap"); root.innerHTML=""; cells.forEach(c=>{ const div=document.createElement("div"); div.className="cell";
-  const a=max? (c.count/max):0; div.style.background=`rgba(46,125,50, ${0.1+0.9*a})`; div.title=new Date(c.t*1000).toLocaleTimeString()+" – "+c.count+" req/min"; root.appendChild(div); }); }
-
-function renderHeatmapS(cells,max){ const root=$("heatmapS"); root.innerHTML="";
-  cells.forEach(c=>{ const div=document.createElement("div"); div.className="cell";
-    let rgb="46,125,50"; if(c.c5xx>0) rgb="198,40,40"; else if(c.c4xx>0) rgb="224,145,0";
-    const a=max? (c.count/max):0; div.style.background=`rgba(${rgb}, ${0.15+0.85*a})`;
-    div.title=new Date(c.t*1000).toLocaleTimeString()+` – 2xx:${c.c2xx} 4xx:${c.c4xx} 5xx:${c.c5xx}`; root.appendChild(div); }); }
-
-function renderRateBox(stats){ const box=$("rateBox"); const lines=[];
-  lines.push(`window=${stats.window_s}s, limit=${stats.max}/ip, ips=${stats.total_ips}`);
-  (stats.ips||[]).forEach((r,i)=>{ const bar="█".repeat(Math.max(1, Math.round((r.count/stats.max)*10))); lines.push(`${i+1}. ${r.ip.padEnd(15)} ${String(r.count).padStart(3)} ${bar}`); });
-  box.textContent=lines.join("\\n"); }
-
-const TOKKEY="guardian_session"; 
-$("admTok").value=localStorage.getItem(TOKKEY)||getTokForOrigin()||"";
-$("admTok").oninput=()=>localStorage.setItem(TOKKEY,$("admTok").value.trim());
-$("tokLoad").onclick=()=>{ setActive($("tokLoad")); const t=getTokForOrigin(); $("admTok").value=t; localStorage.setItem(TOKKEY,t); toast(t? "Załadowano token z pamięci":"Brak zapisanego."); };
-$("tokSave").onclick=()=>{ setActive($("tokSave")); const t=$("admTok").value.trim(); setTokForOrigin(t); localStorage.setItem(TOKKEY,t); toast("Token zapisany"); };
-$("tokClear").onclick=()=>{ setActive($("tokClear")); $("admTok").value=""; localStorage.removeItem(TOKKEY); setTokForOrigin(""); toast("Token wyczyszczony"); };
-
-function tok(){ return $("admTok").value.trim(); }
-function copy(text){ navigator.clipboard.writeText(text).then(()=>toast("Skopiowano")).catch(()=>toast("Nie udało się skopiować")); }
-async function withBusy(btn, fn){ try{ btn.setAttribute("disabled",""); setActive(btn); await fn(); } finally{ btn.removeAttribute("disabled"); } }
-
-// Alerts (WS + poll + beep)
-let muted=false; let lastAlert=0;
-$("mute").onclick=()=>{ muted=!muted; $("mute").textContent = muted? "🔇 Mute: ON":"🔈 Mute: OFF"; setActive($("mute")); };
-function beep(){ if(muted) return; try{ const ctx=new (window.AudioContext||window.webkitAudioContext)(); const o=ctx.createOscillator(); const g=ctx.createGain();
-  o.connect(g); g.connect(ctx.destination); o.type="sine"; o.frequency.setValueAtTime(880, ctx.currentTime);
-  g.gain.setValueAtTime(0.0001, ctx.currentTime); g.gain.exponentialRampToValueAtTime(0.2, ctx.currentTime+0.01);
-  g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime+0.25); o.start(); o.stop(ctx.currentTime+0.26); }catch(e){} }
-function pushAlert(rec){ const ul=$("alerts"); const li=document.createElement("li");
-  const pill=document.createElement("span"); pill.className="pill "+(rec.level||"info"); pill.textContent=rec.level.toUpperCase();
-  li.appendChild(pill); li.append(" "); li.appendChild(document.createTextNode(`[${new Date(rec.ts*1000).toLocaleTimeString()}] ${rec.title}`));
-  if(rec.meta){ li.appendChild(document.createElement("br")); li.appendChild(document.createTextNode(JSON.stringify(rec.meta))); }
-  ul.insertBefore(li, ul.firstChild); while(ul.children.length>15) ul.removeChild(ul.lastChild); beep(); lastAlert=Math.max(lastAlert, rec.ts); }
-async function pollAlerts(){ const r=await fetch('/api/alerts/poll?since='+lastAlert); const j=await r.json(); (j.items||[]).forEach(pushAlert); }
-
-// Loaders
-async function loadSummary(){ const r=await fetch('/api/logs/summary?n=500'); const j=await r.json();
-  const ul=$("topPaths"); ul.innerHTML=""; (j.paths_top5||[]).forEach(([p,c])=>{ const li=document.createElement('li'); li.textContent=p+"  ("+c+")"; ul.appendChild(li); });
-  $("codes").textContent=JSON.stringify(j.statuses||{},null,2);
-  const lat=j.latency_ms||{}; $("latStats").textContent=`p50=${lat.p50||0}ms  p95=${lat.p95||0}ms  avg=${lat.avg||0}ms  max=${lat.max||0}ms`;
-  $("p95").textContent=lat.p95||0; $("e4").textContent=(j.errors&&j.errors["4xx"])||0; $("e5").textContent=(j.errors&&j.errors["5xx"])||0; }
-async function loadHealth(){ const r=await fetch('/api/health/detail?n=300'); const j=await r.json();
-  $("healthOut").textContent=JSON.stringify({ts:j.ts, uptime_s:j.uptime_s, codes:j.codes, latency_ms:j.latency_ms, sample:j.sample_size},null,2);
-  $("uptime").textContent=j.uptime_s+"s"; const p95=(j.latency_ms&&j.latency_ms.p95)||0; const alert=$("alert"), txt=$("alertText"); alert.className=""; 
-  if(p95>=j.thresholds.crit){ alert.classList.add("crit"); alert.style.display="block"; txt.textContent=`CRIT: p95=${p95}ms (>= ${j.thresholds.crit})`; }
-  else if(p95>=j.thresholds.warn){ alert.classList.add("warn"); alert.style.display="block"; txt.textContent=`WARN: p95=${p95}ms (>= ${j.thresholds.warn})`; }
-  else { alert.style.display="none"; txt.textContent=""; } }
-async function loadRollup(){ const r=await fetch('/api/logs/rollup?minutes=60'); const j=await r.json(); const vals=(j.series||[]).map(pt=>pt.p95||0); if(vals.length){ series.length=0; vals.forEach(v=>series.push(v)); drawSpark(series); } }
-async function loadHeat(){ const r=await fetch('/api/logs/heatmap?minutes=60'); const j=await r.json(); renderHeatmap(j.cells||[], j.max||0); }
-async function loadHeatStatus(){ const r=await fetch('/api/logs/heatmap_status?minutes=60'); const j=await r.json(); renderHeatmapS(j.cells||[], j.max||0); }
-async function loadRateStats(){ const r=await fetch('/api/rate/window_stats?top=8'); const j=await r.json(); renderRateBox(j); }
-
-(async function init(){
-  try{ const r=await fetch('/auth/challenge'); $("challenge").textContent=JSON.stringify(await r.json(),null,2); } catch(e){ $("challenge").textContent="API offline"; }
-  try{ const wsUrl=(location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/shadow/ws"; const ws=new WebSocket(wsUrl);
-    ws.onmessage=(ev)=>{ try{ const j=JSON.parse(ev.data); if(j.vec && j.vec.alert){ pushAlert(j.vec.alert); return; }
-      const el=$("log"); el.textContent+=JSON.stringify(j)+"\\n"; el.scrollTop=el.scrollHeight; }catch(e){} }; }
-  catch(e){ const el=document.querySelector("#ws"); el.textContent="WS: error"; el.style.color="#c62828"; }
-
-  const state=JSON.parse(localStorage.getItem(LS_KEY)||"{}"); renderBars(state);
-  $("save").onclick=()=>{ localStorage.setItem(LS_KEY,JSON.stringify(state)); toast("Zapisano"); };
-  $("reset").onclick=()=>{ localStorage.removeItem(LS_KEY); location.reload(); };
-
-  $("start").onclick=()=>{ if(!window._n18){ window._n18=setInterval(async()=>{ await loadHealth(); await loadSummary(); await loadRollup(); await loadHeat(); await loadHeatStatus(); await loadRateStats(); await pollAlerts(); },5000); } setActive($("start")); };
-  $("stop").onclick=()=>{ if(window._n18){ clearInterval(window._n18); window._n18=null; } setActive($("stop")); };
-  $("once").onclick=()=>withBusy($("once"), async()=>{
-    try{ await loadHealth(); }catch(e){ $("healthOut").textContent="ERR health: "+(e.message||e); }
-    try{ await loadSummary(); }catch(e){}
-    try{ await loadRollup(); }catch(e){}
-    try{ await loadHeat(); }catch(e){}
-    try{ await loadHeatStatus(); }catch(e){}
-    try{ await loadRateStats(); }catch(e){}
-    try{ await pollAlerts(); }catch(e){}
-  });
-
-  // Kiosk: pamiętaj w LS i auto-włącz
-  const KIOSK_KEY="guardian_kiosk";
-  function setKioskUI(on){ $("kiosk").textContent= on? "🖥️ Kiosk: ON":"🖥️ Kiosk: OFF"; }
-  $("kiosk").onclick=async ()=>{ 
-    const on=localStorage.getItem(KIOSK_KEY)==="1";
-    const next = !on; 
-    localStorage.setItem(KIOSK_KEY, next ? "1" : "0");
-    setKioskUI(next); 
-    if(next){ $("start").click(); await wakeOn(); } 
-    setActive($("kiosk")); 
-  };
-  $("fs").onclick=()=>{ setActive($("fs")); goFullscreen(); };
-
-  setKioskUI(localStorage.getItem(KIOSK_KEY)==="1");
-  if(localStorage.getItem(KIOSK_KEY)==="1"){ $("start").click(); await wakeOn(); goFullscreen(); }
-
-  // Diag + Admin
-  $("btnEcho").onclick=()=>withBusy($("btnEcho"), async()=>{ const r=await fetch('/api/diag/echo'); $("diagOut").textContent=JSON.stringify(await r.json(),null,2); });
-  $("btnEchoCurl").onclick=()=>{ setActive($("btnEchoCurl")); copy(`curl "${location.origin}/api/diag/echo"`); };
-  $("btnSnapSave").onclick=()=>withBusy($("btnSnapSave"), async()=>{ const r=await fetch('/admin/snaps/save',{method:'POST',headers:{Authorization:'Bearer '+tok()}}); const j=await r.json(); $("diagOut").textContent=JSON.stringify(j,null,2); if(j.file) toast("Snapshot zapisany: "+j.file); });
-  $("btnSnapList").onclick=()=>withBusy($("btnSnapList"), async()=>{ const r=await fetch('/admin/snaps/list',{headers:{Authorization:'Bearer '+tok()}}); $("diagOut").textContent=JSON.stringify(await r.json(),null,2); });
-  $("btnSnapGet").onclick=()=>withBusy($("btnSnapGet"), async()=>{
-    const list=await (await fetch('/admin/snaps/list',{headers:{Authorization:'Bearer '+tok()}})).json();
-    const files=(list.files||[]); if(!files.length){ $("diagOut").textContent="Brak snapshotów."; return; }
-    const last=files[files.length-1]; const r=await fetch('/admin/snaps/get?name='+encodeURIComponent(last),{headers:{Authorization:'Bearer '+tok()}});
-    const j=await r.json(); $("diagOut").textContent=JSON.stringify(j,null,2);
-    const blob=new Blob([JSON.stringify(j,null,2)],{type:'application/json'}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=last; a.click(); URL.revokeObjectURL(url); toast("Pobrano "+last);
-  });
-  $("btnMetricsCurl").onclick=()=>{ setActive($("btnMetricsCurl")); copy(`curl "${location.origin}/metrics"`); };
-  $("btnMetricsOpen").onclick=()=>{ setActive($("btnMetricsOpen")); window.open('/metrics','_blank'); };
-
-  const origin=location.origin;
-  $("btnTail").onclick=()=>withBusy($("btnTail"), async()=>{ const r=await fetch('/admin/events/tail?n=50',{headers:{Authorization:'Bearer '+tok()}}); $("admOut").textContent=await r.text(); });
-  $("btnCSV").onclick=()=>withBusy($("btnCSV"), async()=>{ const r=await fetch('/admin/events/export.csv?n=200',{headers:{Authorization:'Bearer '+tok()}}); const blob=await r.blob(); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='events.csv'; a.click(); URL.revokeObjectURL(url); $("admOut").textContent="Pobrano events.csv"; });
-  $("btnSummary").onclick=()=>withBusy($("btnSummary"), async()=>{ const r=await fetch('/api/logs/summary?n=500'); $("admOut").textContent=JSON.stringify(await r.json(),null,2); });
-  $("btnHealth").onclick=()=>withBusy($("btnHealth"), async()=>{ const r=await fetch('/api/health/detail?n=300'); const j=await r.json(); $("admOut").textContent=JSON.stringify(j,null,2); });
-  $("btnPurge").onclick=()=>withBusy($("btnPurge"), async()=>{ if(!confirm('Na pewno usunąć zawartość events.jsonl?')) return; const r=await fetch('/admin/events/purge',{method:'POST',headers:{Authorization:'Bearer '+tok()}}); $("admOut").textContent=await r.text(); });
-  $("btnTailCurl").onclick=()=>{ setActive($("btnTailCurl")); copy(`curl -H "Authorization: Bearer ${tok()}" "${origin}/admin/events/tail?n=50"`); };
-  $("btnCSVCurl").onclick=()=>{ setActive($("btnCSVCurl")); copy(`curl -H "Authorization: Bearer ${tok()}" -o events.csv "${origin}/admin/events/export.csv?n=200"`); };
-  $("btnPurgeCurl").onclick=()=>{ setActive($("btnPurgeCurl")); copy(`curl -X POST -H "Authorization: Bearer ${tok()}" "${origin}/admin/events/purge"`); };
-
-  $("btnSearch").onclick=()=>withBusy($("btnSearch"), async()=>{ const qs=new URLSearchParams({n:$("nSearch").value,path_re:$("re").value,status:$("st").value,method:$("md").value}).toString();
-    const r=await fetch('/admin/events/search?'+qs,{headers:{Authorization:'Bearer '+tok()}}); $("admOut").textContent=await r.text(); });
-  $("btnSearchCurl").onclick=()=>{ setActive($("btnSearchCurl")); const qs=new URLSearchParams({n:$("nSearch").value,path_re:$("re").value,status:$("st").value,method:$("md").value}).toString();
-    copy(`curl -H "Authorization: Bearer ${tok()}" "${origin}/admin/events/search?${qs}"`); };
-
-  // Autostart „live”
-  await loadHealth(); await loadSummary(); await loadRollup(); await loadHeat(); await loadHeatStatus(); await loadRateStats(); await pollAlerts(); $("start").click();
-})();
+$("arPing").onclick=async()=>{
+  const r=await fetch("/ar/ping");
+  $("arOut").textContent=JSON.stringify(await r.json(),null,2);
+};
 </script>
-</body>
 """
 
 MOBILE_HTML = """<!doctype html>
-<meta charset="utf-8"><title>Guardian — Mobile Signer</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-  body{font-family:system-ui,-apple-system,Segoe UI,Roboto;margin:16px;line-height:1.25}
-  .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-  .card{border:1px solid #ddd;border-radius:10px;padding:10px}
-  pre,textarea,input{width:100%;box-sizing:border-box}
-  pre{background:#f7f7f7;border:1px solid #eee;border-radius:8px;white-space:pre-wrap;min-height:80px;padding:10px}
-  button{padding:8px 10px;border-radius:8px;border:1px solid #ddd;background:#f9f9f9}
-</style>
-<h1>Guardian — Mobile Signer</h1>
-
-<div class="row">
-  <div class="card">
-    <b>1) Klucz prywatny (PRIV, seed 32B)</b>
-    <input id="kid" placeholder="dev-key-1" style="margin:8px 0">
-    <textarea id="priv" rows="3" placeholder="Wklej PRIV z terminala (base64url)"></textarea>
-    <div class="muted">PRIV to seed 32B w base64url. Strona zapisuje go lokalnie w przeglądarce.</div>
-    <button id="save" style="margin-top:8px">💾 Zapisz w przeglądarce</button>
-  </div>
-
-  <div class="card">
-    <b>2) Rejestracja PUB</b>
-    <button id="register">🪪 Zarejestruj PUB na serwerze</button>
-    <pre id="regOut"></pre>
-  </div>
-</div>
-
-<div class="row" style="margin-top:10px">
-  <div class="card">
-    <b>3) Challenge</b>
-    <button id="getCh">🎯 Pobierz /auth/challenge</button>
-    <pre id="chOut"></pre>
-  </div>
-
-  <div class="card">
-    <b>4) Podpisz JWS i zweryfikuj</b>
-    <button id="verify">🔐 Podpisz & /guardian/verify</button>
-    <pre id="verOut"></pre>
-  </div>
-</div>
-
-<div class="card" style="margin-top:10px">
-  <b>5) Token (Bearer)</b><br><br>
-  <button id="ping">🔎 /protected/hello</button>
-  <button id="refresh">🔁 /guardian/refresh</button>
-  <button id="logout">🚪 /guardian/logout</button>
-  <pre id="pingOut"></pre>
-  <div>ETA tokenu: <span id="eta">-</span></div>
-</div>
-
-<div class="card" style="margin-top:10px">
-  <b>6) Echo (signed, aud=diag)</b><br><br>
-  <button id="getDiag">🎯 Pobierz /auth/challenge?aud=diag</button>
-  <button id="echoSigned">🔐 Podpisz & /api/diag/echo_signed</button>
-  <pre id="diagOut"></pre>
-</div>
-
-<script src="https://cdn.jsdelivr.net/npm/tweetnacl@1.0.3/nacl.min.js"></script>
-<script>
-const $=id=>document.getElementById(id);
-const enc=new TextEncoder();
-const b64u=b=>btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
-const fromB64u=s=>{ s=s.replace(/-/g,'+').replace(/_/g,'/'); while(s.length%4) s+='='; const bin=atob(s), out=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) out[i]=bin.charCodeAt(i); return out; };
-
-const TOK_SINGLE="guardian_session";
-const TOKMAP_KEY="guardian_tokens";
-function setTokForOrigin(token){ try{ const m=JSON.parse(localStorage.getItem(TOKMAP_KEY)||"{}"); m[location.origin]=token; localStorage.setItem(TOKMAP_KEY, JSON.stringify(m)); }catch(_){ } }
-
-const LS_KEY="guardian_priv_seed"; $("priv").value=localStorage.getItem(LS_KEY)||""; $("save").onclick=()=>{ localStorage.setItem(LS_KEY,$("priv").value.trim()); alert("Zapisano PRIV w przeglądarce."); };
-
-function getKeypair(){ const seedB64u=$("priv").value.trim(); if(!seedB64u) throw new Error("Brak PRIV"); const seed=fromB64u(seedB64u); if(seed.length!==32) throw new Error("PRIV (seed) musi być 32 bajty!"); return nacl.sign.keyPair.fromSeed(seed); }
-
-$("register").onclick=async ()=>{ try{ const kp=getKeypair(); const pub=b64u(kp.publicKey); const kid=$("kid").value.trim()||"dev-key-1";
-  const r=await fetch("/guardian/register_pubkey",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({kid,pub})}); $("regOut").textContent=await r.text();
-}catch(e){ $("regOut").textContent="ERR: "+e.message; }};
-
-let last=null,lastDiag=null,session=null,exp=0,ticker=null; function tick(){ const eta=Math.max(0, exp - Math.floor(Date.now()/1000)); $("eta").textContent=eta+"s"; }
-
-$("getCh").onclick=async ()=>{ const r=await fetch("/auth/challenge"); last=await r.json(); $("chOut").textContent=JSON.stringify(last,null,2); };
-
-$("verify").onclick=async ()=>{ try{
-  if(!last) throw new Error("Najpierw pobierz challenge."); const kid=$("kid").value.trim()||"dev-key-1";
-  const hdr={alg:"EdDSA", typ:"JWT", kid}; const pld={aud:last.aud, nonce:last.nonce, ts: Math.floor(Date.now()/1000)};
-  const h=b64u(enc.encode(JSON.stringify(hdr))); const p=b64u(enc.encode(JSON.stringify(pld))); const msg=enc.encode(h+"."+p);
-  const kp=getKeypair(); const sig=nacl.sign.detached(msg, kp.secretKey); const jws=h+"."+p+"."+b64u(sig);
-  const r=await fetch("/guardian/verify",{method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({jws})});
-  const j=await r.json(); $("verOut").textContent=JSON.stringify(j,null,2);
-  if(j.ok && j.session){ session=j.session; exp=j.exp; localStorage.setItem(TOK_SINGLE, session); setTokForOrigin(session); clearInterval(ticker); ticker=setInterval(tick,1000); tick(); }
-}catch(e){ $("verOut").textContent="ERR: "+e.message; }};
-
-$("ping").onclick=async ()=>{ const r=await fetch("/protected/hello",{ headers:{"Authorization":"Bearer "+(session||"")}}); $("pingOut").textContent=await r.text(); };
-$("refresh").onclick=async ()=>{ const r=await fetch("/guardian/refresh",{ method:"POST", headers:{"Authorization":"Bearer "+(session||"")}}); const j=await r.json(); if(j.ok){ exp=j.exp; } $("pingOut").textContent=JSON.stringify(j,null,2); };
-$("logout").onclick=async ()=>{ const r=await fetch("/guardian/logout",{ method:"POST", headers:{"Authorization":"Bearer "+(session||"")}}); const j=await r.json(); session=null; exp=0; tick(); $("pingOut").textContent=JSON.stringify(j,null,2); };
-
-$("getDiag").onclick=async ()=>{ const r=await fetch("/auth/challenge?aud=diag"); lastDiag=await r.json(); $("diagOut").textContent=JSON.stringify(lastDiag,null,2); };
-$("echoSigned").onclick=async ()=>{ try{
-  if(!lastDiag) throw new Error("Najpierw pobierz challenge (aud=diag)."); const kid=$("kid").value.trim()||"dev-key-1";
-  const hdr={alg:"EdDSA", typ:"JWT", kid}; const pld={aud:lastDiag.aud, nonce:lastDiag.nonce, ts: Math.floor(Date.now()/1000)};
-  const h=b64u(enc.encode(JSON.stringify(hdr))); const p=b64u(enc.encode(JSON.stringify(pld)));
-  const kp=getKeypair(); const sig=nacl.sign.detached(new TextEncoder().encode(h+"."+p), kp.secretKey);
-  const jws=h+"."+p+"."+b64u(sig);
-  const r=await fetch("/api/diag/echo_signed",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({jws})});
-  $("diagOut").textContent=JSON.stringify(await r.json(),null,2);
-}catch(e){ $("diagOut").textContent="ERR: "+e.message; } };
-</script>
+<meta charset="utf-8"><title>Mobile</title>
+<style>body{font-family:system-ui;margin:16px}</style>
+<h3>Mobile stub</h3>
+<p>TODO</p>
 """
+
+# ===== Series endpoint =====
+@app.get("/api/series")
+def series(minutes: int = Query(30, ge=1, le=240)):
+    return _compute_series(minutes)
+
+# ===== Alerts =====
+async def emit_alert(level: str, msg: str, cooldown_s: int = 5, **extra):
+    now = int(time.time())
+    key = f"{level}:{msg}"
+    last = LAST_ALERT_TS.get(key, 0)
+    if now - last < cooldown_s:
+        return
+    LAST_ALERT_TS[key] = now
+    entry = Alert(level=level, msg=msg, ts=now, extra=extra).dict()
+    ALERTS.append(entry)
+    ALERTS[:] = ALERTS[-200:]
+    write_shadow(kind="alert", **entry)
+
+@app.get("/alerts")
+def list_alerts():
+    return {"ok": True, "alerts": ALERTS[-50:]}
+
+# ===== Snapshots =====
+@app.post("/snapshots")
+def save_snapshot(s: Snapshot):
+    name = re.sub(r"[^a-zA-Z0-9_-]", "_", s.tag)[:48]
+    path = os.path.join(SNAPS_DIR, f"{name}_{int(time.time())}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"ts": int(time.time()), "payload": s.payload}, f)
+    return {"ok": True, "path": path}
+
+# ===== Admin =====
+@app.post("/admin/clear")
+def admin_clear():
+    for p in [EVENTS_JSONL, SHADOW_JSONL]:
+        try:
+            open(p, "w").close()
+        except Exception:
+            pass
+    return {"ok": True}
