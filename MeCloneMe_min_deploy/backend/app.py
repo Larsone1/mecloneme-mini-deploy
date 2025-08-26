@@ -1,5 +1,5 @@
 import os, time, json, base64, secrets, asyncio, io, statistics
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Query
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,11 +16,15 @@ def b64u_encode(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode().rstrip("=")
 
 # ===== Config (ENV) =====
-API_VERSION = os.getenv("API_VERSION","0.1.4")
+API_VERSION = os.getenv("API_VERSION","0.1.5")
 NONCE_TTL   = int(os.getenv("NONCE_TTL", "300"))   # s
 SESSION_TTL = int(os.getenv("SESSION_TTL", "900")) # s
 RATE_MAX    = int(os.getenv("RATE_MAX", "30"))     # max calls / window
 RATE_WINDOW = int(os.getenv("RATE_WINDOW", "10"))  # s
+
+# Alert progi dla p95 (ms)
+P95_WARN = int(os.getenv("P95_WARN", "300"))
+P95_CRIT = int(os.getenv("P95_CRIT", "800"))
 
 # ===== In-memory stores (demo) =====
 NONCES: Dict[str, int] = {}                 # nonce -> expiry ts
@@ -123,7 +127,10 @@ class WSManager:
             except Exception:
                 stale.append(ws)
         for ws in stale:
-            await ws.close()
+            try:
+                await ws.close()
+            except Exception:
+                pass
             await self.disconnect(ws)
 
 ws_manager = WSManager()
@@ -157,75 +164,115 @@ async def audit_mw(request: Request, call_next):
 # ===== Mini panel (admin + progress + quick tests + N18) =====
 PANEL_HTML = """<!doctype html>
 <meta charset="utf-8"><title>Guardian — mini panel</title>
-<body style="font-family: system-ui, -apple-system, Segoe UI, Roboto; margin:16px">
+<style>
+  :root{
+    --ok:#2e7d32; --warn:#e09100; --crit:#c62828; --btn:#f3f3f3; --bd:#e5e5e5;
+  }
+  body{font-family: system-ui,-apple-system,Segoe UI,Roboto;margin:16px}
+  .card{border:1px solid var(--bd);border-radius:8px;padding:12px}
+  .btn{padding:6px 10px;border:1px solid var(--bd);border-radius:8px;background:var(--btn);cursor:pointer}
+  .btn[disabled]{opacity:.6;cursor:not-allowed}
+  .btn.active{outline:2px solid #2e7d32;background:#edf7ed}
+  .btn.danger{border-color:var(--crit);color:var(--crit)}
+  .btn.danger.active{outline:2px solid var(--crit);background:#fdeaea}
+  #alert{display:none;border-radius:8px;padding:10px;margin:8px 0}
+  #alert.warn{display:block;background:#fff4e5;border:1px solid #ffe3b3}
+  #alert.crit{display:block;background:#fdeaea;border:1px solid #f5b7b1}
+  #toast{position:fixed;right:16px;bottom:16px;background:#111;color:#fff;padding:8px 12px;border-radius:8px;opacity:0;transition:opacity .2s}
+  #toast.show{opacity:.9}
+  pre{background:#f7f7f7;border:1px solid #eee;border-radius:8px;padding:12px}
+</style>
+<body>
 <h1>Guardian — mini panel</h1>
+
+<div id="alert"><b>STATUS:</b> <span id="alertText"></span></div>
+
 <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
-  <div style="border:1px solid #eee;border-radius:8px;padding:12px">
+  <div class="card">
     <h2>Challenge</h2>
-    <pre id="challenge" style="background:#f7f7f7;border:1px solid #eee;border-radius:8px;min-height:120px;padding:12px"></pre>
+    <pre id="challenge" style="min-height:120px"></pre>
   </div>
-  <div style="border:1px solid #eee;border-radius:8px;padding:12px">
-    <h2>Live log <span id="ws" style="color:#2e7d32">WS: connected</span></h2>
-    <pre id="log" style="background:#f7f7f7;border:1px solid #eee;border-radius:8px;height:220px;overflow:auto;padding:12px"></pre>
+  <div class="card">
+    <h2>Live log <span id="ws" style="color:var(--ok)">WS: connected</span></h2>
+    <pre id="log" style="height:220px;overflow:auto"></pre>
   </div>
 </div>
 
-<div style="border:1px solid #eee;border-radius:8px;padding:12px;margin-top:16px">
+<div class="card" style="margin-top:16px">
   <h2>Postęp projektu (tylko lokalnie — zapis w przeglądarce)</h2>
   <div id="bars"></div>
   <div style="margin-top:8px">
-    <button id="save">💾 Zapisz</button>
-    <button id="reset">↩︎ Reset</button>
+    <button id="save" class="btn">💾 Zapisz</button>
+    <button id="reset" class="btn">↩︎ Reset</button>
   </div>
 </div>
 
-<div style="border:1px solid #eee;border-radius:8px;padding:12px;margin-top:16px">
+<div class="card" style="margin-top:16px">
   <h2>CEO — N18 widżet (live)</h2>
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
     <div>
       <canvas id="spark" width="640" height="90" style="width:100%;border:1px solid #eee;border-radius:6px"></canvas>
-      <div style="font-size:12px;color:#666;margin-top:4px">Sparkline: ostatnie p95(ms). Auto-refresh co 5s.</div>
+      <div style="font-size:12px;color:#666;margin-top:4px">Sparkline: p95/ms per-minute (ostatnie 60 min). Auto-refresh 5s.</div>
       <div style="display:flex;gap:8px;margin-top:8px">
-        <button id="start">▶︎ Start</button>
-        <button id="stop">⏸ Stop</button>
-        <button id="once">↻ Odśwież teraz</button>
+        <button id="start" class="btn">▶︎ Start</button>
+        <button id="stop" class="btn">⏸ Stop</button>
+        <button id="once" class="btn">↻ Odśwież teraz</button>
       </div>
-      <pre id="healthOut" style="background:#f7f7f7;border:1px solid #eee;border-radius:8px;min-height:80px;padding:10px;margin-top:8px"></pre>
+      <pre id="healthOut" style="min-height:80px;margin-top:8px"></pre>
     </div>
     <div>
+      <div style="display:flex;gap:16px;align-items:center;margin-bottom:6px">
+        <div><b>Uptime:</b> <span id="uptime">-</span></div>
+        <div><b>p95:</b> <span id="p95">-</span> ms</div>
+        <div><b>4xx:</b> <span id="e4">0</span></div>
+        <div><b>5xx:</b> <span id="e5">0</span></div>
+      </div>
       <b>Top ścieżki</b>
       <ol id="topPaths" style="margin-top:6px"></ol>
       <b>Statusy</b>
-      <pre id="codes" style="background:#f7f7f7;border:1px solid #eee;border-radius:8px;min-height:60px;padding:10px"></pre>
+      <pre id="codes" style="min-height:60px"></pre>
       <b>Latencja (ms)</b>
       <div id="latStats" style="font-family:ui-monospace, Menlo, monospace;"></div>
     </div>
   </div>
 </div>
 
-<div style="border:1px solid #eee;border-radius:8px;padding:12px;margin-top:16px">
+<div class="card" style="margin-top:16px">
   <h2>Admin — szybkie testy</h2>
   <div style="margin:6px 0">
     Token (Bearer) z <code>/mobile</code> po <i>verify</i> (zapamięta się lokalnie):
     <input id="admTok" placeholder="sess_xxx" style="width:320px">
   </div>
-  <div style="display:flex;gap:8px;flex-wrap:wrap;margin:6px 0">
-    <button id="btnTail">📜 Tail (50)</button>
-    <button id="btnTailCurl">📋 Copy cURL: Tail</button>
-    <button id="btnCSV">⬇️ CSV (200)</button>
-    <button id="btnCSVCurl">📋 Copy cURL: CSV</button>
-    <button id="btnSummary">📊 Summary (500)</button>
-    <button id="btnHealth">🩺 Health detail</button>
-    <button id="btnPurge" style="color:#b71c1c;border-color:#b71c1c">🧹 Purge log</button>
-    <button id="btnPurgeCurl" style="color:#b71c1c;border-color:#b71c1c">📋 Copy cURL: Purge</button>
+  <div id="adminBtns" style="display:flex;gap:8px;flex-wrap:wrap;margin:6px 0">
+    <button id="btnTail" class="btn" data-group="admin">📜 Tail (50)</button>
+    <button id="btnTailCurl" class="btn" data-group="admin">📋 Copy cURL: Tail</button>
+    <button id="btnCSV" class="btn" data-group="admin">⬇️ CSV (200)</button>
+    <button id="btnCSVCurl" class="btn" data-group="admin">📋 Copy cURL: CSV</button>
+    <button id="btnSummary" class="btn" data-group="admin">📊 Summary (500)</button>
+    <button id="btnHealth" class="btn" data-group="admin">🩺 Health detail</button>
+    <button id="btnPurge" class="btn danger" data-group="admin">🧹 Purge log</button>
+    <button id="btnPurgeCurl" class="btn danger" data-group="admin">📋 Copy cURL: Purge</button>
   </div>
-  <pre id="admOut" style="background:#f7f7f7;border:1px solid #eee;border-radius:8px;min-height:120px;padding:12px"></pre>
+  <pre id="admOut" style="min-height:120px"></pre>
 </div>
+
+<div id="toast"></div>
 
 <script>
 const $=id=>document.getElementById(id);
 
-// Progress bars (local only)
+// ---- Toast
+function toast(msg){ const t=$("toast"); t.textContent=msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"), 1200); }
+
+// ---- Active buttons
+function setActive(button){ 
+  const group = button.getAttribute("data-group"); 
+  if(!group) return;
+  document.querySelectorAll('[data-group="'+group+'"]').forEach(b=>b.classList.remove("active"));
+  button.classList.add("active");
+}
+
+// ---- Progress bars (local only)
 const LS_KEY="guardian_progress";
 const FIELDS=[["Guardian/Auth","ga"],["AR Engine (R&D)","ar"],["App Shell / UI","ui"],["Cloud & Deploy","cd"],["MVP (całość)","mvp"]];
 function renderBars(state){
@@ -235,7 +282,7 @@ function renderBars(state){
     wrap.style.display="grid";wrap.style.gridTemplateColumns="200px 1fr 42px 42px";wrap.style.gap="8px";wrap.style.alignItems="center";wrap.style.margin="6px 0";
     const lab=document.createElement("div"); lab.textContent=label;
     const bar=document.createElement("div"); bar.style.height="8px";bar.style.background="#eee";bar.style.borderRadius="4px";
-    const inner=document.createElement("div"); inner.style.height="100%";inner.style.width=(state[key]||0)+"%";inner.style.background="#2e7d32";inner.style.borderRadius="4px";
+    const inner=document.createElement("div"); inner.style.height="100%";inner.style.width=(state[key]||0)+"%";inner.style.background="var(--ok)";inner.style.borderRadius="4px";
     bar.appendChild(inner);
     const input=document.createElement("input"); input.type="number";input.min=0;input.max=100;input.value=state[key]||0;input.style.width="42px";
     const pct=document.createElement("div"); pct.textContent=(state[key]||0)+"%";
@@ -244,11 +291,10 @@ function renderBars(state){
   });
 }
 
-// N18 widget — sparkline + summary
+// ---- N18 widget — sparkline (per-minute p95)
 let timer=null; const series=[];
 function drawSpark(values){
-  const cv=$("spark"); const ctx=cv.getContext("2d");
-  ctx.clearRect(0,0,cv.width,cv.height);
+  const cv=$("spark"); const ctx=cv.getContext("2d"); ctx.clearRect(0,0,cv.width,cv.height);
   if(values.length<2) return;
   const pad=6, w=cv.width-pad*2, h=cv.height-pad*2;
   const min=Math.min(...values), max=Math.max(...values);
@@ -259,29 +305,39 @@ function drawSpark(values){
     const y=pad + (1-norm(v))*h;
     if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
   });
-  ctx.lineWidth=2; ctx.strokeStyle="#2e7d32"; ctx.stroke();
+  ctx.lineWidth=2; ctx.strokeStyle="var(--ok)"; ctx.stroke();
+}
+
+async function loadRollup(){
+  const r=await fetch('/api/logs/rollup?minutes=60'); const j=await r.json();
+  const vals=(j.series||[]).map(pt=>pt.p95||0);
+  if(vals.length){ series.length=0; vals.forEach(v=>series.push(v)); drawSpark(series); }
 }
 
 async function loadSummary(){
   const r=await fetch('/api/logs/summary?n=500'); const j=await r.json();
-  const ul=$("topPaths"); ul.innerHTML="";
-  (j.paths_top5||[]).forEach(([p,c])=>{ const li=document.createElement('li'); li.textContent=p+"  ("+c+")"; ul.appendChild(li); });
+  const ul=$("topPaths"); ul.innerHTML=""; (j.paths_top5||[]).forEach(([p,c])=>{ const li=document.createElement('li'); li.textContent=p+"  ("+c+")"; ul.appendChild(li); });
   $("codes").textContent=JSON.stringify(j.statuses||{},null,2);
-  const lat=j.latency_ms||{};
-  $("latStats").textContent=`p50=${lat.p50||0}ms  p95=${lat.p95||0}ms  avg=${lat.avg||0}ms  max=${lat.max||0}ms`;
+  const lat=j.latency_ms||{}; $("latStats").textContent=`p50=${lat.p50||0}ms  p95=${lat.p95||0}ms  avg=${lat.avg||0}ms  max=${lat.max||0}ms`;
+  $("p95").textContent = lat.p95||0;
+  $("e4").textContent = (j.errors&&j.errors["4xx"])||0;
+  $("e5").textContent = (j.errors&&j.errors["5xx"])||0;
 }
 
 async function loadHealth(){
   const r=await fetch('/api/health/detail?n=200'); const j=await r.json();
   $("healthOut").textContent=JSON.stringify({ts:j.ts, uptime_s:j.uptime_s, codes:j.codes, latency_ms:j.latency_ms, sample:j.sample_size},null,2);
-  // sparkline data = p95 history
+  $("uptime").textContent = j.uptime_s+"s";
   const p95=(j.latency_ms&&j.latency_ms.p95)||0;
-  series.push(p95); while(series.length>60) series.shift();
-  drawSpark(series);
+  // Alert banner
+  const alert=$("alert"), txt=$("alertText");
+  alert.className=""; if(p95>=j.thresholds.crit){ alert.classList.add("crit"); txt.textContent=`CRIT: p95=${p95}ms (>= ${j.thresholds.crit})`; }
+  else if(p95>=j.thresholds.warn){ alert.classList.add("warn"); txt.textContent=`WARN: p95=${p95}ms (>= ${j.thresholds.warn})`; }
+  else { alert.style.display="none"; txt.textContent=""; }
 }
 
-function start(){ if(timer) return; timer=setInterval(async()=>{ try{ await loadHealth(); await loadSummary(); }catch(e){} }, 5000); }
-function stop(){ if(timer){ clearInterval(timer); timer=null; } }
+function start(){ if(timer) return; timer=setInterval(async()=>{ try{ await loadHealth(); await loadSummary(); await loadRollup(); }catch(e){} }, 5000); $("start").classList.add("active"); $("stop").classList.remove("active"); }
+function stop(){ if(timer){ clearInterval(timer); timer=null; } $("stop").classList.add("active"); $("start").classList.remove("active"); }
 
 (async function init(){
   // challenge preview
@@ -292,39 +348,44 @@ function stop(){ if(timer){ clearInterval(timer); timer=null; } }
   try{
     const wsUrl=(location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/shadow/ws";
     const ws=new WebSocket(wsUrl);
-    ws.onmessage=(ev)=>{ try{ const j=JSON.parse(ev.data); const el=document.getElementById("log"); el.textContent+=JSON.stringify(j)+"\\n"; el.scrollTop=el.scrollHeight; }catch(e){ } };
-  }catch(e){ const el=document.querySelector("#ws"); el.textContent="WS: error"; el.style.color="#b71c1c"; }
+    ws.onmessage=(ev)=>{ try{ const j=JSON.parse(ev.data); const el=$("log"); el.textContent+=JSON.stringify(j)+"\\n"; el.scrollTop=el.scrollHeight; }catch(e){ } };
+  }catch(e){ const el=document.querySelector("#ws"); el.textContent="WS: error"; el.style.color="#c62828"; }
 
   // progress bars state
   const state=JSON.parse(localStorage.getItem(LS_KEY)||"{}"); renderBars(state);
-  document.getElementById("save").onclick=()=>localStorage.setItem(LS_KEY,JSON.stringify(state));
-  document.getElementById("reset").onclick=()=>{ localStorage.removeItem(LS_KEY); location.reload(); };
+  $("save").onclick=()=>{ localStorage.setItem(LS_KEY,JSON.stringify(state)); toast("Zapisano"); };
+  $("reset").onclick=()=>{ localStorage.removeItem(LS_KEY); location.reload(); };
 
   // Admin quick tests — token persistence
   const TOKKEY="guardian_session";
-  $("admTok").value=localStorage.getItem(TOKKEY)||"";
-  $("admTok").oninput=()=>localStorage.setItem(TOKKEY,$("admTok").value.trim());
+  $("admTok").value=localStorage.getItem(TOKKEY)||""; $("admTok").oninput=()=>localStorage.setItem(TOKKEY,$("admTok").value.trim());
   function tok(){ return $("admTok").value.trim(); }
   const origin=location.origin;
-  async function copy(text){ try{ await navigator.clipboard.writeText(text); $("admOut").textContent="Skopiowano do schowka."; }catch(e){ $("admOut").textContent="Nie udało się skopiować."; } }
+  async function copy(text){ try{ await navigator.clipboard.writeText(text); toast("Skopiowano"); }catch(e){ toast("Nie udało się skopiować"); } }
+  async function withBusy(btn, fn){
+    try{ btn.setAttribute("disabled",""); setActive(btn); await fn(); }
+    finally{ btn.removeAttribute("disabled"); }
+  }
 
   // Admin buttons
-  $("btnTail").onclick=async()=>{ const r=await fetch('/admin/events/tail?n=50',{headers:{Authorization:'Bearer '+tok()}}); $("admOut").textContent=await r.text(); };
-  $("btnCSV").onclick=async()=>{
+  $("btnTail").onclick=()=>withBusy($("btnTail"), async()=>{ const r=await fetch('/admin/events/tail?n=50',{headers:{Authorization:'Bearer '+tok()}}); $("admOut").textContent=await r.text(); });
+  $("btnCSV").onclick=()=>withBusy($("btnCSV"), async()=>{
     const r=await fetch('/admin/events/export.csv?n=200',{headers:{Authorization:'Bearer '+tok()}});
-    const blob=await r.blob(); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='events.csv'; a.click(); URL.revokeObjectURL(url);
-    $("admOut").textContent="Pobrano events.csv";
-  };
-  $("btnSummary").onclick=async()=>{ const r=await fetch('/api/logs/summary?n=500'); $("admOut").textContent=JSON.stringify(await r.json(),null,2); };
-  $("btnHealth").onclick=async()=>{ const r=await fetch('/api/health/detail?n=200'); $("admOut").textContent=JSON.stringify(await r.json(),null,2); };
-  $("btnPurge").onclick=async()=>{ if(!confirm('Na pewno usunąć zawartość events.jsonl?')) return; const r=await fetch('/admin/events/purge',{method:'POST',headers:{Authorization:'Bearer '+tok()}}); $("admOut").textContent=await r.text(); };
-  $("btnTailCurl").onclick=()=>copy(`curl -H "Authorization: Bearer ${tok()}" "${origin}/admin/events/tail?n=50"`);
-  $("btnCSVCurl").onclick=()=>copy(`curl -H "Authorization: Bearer ${tok()}" -o events.csv "${origin}/admin/events/export.csv?n=200"`);
-  $("btnPurgeCurl").onclick=()=>copy(`curl -X POST -H "Authorization: Bearer ${tok()}" "${origin}/admin/events/purge"`);
+    const blob=await r.blob(); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='events.csv'; a.click(); URL.revokeObjectURL(url); $("admOut").textContent="Pobrano events.csv";
+  });
+  $("btnSummary").onclick=()=>withBusy($("btnSummary"), async()=>{ const r=await fetch('/api/logs/summary?n=500'); $("admOut").textContent=JSON.stringify(await r.json(),null,2); });
+  $("btnHealth").onclick=()=>withBusy($("btnHealth"), async()=>{ const r=await fetch('/api/health/detail?n=200'); $("admOut").textContent=JSON.stringify(await r.json(),null,2); });
+  $("btnPurge").onclick=()=>withBusy($("btnPurge"), async()=>{ if(!confirm('Na pewno usunąć zawartość events.jsonl?')) return; const r=await fetch('/admin/events/purge',{method:'POST',headers:{Authorization:'Bearer '+tok()}}); $("admOut").textContent=await r.text(); });
+  $("btnTailCurl").onclick=()=>{ setActive($("btnTailCurl")); copy(`curl -H "Authorization: Bearer ${tok()}" "${origin}/admin/events/tail?n=50"`); };
+  $("btnCSVCurl").onclick=()=>{ setActive($("btnCSVCurl")); copy(`curl -H "Authorization: Bearer ${tok()}" -o events.csv "${origin}/admin/events/export.csv?n=200"`); };
+  $("btnPurgeCurl").onclick=()=>{ setActive($("btnPurgeCurl")); copy(`curl -X POST -H "Authorization: Bearer ${tok()}" "${origin}/admin/events/purge"`); };
 
   // N18 controls
-  $("start").onclick=start; $("stop").onclick=stop; $("once").onclick=async()=>{ await loadHealth(); await loadSummary(); };
-  await loadHealth(); await loadSummary(); start();
+  $("start").onclick=()=>{ setActive($("start")); start(); };
+  $("stop").onclick=()=>{ setActive($("stop")); stop(); };
+  $("once").onclick=()=>withBusy($("once"), async()=>{ await loadHealth(); await loadSummary(); await loadRollup(); });
+
+  await loadHealth(); await loadSummary(); await loadRollup(); start();
 })();
 </script>
 </body>
@@ -448,7 +509,7 @@ $("verify").onclick = async ()=>{
     $("verOut").textContent = JSON.stringify(j,null,2);
     if(j.ok && j.session){
       session=j.session; exp=j.exp;
-      localStorage.setItem("guardian_session", session); // zapisz token dla panelu
+      localStorage.setItem("guardian_session", session);
       clearInterval(ticker); ticker=setInterval(tick,1000); tick();
     }
   }catch(e){ $("verOut").textContent = "ERR: "+e.message; }
@@ -499,10 +560,10 @@ def ok(**payload):
     return JSONResponse(data)
 
 def require_session(token: str) -> Optional[Dict[str, Any]]:
-    if not token or not token.startswith("sess_"): 
+    if not token or not token.startswith("sess_"):
         return None
     s = SESSIONS.get(token)
-    if not s: 
+    if not s:
         return None
     if s["exp"] < int(time.time()):
         SESSIONS.pop(token, None)
@@ -762,7 +823,7 @@ def admin_purge(request: Request):
     except Exception as e:
         return bad("purge-failed", error=str(e))
 
-# ===== Logs summary & health detail =====
+# ===== Logs summary, rollup & health detail =====
 def _quantiles(vals: List[int]) -> Dict[str, int]:
     if not vals: return {"p50":0,"p95":0,"avg":0,"max":0}
     p50 = int(statistics.quantiles(vals, n=100)[49]) if len(vals) >= 2 else vals[0]
@@ -790,6 +851,26 @@ def logs_summary(n: int = Query(1000, ge=10, le=10000)):
     err5 = sum(v for k,v in by_status.items() if k.startswith("5"))
     return {"ok": True,"total": total,"paths_top5": top_paths,"methods": by_method,"statuses": by_status,"latency_ms": lat_q,"errors": {"4xx": err4, "5xx": err5}}
 
+@app.get("/api/logs/rollup")
+def logs_rollup(minutes: int = Query(60, ge=5, le=1440), n: int = Query(10000, ge=100, le=50000)):
+    """Per-minute p95 + count for last <minutes>. Reads last N lines best-effort."""
+    now = int(time.time())
+    floor_start = now - minutes*60
+    rows = [r for r in tail_jsonl(EVENTS_JSONL, n) if r.get("kind")=="http" and r.get("ts",0)>=floor_start]
+    buckets: Dict[int, List[int]] = {}
+    counts: Dict[int, int] = {}
+    for r in rows:
+        t = int(r.get("ts",0))
+        m = (t // 60) * 60
+        buckets.setdefault(m, []).append(int(r.get("ms",0)))
+        counts[m] = counts.get(m,0)+1
+    series = []
+    for m in range((floor_start//60)*60, (now//60)*60 + 60, 60):
+        vals = buckets.get(m, [])
+        q = _quantiles(vals) if vals else {"p50":0,"p95":0,"avg":0,"max":0}
+        series.append({"t": m, "p95": q["p95"], "count": counts.get(m,0)})
+    return {"ok": True, "series": series[-minutes:]}
+
 @app.get("/api/health/detail")
 def health_detail(n: int = Query(200, ge=20, le=5000)):
     rows = [r for r in tail_jsonl(EVENTS_JSONL, n) if r.get("kind")=="http"]
@@ -798,7 +879,22 @@ def health_detail(n: int = Query(200, ge=20, le=5000)):
     codes: Dict[str,int] = {}
     for r in rows:
         k = str(r.get("status","?")); codes[k] = codes.get(k,0)+1
-    return {"ok": True,"ts": int(time.time()),"version": API_VERSION,"uptime_s": int(time.time()) - BOOT_TS,"req_count": REQ_COUNT,"rate_window_s": RATE_WINDOW,"latency_ms": lat_q,"codes": codes,"sample_size": len(rows)}
+    level = "ok"
+    if lat_q["p95"] >= P95_CRIT: level = "crit"
+    elif lat_q["p95"] >= P95_WARN: level = "warn"
+    return {
+        "ok": True,
+        "ts": int(time.time()),
+        "version": API_VERSION,
+        "uptime_s": int(time.time()) - BOOT_TS,
+        "req_count": REQ_COUNT,
+        "rate_window_s": RATE_WINDOW,
+        "latency_ms": lat_q,
+        "codes": codes,
+        "sample_size": len(rows),
+        "level": level,
+        "thresholds": {"warn": P95_WARN, "crit": P95_CRIT}
+    }
 
 # ===== AR engine (stub / R&D) =====
 @app.get("/ar/ping")
