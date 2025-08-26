@@ -1,4 +1,4 @@
-import os, time, json, base64, secrets, io, statistics, re
+import os, time, json, base64, secrets, io, re
 from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Query
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
@@ -9,6 +9,7 @@ from nacl.exceptions import BadSignatureError
 
 # ===== Base64url helpers =====
 def b64u_decode(s: str) -> bytes:
+    s = s or ""
     s += "=" * (-len(s) % 4)
     return base64.urlsafe_b64decode(s.encode())
 
@@ -16,7 +17,7 @@ def b64u_encode(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode().rstrip("=")
 
 # ===== Config (ENV) =====
-API_VERSION = os.getenv("API_VERSION","0.3.0")
+API_VERSION = os.getenv("API_VERSION", "0.3.1")
 NONCE_TTL   = int(os.getenv("NONCE_TTL", "300"))
 SESSION_TTL = int(os.getenv("SESSION_TTL", "900"))
 RATE_MAX    = int(os.getenv("RATE_MAX", "30"))
@@ -32,13 +33,20 @@ RATE: Dict[str, List[int]] = {}             # ip -> [timestamps]
 ALERTS: List[Dict[str, Any]] = []           # rolling alerts
 
 # ===== Simple persistence =====
-DATA_DIR = "data"; LOG_DIR = "logs"; SNAPS_DIR = os.path.join(LOG_DIR,"snaps")
-os.makedirs(DATA_DIR, exist_ok=True); os.makedirs(LOG_DIR, exist_ok=True); os.makedirs(SNAPS_DIR, exist_ok=True)
-PUBKEYS_PATH = os.path.join(DATA_DIR, "pubkeys.json"); SESSIONS_PATH = os.path.join(DATA_DIR, "sessions.json")
-EVENTS_JSONL = os.path.join(LOG_DIR,  "events.jsonl"); SHADOW_JSONL = os.path.join(LOG_DIR,  "shadow.jsonl")
+DATA_DIR = "data"
+LOG_DIR = "logs"
+SNAPS_DIR = os.path.join(LOG_DIR, "snaps")
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(SNAPS_DIR, exist_ok=True)
+PUBKEYS_PATH = os.path.join(DATA_DIR, "pubkeys.json")
+SESSIONS_PATH = os.path.join(DATA_DIR, "sessions.json")
+EVENTS_JSONL = os.path.join(LOG_DIR, "events.jsonl")
+SHADOW_JSONL = os.path.join(LOG_DIR, "shadow.jsonl")
 
-BOOT_TS = int(time.time()); REQ_COUNT = 0
-LAST_ALERT_TS: Dict[str,int] = {}   # throttling
+BOOT_TS = int(time.time())
+REQ_COUNT = 0
+LAST_ALERT_TS: Dict[str, int] = {}  # throttling
 
 def _load_json(path: str, default):
     try:
@@ -66,10 +74,13 @@ def save_sessions(): _save_json(SESSIONS_PATH, SESSIONS)
 
 # ===== Events (JSONL) =====
 def write_event(kind: str, **data) -> None:
-    # pozwól nadpisać ts gdy przychodzi z zewnątrz (ingest)
+    """Append event to JSONL; allow 'ts' override (for ingest)."""
     ts_override = data.pop("ts", None)
-    rec = {"ts": ts_override if isinstance(ts_override, int) else int(time.time()),
-           "kind": kind, **data}
+    rec = {
+        "ts": ts_override if isinstance(ts_override, int) else int(time.time()),
+        "kind": kind,
+        **data,
+    }
     try:
         with open(EVENTS_JSONL, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -82,8 +93,10 @@ def tail_jsonl(path: str, n: int) -> List[Dict[str, Any]]:
             lines = f.readlines()[-n:]
         out = []
         for ln in lines:
-            try: out.append(json.loads(ln))
-            except Exception: pass
+            try:
+                out.append(json.loads(ln))
+            except Exception:
+                pass
         return out
     except FileNotFoundError:
         return []
@@ -103,10 +116,11 @@ async def emit(kind: str, **vec):
 
 async def emit_alert(level: str, title: str, cooldown_s: int = 20, **meta):
     key = f"{level}:{title}"
-    if not _throttle(key, cooldown_s):  # nie spamuj
+    if not _throttle(key, cooldown_s):
         return
     rec = {"ts": int(time.time()), "level": level, "title": title, "meta": meta}
-    ALERTS.append(rec); del ALERTS[:-200]  # keep last 200
+    ALERTS.append(rec)
+    del ALERTS[:-200]  # keep last 200
     write_event("alert", level=level, title=title, **meta)
     await ws_manager.broadcast({"ts": rec["ts"], "vec": {"alert": rec}})
 
@@ -116,7 +130,8 @@ def rate_check(ip: str) -> bool:
     buf = RATE.get(ip, [])
     buf = [t for t in buf if t > now - RATE_WINDOW]
     allowed = len(buf) < RATE_MAX
-    buf.append(now); RATE[ip] = buf
+    buf.append(now)
+    RATE[ip] = buf
     return allowed
 
 def rate_is_hot(ip: str) -> Optional[int]:
@@ -126,25 +141,43 @@ def rate_is_hot(ip: str) -> Optional[int]:
 
 # ===== WS manager =====
 class WSManager:
-    def __init__(self) -> None: self.active: List[WebSocket] = []
-    async def connect(self, ws: WebSocket): await ws.accept(); self.active.append(ws)
+    def __init__(self) -> None:
+        self.active: List[WebSocket] = []
+
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+        self.active.append(ws)
+
     async def disconnect(self, ws: WebSocket):
-        if ws in self.active: self.active.remove(ws)
+        if ws in self.active:
+            self.active.remove(ws)
+
     async def broadcast(self, data: Dict[str, Any]):
-        msg = json.dumps(data); stale=[]
+        msg = json.dumps(data)
+        stale: List[WebSocket] = []
         for ws in self.active:
-            try: await ws.send_text(msg)
-            except Exception: stale.append(ws)
+            try:
+                await ws.send_text(msg)
+            except Exception:
+                stale.append(ws)
         for ws in stale:
-            try: await ws.close()
-            except Exception: pass
+            try:
+                await ws.close()
+            except Exception:
+                pass
             await self.disconnect(ws)
 
 ws_manager = WSManager()
 
 # ===== FastAPI =====
 app = FastAPI(title="MeCloneMe API (mini)")
-app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_credentials=True, allow_methods=['*'], allow_headers=['*'])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 load_stores()
 
 # ===== HTTP middleware: audit + metrics =====
@@ -154,13 +187,16 @@ async def audit_mw(request: Request, call_next):
     t0 = time.perf_counter()
     ip = request.client.host if request.client else "?"
     ua = (request.headers.get("user-agent") or "")[:160]
-    path = request.url.path; method = request.method
+    path = request.url.path
+    method = request.method
+    status = 500
     try:
         response = await call_next(request)
         status = getattr(response, "status_code", 200)
         return response
     finally:
-        ms = int((time.perf_counter() - t0) * 1000); REQ_COUNT += 1
+        ms = int((time.perf_counter() - t0) * 1000)
+        REQ_COUNT += 1
         write_event("http", ip=ip, ua=ua, method=method, path=path, status=status, ms=ms)
         if status >= 500:
             await emit_alert("crit", "HTTP 5xx", cooldown_s=10, path=path, code=status)
@@ -168,65 +204,139 @@ async def audit_mw(request: Request, call_next):
         if hot is not None:
             await emit_alert("warn", "Rate hot", cooldown_s=15, ip=ip, count=hot, limit=RATE_MAX)
 
-# ===== Helpers =====
-def _quantiles(vals: List[int]) -> Dict[str, int]:
-    if not vals: return {"p50":0,"p95":0,"avg":0,"max":0}
-    p50 = int(statistics.quantiles(vals, n=100)[49]) if len(vals) >= 2 else vals[0]
-    p95_idx = max(0, int(len(vals)*0.95) - 1); p95 = sorted(vals)[p95_idx]
-    avg = int(sum(vals)/len(vals))
-    return {"p50":p50, "p95":p95, "avg":avg, "max":max(vals)}
+# ===== Percentiles (robust) =====
+def _percentile(values: List[int], p: float) -> int:
+    if not values:
+        return 0
+    xs = sorted(values)
+    if len(xs) == 1:
+        return xs[0]
+    k = (len(xs) - 1) * p
+    f = int(k)
+    c = min(f + 1, len(xs) - 1)
+    if f == c:
+        return xs[f]
+    lo = xs[f]
+    hi = xs[c]
+    return int(round(lo + (hi - lo) * (k - f)))
 
+def _lat_stats(vals: List[int]) -> Dict[str, int]:
+    if not vals:
+        return {"p50": 0, "p95": 0, "avg": 0, "max": 0}
+    return {
+        "p50": _percentile(vals, 0.50),
+        "p95": _percentile(vals, 0.95),
+        "avg": int(sum(vals) / len(vals)),
+        "max": max(vals),
+    }
+
+# ===== Metrics builders =====
 def _compute_summary(n: int) -> Dict[str, Any]:
-    rows = [r for r in tail_jsonl(EVENTS_JSONL, n) if r.get("kind")=="http"]
-    total=len(rows); by_path={}; by_method={}; by_status={}; lat=[]
+    rows = [r for r in tail_jsonl(EVENTS_JSONL, n) if r.get("kind") == "http"]
+    total = len(rows)
+    by_path: Dict[str, int] = {}
+    by_method: Dict[str, int] = {}
+    by_status: Dict[str, int] = {}
+    lat: List[int] = []
     for r in rows:
-        p=r.get("path","?"); by_path[p]=by_path.get(p,0)+1
-        m=r.get("method","?"); by_method[m]=by_method.get(m,0)+1
-        s=str(r.get("status","?")); by_status[s]=by_status.get(s,0)+1
-        if isinstance(r.get("ms"), int): lat.append(r["ms"])
-    top_paths=sorted(by_path.items(), key=lambda x:x[1], reverse=True)[:5]
-    lat_q=_quantiles(lat); err4=sum(v for k,v in by_status.items() if k.startswith("4")); err5=sum(v for k,v in by_status.items() if k.startswith("5"))
-    return {"ok": True, "total": total, "paths_top5": top_paths, "methods": by_method, "statuses": by_status, "latency_ms": lat_q, "errors":{"4xx":err4,"5xx":err5}}
+        p = r.get("path", "?")
+        by_path[p] = by_path.get(p, 0) + 1
+        m = r.get("method", "?")
+        by_method[m] = by_method.get(m, 0) + 1
+        s = str(r.get("status", "?"))
+        by_status[s] = by_status.get(s, 0) + 1
+        if isinstance(r.get("ms"), int):
+            lat.append(r["ms"])
+    top_paths = sorted(by_path.items(), key=lambda x: x[1], reverse=True)[:5]
+    lat_q = _lat_stats(lat)
+    err4 = sum(v for k, v in by_status.items() if k.startswith("4"))
+    err5 = sum(v for k, v in by_status.items() if k.startswith("5"))
+    return {
+        "ok": True,
+        "total": total,
+        "paths_top5": top_paths,
+        "methods": by_method,
+        "statuses": by_status,
+        "latency_ms": lat_q,
+        "errors": {"4xx": err4, "5xx": err5},
+    }
 
 def _compute_rollup(minutes: int, n: int) -> Dict[str, Any]:
-    now=int(time.time()); floor_start = now - minutes*60
-    rows=[r for r in tail_jsonl(EVENTS_JSONL, n) if r.get("kind")=="http" and r.get("ts",0)>=floor_start]
-    buckets: Dict[int, List[int]]={}; counts: Dict[int,int]={}
+    now = int(time.time())
+    floor_start = now - minutes * 60
+    rows = [
+        r
+        for r in tail_jsonl(EVENTS_JSONL, n)
+        if r.get("kind") == "http" and r.get("ts", 0) >= floor_start
+    ]
+    buckets: Dict[int, List[int]] = {}
+    counts: Dict[int, int] = {}
     for r in rows:
-        m=(int(r.get("ts",0))//60)*60; buckets.setdefault(m, []).append(int(r.get("ms",0))); counts[m]=counts.get(m,0)+1
-    series=[]
-    for m in range((floor_start//60)*60, (now//60)*60 + 60, 60):
-        vals=buckets.get(m, []); q=_quantiles(vals) if vals else {"p50":0,"p95":0,"avg":0,"max":0}
-        series.append({"t":m,"p95":q["p95"],"count":counts.get(m,0)})
-    return {"ok":True, "series":series[-minutes:]}
+        m = (int(r.get("ts", 0)) // 60) * 60
+        buckets.setdefault(m, []).append(int(r.get("ms", 0)))
+        counts[m] = counts.get(m, 0) + 1
+    series = []
+    for m in range((floor_start // 60) * 60, (now // 60) * 60 + 60, 60):
+        vals = buckets.get(m, [])
+        q = _lat_stats(vals) if vals else {"p50": 0, "p95": 0, "avg": 0, "max": 0}
+        series.append({"t": m, "p95": q["p95"], "count": counts.get(m, 0)})
+    return {"ok": True, "series": series[-minutes:]}
 
 def _compute_health(n: int) -> Dict[str, Any]:
-    rows=[r for r in tail_jsonl(EVENTS_JSONL, n) if r.get("kind")=="http"]
-    lat=[r["ms"] for r in rows if isinstance(r.get("ms"), int)]; lat_q=_quantiles(lat); codes={}
-    for r in rows: k=str(r.get("status","?")); codes[k]=codes.get(k,0)+1
-    level="ok"; 
-    if lat_q["p95"]>=P95_CRIT: level="crit"
-    elif lat_q["p95"]>=P95_WARN: level="warn"
-    return {"ok":True, "ts":int(time.time()), "version":API_VERSION, "uptime_s":int(time.time())-BOOT_TS,
-            "req_count":REQ_COUNT, "rate_window_s":RATE_WINDOW, "latency_ms":lat_q, "codes":codes,
-            "sample_size":len(rows), "level":level, "thresholds":{"warn":P95_WARN,"crit":P95_CRIT}}
+    rows = [r for r in tail_jsonl(EVENTS_JSONL, n) if r.get("kind") == "http"]
+    lat = [r["ms"] for r in rows if isinstance(r.get("ms"), int)]
+    lat_q = _lat_stats(lat)
+    codes: Dict[str, int] = {}
+    for r in rows:
+        k = str(r.get("status", "?"))
+        codes[k] = codes.get(k, 0) + 1
+    level = "ok"
+    if lat_q["p95"] >= P95_CRIT:
+        level = "crit"
+    elif lat_q["p95"] >= P95_WARN:
+        level = "warn"
+    return {
+        "ok": True,
+        "ts": int(time.time()),
+        "version": API_VERSION,
+        "uptime_s": int(time.time()) - BOOT_TS,
+        "req_count": REQ_COUNT,
+        "rate_window_s": RATE_WINDOW,
+        "latency_ms": lat_q,
+        "codes": codes,
+        "sample_size": len(rows),
+        "level": level,
+        "thresholds": {"warn": P95_WARN, "crit": P95_CRIT},
+    }
 
 # ===== UI roots =====
 @app.get("/", response_class=HTMLResponse)
-def root(): return HTMLResponse(PANEL_HTML)
+def root():
+    return HTMLResponse(PANEL_HTML)
 
 @app.get("/mobile", response_class=HTMLResponse)
-def mobile_page(): return HTMLResponse(MOBILE_HTML)
+def mobile_page():
+    return HTMLResponse(MOBILE_HTML)
 
 # ===== Simple health/metrics =====
 @app.get("/healthz")
-def healthz(): return {"ok": True, "ts": int(time.time())}
+def healthz():
+    return {"ok": True, "ts": int(time.time())}
 
 @app.get("/api/health")
 def api_health():
-    return {"ok":True, "version":API_VERSION, "ts":int(time.time()),
-            "uptime":int(time.time())-BOOT_TS,
-            "counts":{"requests":REQ_COUNT,"nonces":len(NONCES),"pubkeys":len(PUBKEYS),"sessions":len(SESSIONS)}}
+    return {
+        "ok": True,
+        "version": API_VERSION,
+        "ts": int(time.time()),
+        "uptime": int(time.time()) - BOOT_TS,
+        "counts": {
+            "requests": REQ_COUNT,
+            "nonces": len(NONCES),
+            "pubkeys": len(PUBKEYS),
+            "sessions": len(SESSIONS),
+        },
+    }
 
 @app.get("/api/health/detail")
 def health_detail(n: int = Query(300, ge=50, le=10000)):
@@ -234,345 +344,533 @@ def health_detail(n: int = Query(300, ge=50, le=10000)):
 
 @app.get("/api/version")
 def api_version():
-    git=os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_SHA") or ""
-    svc=os.getenv("RENDER_SERVICE_NAME") or ""
-    return {"ok":True, "version":API_VERSION, "boot_ts":BOOT_TS, "git":git[:12], "service":svc}
+    git = os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_SHA") or ""
+    svc = os.getenv("RENDER_SERVICE_NAME") or ""
+    return {"ok": True, "version": API_VERSION, "boot_ts": BOOT_TS, "git": git[:12], "service": svc}
 
 @app.get("/api/metrics")
-def api_metrics(): return {"ok":True, "rate":{"window_s":RATE_WINDOW,"max":RATE_MAX}, "counts":{"ip_slots":len(RATE)}}
+def api_metrics():
+    return {
+        "ok": True,
+        "rate": {"window_s": RATE_WINDOW, "max": RATE_MAX},
+        "counts": {"ip_slots": len(RATE)},
+    }
 
 # ===== WS + Shadow ingest =====
-class ShadowFrame(BaseModel): ts:int; vec:Dict[str,Any]
+class ShadowFrame(BaseModel):
+    ts: int
+    vec: Dict[str, Any]
 
 @app.websocket("/shadow/ws")
 async def ws_shadow(ws: WebSocket):
     await ws_manager.connect(ws)
     try:
-        while True: await ws.receive_text()
+        while True:
+            await ws.receive_text()
     except WebSocketDisconnect:
         await ws_manager.disconnect(ws)
 
 @app.post("/shadow/ingest")
 async def shadow_ingest(frame: ShadowFrame):
     try:
-        with open(SHADOW_JSONL,"a",encoding="utf-8") as f: f.write(json.dumps(frame.dict())+"\n")
-    except Exception: pass
-    await ws_manager.broadcast(frame.dict()); write_event("shadow", **frame.dict())
-    return {"ok":True}
+        with open(SHADOW_JSONL, "a", encoding="utf-8") as f:
+            f.write(json.dumps(frame.dict()) + "\n")
+    except Exception:
+        pass
+    await ws_manager.broadcast(frame.dict())
+    write_event("shadow", **frame.dict())
+    return {"ok": True}
 
 # ===== Auth flow =====
-class PubKeyReq(BaseModel): kid:str; pub:str
-class VerifyReq(BaseModel): jws:str
+class PubKeyReq(BaseModel):
+    kid: str
+    pub: str
 
-def bad(reason: str, **extra): data={"ok":False,"reason":reason}; data.update(extra); return JSONResponse(data)
-def ok(**payload): data={"ok":True}; data.update(payload); return JSONResponse(data)
+class VerifyReq(BaseModel):
+    jws: str
+
+def bad(reason: str, **extra):
+    data = {"ok": False, "reason": reason}
+    data.update(extra)
+    return JSONResponse(data)
+
+def ok(**payload):
+    data = {"ok": True}
+    data.update(payload)
+    return JSONResponse(data)
 
 def require_session(token: str) -> Optional[Dict[str, Any]]:
-    if not token or not token.startswith("sess_"): return None
-    s=SESSIONS.get(token); 
-    if not s: return None
-    if s["exp"]<int(time.time()): SESSIONS.pop(token,None); save_sessions(); return None
+    if not token or not token.startswith("sess_"):
+        return None
+    s = SESSIONS.get(token)
+    if not s:
+        return None
+    if s["exp"] < int(time.time()):
+        SESSIONS.pop(token, None)
+        save_sessions()
+        return None
     return s
 
 def _auth_token(request: Request) -> str:
-    auth=request.headers.get("authorization") or ""
-    return auth.split(" ",1)[1] if auth.lower().startswith("bearer ") else ""
+    auth = request.headers.get("authorization") or ""
+    return auth.split(" ", 1)[1] if auth.lower().startswith("bearer ") else ""
 
 @app.get("/auth/challenge")
 async def challenge(request: Request, aud: str = "mobile"):
-    ip=request.client.host if request.client else "?"
+    ip = request.client.host if request.client else "?"
     if not rate_check(ip):
-        await emit("rate", ip=ip, status="limit"); write_event("rate_limit", ip=ip, path="/auth/challenge")
-        await emit_alert("crit","Rate limit", path="/auth/challenge", ip=ip)
+        await emit("rate", ip=ip, status="limit")
+        write_event("rate_limit", ip=ip, path="/auth/challenge")
+        await emit_alert("crit", "Rate limit", path="/auth/challenge", ip=ip)
         return bad("rate-limit")
-    now=int(time.time()); nonce=secrets.token_hex(16); NONCES[nonce]=now+NONCE_TTL
-    for n,exp in list(NONCES.items()):
-        if exp<now: NONCES.pop(n,None)
-    await emit("challenge", aud=aud, nonce=nonce); write_event("auth.challenge", ip=ip, aud=aud, nonce=nonce)
-    hot=rate_is_hot(ip)
-    if hot is not None: await emit_alert("warn","Rate hot", ip=ip, count=hot, limit=RATE_MAX)
+    now = int(time.time())
+    nonce = secrets.token_hex(16)
+    NONCES[nonce] = now + NONCE_TTL
+    # cleanup
+    for n, exp in list(NONCES.items()):
+        if exp < now:
+            NONCES.pop(n, None)
+    await emit("challenge", aud=aud, nonce=nonce)
+    write_event("auth.challenge", ip=ip, aud=aud, nonce=nonce)
+    hot = rate_is_hot(ip)
+    if hot is not None:
+        await emit_alert("warn", "Rate hot", ip=ip, count=hot, limit=RATE_MAX)
     return ok(aud=aud, nonce=nonce, ttl=NONCE_TTL)
 
 @app.post("/guardian/register_pubkey")
 async def register_pubkey(req: PubKeyReq, request: Request):
-    ip=request.client.host if request.client else "?"
+    ip = request.client.host if request.client else "?"
     if not rate_check(ip):
-        await emit("rate", ip=ip, status="limit"); write_event("rate_limit", ip=ip, path="/guardian/register_pubkey")
-        await emit_alert("crit","Rate limit", path="/guardian/register_pubkey", ip=ip)
+        await emit("rate", ip=ip, status="limit")
+        write_event("rate_limit", ip=ip, path="/guardian/register_pubkey")
+        await emit_alert("crit", "Rate limit", path="/guardian/register_pubkey", ip=ip)
         return bad("rate-limit")
     try:
-        if len(b64u_decode(req.pub))!=32: return bad("bad-pubkey")
-    except Exception: return bad("bad-pubkey")
-    PUBKEYS[req.kid]=req.pub; save_pubkeys()
-    await emit("admin", action="register_pubkey", kid=req.kid); write_event("auth.register_pubkey", kid=req.kid)
+        if len(b64u_decode(req.pub)) != 32:
+            return bad("bad-pubkey")
+    except Exception:
+        return bad("bad-pubkey")
+    PUBKEYS[req.kid] = req.pub
+    save_pubkeys()
+    await emit("admin", action="register_pubkey", kid=req.kid)
+    write_event("auth.register_pubkey", kid=req.kid)
     return ok(registered=list(PUBKEYS.keys()))
 
 @app.post("/guardian/verify")
 async def guardian_verify(request: Request, req: VerifyReq):
-    ip=request.client.host if request.client else "?"
+    ip = request.client.host if request.client else "?"
     if not rate_check(ip):
-        await emit("rate", ip=ip, status="limit"); write_event("rate_limit", ip=ip, path="/guardian/verify")
-        await emit_alert("crit","Rate limit", path="/guardian/verify", ip=ip)
+        await emit("rate", ip=ip, status="limit")
+        write_event("rate_limit", ip=ip, path="/guardian/verify")
+        await emit_alert("crit", "Rate limit", path="/guardian/verify", ip=ip)
         return bad("rate-limit")
     try:
-        parts=req.jws.split("."); 
-        if len(parts)!=3: return bad("bad-format")
-        h_b,p_b,s_b=parts; header=json.loads(b64u_decode(h_b)); payload=json.loads(b64u_decode(p_b)); sig=b64u_decode(s_b)
-    except Exception: return bad("bad-jws")
-    kid=header.get("kid"); alg=header.get("alg")
-    if alg!="EdDSA" or not kid or kid not in PUBKEYS: return bad("bad-header")
+        parts = req.jws.split(".")
+        if len(parts) != 3:
+            return bad("bad-format")
+        h_b, p_b, s_b = parts
+        header = json.loads(b64u_decode(h_b))
+        payload = json.loads(b64u_decode(p_b))
+        sig = b64u_decode(s_b)
+    except Exception:
+        return bad("bad-jws")
+    kid = header.get("kid")
+    alg = header.get("alg")
+    if alg != "EdDSA" or not kid or kid not in PUBKEYS:
+        return bad("bad-header")
     try:
-        vk=VerifyKey(b64u_decode(PUBKEYS[kid])); vk.verify((h_b+"."+p_b).encode(), sig)
-    except BadSignatureError: return bad("bad-signature")
-    now=int(time.time())
+        vk = VerifyKey(b64u_decode(PUBKEYS[kid]))
+        vk.verify((h_b + "." + p_b).encode(), sig)
+    except BadSignatureError:
+        return bad("bad-signature")
+    now = int(time.time())
     try:
-        if abs(now-int(payload["ts"]))>NONCE_TTL: return bad("nonce-expired")
-        aud=payload.get("aud"); nonce=payload.get("nonce")
-        if (not aud) or (not nonce): return bad("missing-claims")
-        exp=NONCES.get(nonce); if not exp or exp<now: return bad("nonce-expired")
-        NONCES.pop(nonce,None)
-    except Exception: return bad("bad-payload")
-    sid="sess_"+secrets.token_hex(16); sess_exp=now+SESSION_TTL; SESSIONS[sid]={"kid":kid,"exp":sess_exp}; save_sessions()
-    await emit("auth", status="ok", aud=aud, kid=kid); write_event("auth.verify_ok", kid=kid, aud=aud, sid=sid)
+        if abs(now - int(payload["ts"])) > NONCE_TTL:
+            return bad("nonce-expired")
+        aud = payload.get("aud")
+        nonce = payload.get("nonce")
+        if (not aud) or (not nonce):
+            return bad("missing-claims")
+        exp = NONCES.get(nonce)
+        if not exp or exp < now:
+            return bad("nonce-expired")
+        NONCES.pop(nonce, None)
+    except Exception:
+        return bad("bad-payload")
+    sid = "sess_" + secrets.token_hex(16)
+    sess_exp = now + SESSION_TTL
+    SESSIONS[sid] = {"kid": kid, "exp": sess_exp}
+    save_sessions()
+    await emit("auth", status="ok", aud=aud, kid=kid)
+    write_event("auth.verify_ok", kid=kid, aud=aud, sid=sid)
     return ok(payload=payload, session=sid, exp=sess_exp)
 
 @app.get("/protected/hello")
 async def protected_hello(request: Request):
-    ip=request.client.host if request.client else "?"
+    ip = request.client.host if request.client else "?"
     if not rate_check(ip):
-        await emit("rate", ip=ip, status="limit"); write_event("rate_limit", ip=ip, path="/protected/hello")
-        await emit_alert("crit","Rate limit", path="/protected/hello", ip=ip)
+        await emit("rate", ip=ip, status="limit")
+        write_event("rate_limit", ip=ip, path="/protected/hello")
+        await emit_alert("crit", "Rate limit", path="/protected/hello", ip=ip)
         return bad("rate-limit")
-    token=_auth_token(request); sess=require_session(token)
+    token = _auth_token(request)
+    sess = require_session(token)
     if not sess:
-        await emit("unauth", path="/protected/hello", ip=ip); write_event("auth.unauthorized", ip=ip, path="/protected/hello")
+        await emit("unauth", path="/protected/hello", ip=ip)
+        write_event("auth.unauthorized", ip=ip, path="/protected/hello")
         return bad("unauthorized")
-    await emit("hello", kid=sess["kid"]); write_event("hello", kid=sess["kid"])
+    await emit("hello", kid=sess["kid"])
+    write_event("hello", kid=sess["kid"])
     return ok(msg="hello dev-user", kid=sess["kid"], exp=sess["exp"])
 
 @app.post("/guardian/refresh")
 async def refresh(request: Request):
-    token=_auth_token(request); sess=require_session(token)
+    token = _auth_token(request)
+    sess = require_session(token)
     if not sess:
-        await emit("unauth", path="/guardian/refresh"); return bad("unauthorized")
-    sess["exp"]=int(time.time())+SESSION_TTL; save_sessions()
-    await emit("session", action="refresh", kid=sess["kid"], exp=sess["exp"]); write_event("auth.refresh", kid=sess["kid"], exp=sess["exp"])
+        await emit("unauth", path="/guardian/refresh")
+        return bad("unauthorized")
+    sess["exp"] = int(time.time()) + SESSION_TTL
+    save_sessions()
+    await emit("session", action="refresh", kid=sess["kid"], exp=sess["exp"])
+    write_event("auth.refresh", kid=sess["kid"], exp=sess["exp"])
     return ok(exp=sess["exp"])
 
 @app.post("/guardian/logout")
 async def logout(request: Request):
-    token=_auth_token(request); s=SESSIONS.pop(token, None); save_sessions()
-    if s: await emit("session", action="logout", kid=s["kid"]); write_event("auth.logout", kid=s["kid"])
+    token = _auth_token(request)
+    s = SESSIONS.pop(token, None)
+    save_sessions()
+    if s:
+        await emit("session", action="logout", kid=s["kid"])
+        write_event("auth.logout", kid=s["kid"])
     return ok()
 
 # ===== Admin: events =====
 @app.get("/admin/events/tail")
 def admin_tail(request: Request, n: int = Query(200, ge=1, le=2000)):
-    token=_auth_token(request)
-    if not require_session(token): return bad("unauthorized")
-    return {"ok":True, "items": tail_jsonl(EVENTS_JSONL, n)}
+    token = _auth_token(request)
+    if not require_session(token):
+        return bad("unauthorized")
+    return {"ok": True, "items": tail_jsonl(EVENTS_JSONL, n)}
 
 def _flatten(d: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
-    out={}
-    for k,v in d.items():
-        kk=f"{prefix}.{k}" if prefix else k
-        if isinstance(v, dict): out.update(_flatten(v, kk))
-        else: out[kk]=v
+    out: Dict[str, Any] = {}
+    for k, v in d.items():
+        kk = f"{prefix}.{k}" if prefix else k
+        if isinstance(v, dict):
+            out.update(_flatten(v, kk))
+        else:
+            out[kk] = v
     return out
 
 @app.get("/admin/events/export.csv")
 def admin_csv(request: Request, n: int = Query(500, ge=1, le=5000)):
-    token=_auth_token(request)
-    if not require_session(token): return bad("unauthorized")
-    rows=tail_jsonl(EVENTS_JSONL, n); headers=[]; flat_rows=[]
+    token = _auth_token(request)
+    if not require_session(token):
+        return bad("unauthorized")
+    rows = tail_jsonl(EVENTS_JSONL, n)
+    headers: List[str] = []
+    flat_rows: List[Dict[str, Any]] = []
     for r in rows:
-        fr=_flatten(r); flat_rows.append(fr)
+        fr = _flatten(r)
+        flat_rows.append(fr)
         for k in fr.keys():
-            if k not in headers: headers.append(k)
-    buf=io.StringIO(); buf.write(",".join(headers)+"\n")
+            if k not in headers:
+                headers.append(k)
+    buf = io.StringIO()
+    buf.write(",".join(headers) + "\n")
     for fr in flat_rows:
-        vals=[]
+        vals: List[str] = []
         for h in headers:
-            v=fr.get(h,"")
-            if isinstance(v,(dict,list)): v=json.dumps(v,ensure_ascii=False)
-            s=str(v).replace('"','""')
-            if any(c in s for c in [",","\n",'"']): s=f'"{s}"'
+            v = fr.get(h, "")
+            if isinstance(v, (dict, list)):
+                v = json.dumps(v, ensure_ascii=False)
+            s = str(v).replace('"', '""')
+            if any(c in s for c in [",", "\n", '"']):
+                s = f'"{s}"'
             vals.append(s)
-        buf.write(",".join(vals)+"\n")
+        buf.write(",".join(vals) + "\n")
     return PlainTextResponse(buf.getvalue(), media_type="text/csv")
 
 @app.get("/admin/events/search")
-def admin_search(request: Request,
-                 n: int = Query(1000, ge=10, le=10000),
-                 path_re: str = "",
-                 status: str = "",
-                 method: str = ""):
-    token=_auth_token(request)
-    if not require_session(token): return bad("unauthorized")
-    rows=tail_jsonl(EVENTS_JSONL, n)
+def admin_search(
+    request: Request,
+    n: int = Query(1000, ge=10, le=10000),
+    path_re: str = "",
+    status: str = "",
+    method: str = "",
+):
+    token = _auth_token(request)
+    if not require_session(token):
+        return bad("unauthorized")
+    rows = tail_jsonl(EVENTS_JSONL, n)
     rex = re.compile(path_re) if path_re else None
+
     def status_match(code: int) -> bool:
-        if not status: return True
-        s=str(status).lower()
-        if s in ("2xx","4xx","5xx"): return str(code).startswith(s[0])
-        try: return int(s)==int(code)
-        except: return False
-    out=[]
+        if not status:
+            return True
+        s = str(status).lower()
+        if s in ("2xx", "4xx", "5xx"):
+            return str(code).startswith(s[0])
+        try:
+            return int(s) == int(code)
+        except Exception:
+            return False
+
+    out = []
     for r in rows:
-        if r.get("kind")!="http": continue
-        if method and r.get("method","").upper()!=method.upper(): continue
-        if rex and not rex.search(r.get("path","")): continue
-        if not status_match(int(r.get("status",0))): continue
+        if r.get("kind") != "http":
+            continue
+        if method and r.get("method", "").upper() != method.upper():
+            continue
+        if rex and not rex.search(r.get("path", "")):
+            continue
+        if not status_match(int(r.get("status", 0))):
+            continue
         out.append(r)
-    return {"ok":True, "items": out}
+    return {"ok": True, "items": out}
 
 @app.post("/admin/events/purge")
 def admin_purge(request: Request):
-    token=_auth_token(request)
-    if not require_session(token): return bad("unauthorized")
+    token = _auth_token(request)
+    if not require_session(token):
+        return bad("unauthorized")
     try:
         if os.path.exists(EVENTS_JSONL):
-            ts=int(time.time()); os.replace(EVENTS_JSONL, f"{EVENTS_JSONL}.{ts}.bak")
-        open(EVENTS_JSONL,"w",encoding="utf-8").close(); write_event("admin.purge"); return ok(msg="purged")
+            ts = int(time.time())
+            os.replace(EVENTS_JSONL, f"{EVENTS_JSONL}.{ts}.bak")
+        open(EVENTS_JSONL, "w", encoding="utf-8").close()
+        write_event("admin.purge")
+        return ok(msg="purged")
     except Exception as e:
         return bad("purge-failed", error=str(e))
 
-# >>> NEW: /admin/events/ingest (pojedynczy lub lista) <<<
+# NEW: ingest (single or batch)
 @app.post("/admin/events/ingest")
 async def admin_ingest(request: Request):
-    token=_auth_token(request)
-    if not require_session(token): return bad("unauthorized")
+    token = _auth_token(request)
+    if not require_session(token):
+        return bad("unauthorized")
     try:
         body = await request.json()
     except Exception:
         return bad("bad-json")
-    def store(evt: Dict[str, Any]):
-        if not isinstance(evt, dict): return
-        kind = evt.get("kind","ext")
-        data = dict(evt); data.pop("kind", None)
-        write_event(kind, **data)
-    if isinstance(body, list):
-        for e in body: store(e)
-        return ok(stored=len(body))
-    store(body); return ok(stored=1)
 
-# ===== Snapshots („notebooks”) =====
+    def store(evt: Dict[str, Any]):
+        if not isinstance(evt, dict):
+            return
+        kind = evt.get("kind", "ext")
+        data = dict(evt)
+        data.pop("kind", None)
+        write_event(kind, **data)
+
+    if isinstance(body, list):
+        for e in body:
+            store(e)
+        return ok(stored=len(body))
+    store(body)
+    return ok(stored=1)
+
+# ===== Snapshots =====
 @app.post("/admin/snaps/save")
-def snaps_save(request: Request, minutes: int = Query(60, ge=5, le=1440), n: int = Query(5000, ge=200, le=50000)):
-    token=_auth_token(request)
-    if not require_session(token): return bad("unauthorized")
-    snap={"ts":int(time.time()),"version":API_VERSION,"summary":_compute_summary(min(n,10000)),
-          "rollup":_compute_rollup(minutes,n),"health":_compute_health(max(200,min(n,5000)))}
-    name=time.strftime("snap-%Y%m%d-%H%M%S.json", time.gmtime(snap["ts"])); path=os.path.join(SNAPS_DIR,name)
+def snaps_save(
+    request: Request,
+    minutes: int = Query(60, ge=5, le=1440),
+    n: int = Query(5000, ge=200, le=50000),
+):
+    token = _auth_token(request)
+    if not require_session(token):
+        return bad("unauthorized")
+    snap = {
+        "ts": int(time.time()),
+        "version": API_VERSION,
+        "summary": _compute_summary(min(n, 10000)),
+        "rollup": _compute_rollup(minutes, n),
+        "health": _compute_health(max(200, min(n, 5000))),
+    }
+    name = time.strftime("snap-%Y%m%d-%H%M%S.json", time.gmtime(snap["ts"]))
+    path = os.path.join(SNAPS_DIR, name)
     try:
-        with open(path,"w",encoding="utf-8") as f: json.dump(snap,f,ensure_ascii=False)
-        write_event("admin.snap_save", file=name); return ok(file=name)
-    except Exception as e: return bad("snap-save-failed", error=str(e))
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(snap, f, ensure_ascii=False)
+        write_event("admin.snap_save", file=name)
+        return ok(file=name)
+    except Exception as e:
+        return bad("snap-save-failed", error=str(e))
 
 @app.get("/admin/snaps/list")
 def snaps_list(request: Request):
-    token=_auth_token(request)
-    if not require_session(token): return bad("unauthorized")
-    files=sorted([fn for fn in os.listdir(SNAPS_DIR) if fn.endswith(".json")])
+    token = _auth_token(request)
+    if not require_session(token):
+        return bad("unauthorized")
+    files = sorted([fn for fn in os.listdir(SNAPS_DIR) if fn.endswith(".json")])
     return ok(files=files)
 
 @app.get("/admin/snaps/get")
 def snaps_get(request: Request, name: str):
-    token=_auth_token(request)
-    if not require_session(token): return bad("unauthorized")
-    safe=os.path.basename(name); path=os.path.join(SNAPS_DIR,safe)
+    token = _auth_token(request)
+    if not require_session(token):
+        return bad("unauthorized")
+    safe = os.path.basename(name)
+    path = os.path.join(SNAPS_DIR, safe)
     try:
-        with open(path,"r",encoding="utf-8") as f: data=json.load(f)
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
         return JSONResponse(data)
-    except Exception as e: return bad("snap-not-found", error=str(e))
+    except Exception as e:
+        return bad("snap-not-found", error=str(e))
 
-# ===== Logs APIs: summary/rollups/heatmaps =====
+# ===== Logs APIs =====
 @app.get("/api/logs/summary")
-def logs_summary(n: int = Query(1000, ge=10, le=10000)): return _compute_summary(n)
+def logs_summary(n: int = Query(1000, ge=10, le=10000)):
+    return _compute_summary(n)
 
 @app.get("/api/logs/rollup")
-def logs_rollup(minutes: int = Query(60, ge=5, le=1440), n: int = Query(10000, ge=100, le=50000)): return _compute_rollup(minutes, n)
+def logs_rollup(
+    minutes: int = Query(60, ge=5, le=1440),
+    n: int = Query(10000, ge=100, le=50000),
+):
+    return _compute_rollup(minutes, n)
 
 @app.get("/api/logs/heatmap")
-def logs_heatmap(minutes: int = Query(60, ge=5, le=1440), n: int = Query(20000, ge=200, le=60000)):
-    roll=_compute_rollup(minutes, n)["series"]; maxc=max([c["count"] for c in roll], default=0)
-    cells=[{"t":c["t"],"count":c["count"]} for c in roll]
-    return {"ok":True, "minutes":minutes, "max":maxc, "cells":cells}
+def logs_heatmap(
+    minutes: int = Query(60, ge=5, le=1440),
+    n: int = Query(20000, ge=200, le=60000),
+):
+    roll = _compute_rollup(minutes, n)["series"]
+    maxc = max([c["count"] for c in roll], default=0)
+    cells = [{"t": c["t"], "count": c["count"]} for c in roll]
+    return {"ok": True, "minutes": minutes, "max": maxc, "cells": cells}
 
 @app.get("/api/logs/heatmap_status")
-def logs_heatmap_status(minutes: int = Query(60, ge=5, le=1440), n: int = Query(30000, ge=200, le=80000)):
-    now=int(time.time()); floor_start=now-minutes*60
-    rows=[r for r in tail_jsonl(EVENTS_JSONL, n) if r.get("kind")=="http" and r.get("ts",0)>=floor_start]
-    idx: Dict[int, Dict[str,int]]={}
+def logs_heatmap_status(
+    minutes: int = Query(60, ge=5, le=1440),
+    n: int = Query(30000, ge=200, le=80000),
+):
+    now = int(time.time())
+    floor_start = now - minutes * 60
+    rows = [
+        r
+        for r in tail_jsonl(EVENTS_JSONL, n)
+        if r.get("kind") == "http" and r.get("ts", 0) >= floor_start
+    ]
+    idx: Dict[int, Dict[str, int]] = {}
     for r in rows:
-        m=(int(r.get("ts",0))//60)*60; idx.setdefault(m,{"2":0,"4":0,"5":0,"T":0})
-        code=str(r.get("status","200"))
-        if code.startswith("5"): idx[m]["5"]+=1
-        elif code.startswith("4"): idx[m]["4"]+=1
-        else: idx[m]["2"]+=1
-        idx[m]["T"]+=1
-    series=[]; maxc=0
-    for m in range((floor_start//60)*60, (now//60)*60 + 60, 60):
-        b=idx.get(m, {"2":0,"4":0,"5":0,"T":0})
-        series.append({"t":m,"count":b["T"],"c2xx":b["2"],"c4xx":b["4"],"c5xx":b["5"]}); maxc=max(maxc, b["T"])
-    return {"ok":True, "minutes":minutes, "max":maxc, "cells":series[-minutes:]}
+        m = (int(r.get("ts", 0)) // 60) * 60
+        idx.setdefault(m, {"2": 0, "4": 0, "5": 0, "T": 0})
+        code = str(r.get("status", "200"))
+        if code.startswith("5"):
+            idx[m]["5"] += 1
+        elif code.startswith("4"):
+            idx[m]["4"] += 1
+        else:
+            idx[m]["2"] += 1
+        idx[m]["T"] += 1
+    series = []
+    maxc = 0
+    for m in range((floor_start // 60) * 60, (now // 60) * 60 + 60, 60):
+        b = idx.get(m, {"2": 0, "4": 0, "5": 0, "T": 0})
+        series.append(
+            {"t": m, "count": b["T"], "c2xx": b["2"], "c4xx": b["4"], "c5xx": b["5"]}
+        )
+        maxc = max(maxc, b["T"])
+    return {"ok": True, "minutes": minutes, "max": maxc, "cells": series[-minutes:]}
 
 # ===== Rate window stats =====
 @app.get("/api/rate/window_stats")
 def rate_window_stats(top: int = Query(10, ge=1, le=100)):
-    now=int(time.time()); out=[]
-    for ip,buf in list(RATE.items()):
-        pruned=[t for t in buf if t > now - RATE_WINDOW]; RATE[ip]=pruned
-        if pruned: out.append({"ip":ip, "count":len(pruned)})
-    out.sort(key=lambda x:x["count"], reverse=True)
-    return {"ok":True, "now":now, "window_s":RATE_WINDOW, "max":RATE_MAX, "total_ips":len(out), "ips":out[:top]}
+    now = int(time.time())
+    out = []
+    for ip, buf in list(RATE.items()):
+        pruned = [t for t in buf if t > now - RATE_WINDOW]
+        RATE[ip] = pruned
+        if pruned:
+            out.append({"ip": ip, "count": len(pruned)})
+    out.sort(key=lambda x: x["count"], reverse=True)
+    return {
+        "ok": True,
+        "now": now,
+        "window_s": RATE_WINDOW,
+        "max": RATE_MAX,
+        "total_ips": len(out),
+        "ips": out[:top],
+    }
 
 # ===== Alerts polling =====
 @app.get("/api/alerts/poll")
 def alerts_poll(since: int = 0, limit: int = Query(30, ge=1, le=100)):
-    items=[a for a in ALERTS if a["ts"]>since]
-    return {"ok":True, "items": items[-limit:]}
+    items = [a for a in ALERTS if a["ts"] > since]
+    return {"ok": True, "items": items[-limit:]}
 
 # ===== DIAG: echo public + signed =====
-class JWSReq(BaseModel): jws:str
+class JWSReq(BaseModel):
+    jws: str
 
 @app.get("/api/diag/echo")
 def diag_echo(request: Request):
-    headers={}
-    for k,v in request.headers.items():
-        kl=k.lower(); headers[k]="***" if kl in ("authorization","cookie") else v
-    return {"ok":True, "ts":int(time.time()), "ip":request.client.host if request.client else "?",
-            "method":request.method, "path":request.url.path, "query":dict(request.query_params),
-            "headers":headers, "ua":request.headers.get("user-agent","")}
+    headers = {}
+    for k, v in request.headers.items():
+        kl = k.lower()
+        headers[k] = "***" if kl in ("authorization", "cookie") else v
+    return {
+        "ok": True,
+        "ts": int(time.time()),
+        "ip": request.client.host if request.client else "?",
+        "method": request.method,
+        "path": request.url.path,
+        "query": dict(request.query_params),
+        "headers": headers,
+        "ua": request.headers.get("user-agent", ""),
+    }
 
 @app.post("/api/diag/echo_signed")
 def diag_echo_signed(req: JWSReq, request: Request):
     try:
-        h_b,p_b,s_b=req.jws.split("."); header=json.loads(b64u_decode(h_b)); payload=json.loads(b64u_decode(p_b)); sig=b64u_decode(s_b)
-    except Exception: return bad("bad-jws")
-    kid=header.get("kid"); alg=header.get("alg")
-    if alg!="EdDSA" or not kid or kid not in PUBKEYS: return bad("bad-header")
+        h_b, p_b, s_b = req.jws.split(".")
+        header = json.loads(b64u_decode(h_b))
+        payload = json.loads(b64u_decode(p_b))
+        sig = b64u_decode(s_b)
+    except Exception:
+        return bad("bad-jws")
+    kid = header.get("kid")
+    alg = header.get("alg")
+    if alg != "EdDSA" or not kid or kid not in PUBKEYS:
+        return bad("bad-header")
     try:
-        vk=VerifyKey(b64u_decode(PUBKEYS[kid])); vk.verify((h_b+"."+p_b).encode(), sig)
-    except BadSignatureError: return bad("bad-signature")
-    now=int(time.time())
+        vk = VerifyKey(b64u_decode(PUBKEYS[kid]))
+        vk.verify((h_b + "." + p_b).encode(), sig)
+    except BadSignatureError:
+        return bad("bad-signature")
+    now = int(time.time())
     try:
-        if abs(now-int(payload["ts"]))>NONCE_TTL: return bad("nonce-expired")
-        if payload.get("aud")!="diag": return bad("bad-aud")
-        nonce=payload.get("nonce"); exp=NONCES.get(nonce)
-        if not exp or exp<now: return bad("nonce-expired")
-        NONCES.pop(nonce,None)
-    except Exception: return bad("bad-payload")
-    base=diag_echo(request); base["verified"]=True; base["kid"]=kid; base["payload"]=payload
+        if abs(now - int(payload["ts"])) > NONCE_TTL:
+            return bad("nonce-expired")
+        if payload.get("aud") != "diag":
+            return bad("bad-aud")
+        nonce = payload.get("nonce")
+        exp = NONCES.get(nonce)
+        if not exp or exp < now:
+            return bad("nonce-expired")
+        NONCES.pop(nonce, None)
+    except Exception:
+        return bad("bad-payload")
+    base = diag_echo(request)
+    base["verified"] = True
+    base["kid"] = kid
+    base["payload"] = payload
     return base
 
 # ===== Prometheus exporter =====
 @app.get("/metrics")
 def metrics():
-    # Snapshot (ostatnie 1000 zdarzeń)
-    summ=_compute_summary(1000); health=_compute_health(300)
-    lines=[]
-    def h(x): lines.append(x)
+    summ = _compute_summary(1000)
+    health = _compute_health(300)
+    lines: List[str] = []
+
+    def h(x: str):
+        lines.append(x)
+
     h("# HELP mecloneme_uptime_seconds Service uptime in seconds")
     h("# TYPE mecloneme_uptime_seconds gauge")
     h(f"mecloneme_uptime_seconds {int(time.time())-BOOT_TS}")
@@ -590,14 +888,15 @@ def metrics():
     h(f"mecloneme_latency_p95_ms {health['latency_ms']['p95']}")
     h("# HELP mecloneme_http_status_recent_total Recent sample status distribution")
     h("# TYPE mecloneme_http_status_recent_total gauge")
-    for code,count in (summ["statuses"] or {}).items():
+    for code, count in (summ["statuses"] or {}).items():
         h(f'mecloneme_http_status_recent_total{{code="{code}"}} {count}')
-    body="\n".join(lines)+"\n"
+    body = "\n".join(lines) + "\n"
     return PlainTextResponse(body, media_type="text/plain; version=0.0.4")
 
 # ===== AR engine (stub) =====
 @app.get("/ar/ping")
-def ar_ping(): return {"ok":True, "engine":"stub", "ts":int(time.time())}
+def ar_ping():
+    return {"ok": True, "engine": "stub", "ts": int(time.time())}
 
 # ===== HTML (panel + mobile) =====
 PANEL_HTML = """<!doctype html>
@@ -840,9 +1139,9 @@ async function loadSummary(){ const r=await fetch('/api/logs/summary?n=500'); co
   $("p95").textContent=lat.p95||0; $("e4").textContent=(j.errors&&j.errors["4xx"])||0; $("e5").textContent=(j.errors&&j.errors["5xx"])||0; }
 async function loadHealth(){ const r=await fetch('/api/health/detail?n=300'); const j=await r.json();
   $("healthOut").textContent=JSON.stringify({ts:j.ts, uptime_s:j.uptime_s, codes:j.codes, latency_ms:j.latency_ms, sample:j.sample_size},null,2);
-  $("uptime").textContent=j.uptime_s+"s"; const p95=(j.latency_ms&&j.latency_ms.p95)||0; const alert=$("alert"), txt=$("alertText"); alert.className=""; alert.style.display="block";
-  if(p95>=j.thresholds.crit){ alert.classList.add("crit"); txt.textContent=`CRIT: p95=${p95}ms (>= ${j.thresholds.crit})`; }
-  else if(p95>=j.thresholds.warn){ alert.classList.add("warn"); txt.textContent=`WARN: p95=${p95}ms (>= ${j.thresholds.warn})`; }
+  $("uptime").textContent=j.uptime_s+"s"; const p95=(j.latency_ms&&j.latency_ms.p95)||0; const alert=$("alert"), txt=$("alertText"); alert.className=""; 
+  if(p95>=j.thresholds.crit){ alert.classList.add("crit"); alert.style.display="block"; txt.textContent=`CRIT: p95=${p95}ms (>= ${j.thresholds.crit})`; }
+  else if(p95>=j.thresholds.warn){ alert.classList.add("warn"); alert.style.display="block"; txt.textContent=`WARN: p95=${p95}ms (>= ${j.thresholds.warn})`; }
   else { alert.style.display="none"; txt.textContent=""; } }
 async function loadRollup(){ const r=await fetch('/api/logs/rollup?minutes=60'); const j=await r.json(); const vals=(j.series||[]).map(pt=>pt.p95||0); if(vals.length){ series.length=0; vals.forEach(v=>series.push(v)); drawSpark(series); } }
 async function loadHeat(){ const r=await fetch('/api/logs/heatmap?minutes=60'); const j=await r.json(); renderHeatmap(j.cells||[], j.max||0); }
@@ -862,12 +1161,27 @@ async function loadRateStats(){ const r=await fetch('/api/rate/window_stats?top=
 
   $("start").onclick=()=>{ if(!window._n18){ window._n18=setInterval(async()=>{ await loadHealth(); await loadSummary(); await loadRollup(); await loadHeat(); await loadHeatStatus(); await loadRateStats(); await pollAlerts(); },5000); } setActive($("start")); };
   $("stop").onclick=()=>{ if(window._n18){ clearInterval(window._n18); window._n18=null; } setActive($("stop")); };
-  $("once").onclick=()=>withBusy($("once"), async()=>{ await loadHealth(); await loadSummary(); await loadRollup(); await loadHeat(); await loadHeatStatus(); await loadRateStats(); await pollAlerts(); });
+  $("once").onclick=()=>withBusy($("once"), async()=>{
+    try{ await loadHealth(); }catch(e){ $("healthOut").textContent="ERR health: "+(e.message||e); }
+    try{ await loadSummary(); }catch(e){}
+    try{ await loadRollup(); }catch(e){}
+    try{ await loadHeat(); }catch(e){}
+    try{ await loadHeatStatus(); }catch(e){}
+    try{ await loadRateStats(); }catch(e){}
+    try{ await pollAlerts(); }catch(e){}
+  });
 
   // Kiosk: pamiętaj w LS i auto-włącz
   const KIOSK_KEY="guardian_kiosk";
   function setKioskUI(on){ $("kiosk").textContent= on? "🖥️ Kiosk: ON":"🖥️ Kiosk: OFF"; }
-  $("kiosk").onclick=async ()=>{ const on=localStorage.getItem(KIOSK_KEY)==="1"; const next = !on; localStorage.setItem(KIOSK_KEY", next? "1":"0"); setKioskUI(next); if(next){ $("start").click(); await wakeOn(); } setActive($("kiosk")); };
+  $("kiosk").onclick=async ()=>{ 
+    const on=localStorage.getItem(KIOSK_KEY)==="1";
+    const next = !on; 
+    localStorage.setItem(KIOSK_KEY, next ? "1" : "0");
+    setKioskUI(next); 
+    if(next){ $("start").click(); await wakeOn(); } 
+    setActive($("kiosk")); 
+  };
   $("fs").onclick=()=>{ setActive($("fs")); goFullscreen(); };
 
   setKioskUI(localStorage.getItem(KIOSK_KEY)==="1");
