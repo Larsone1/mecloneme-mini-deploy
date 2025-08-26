@@ -1,40 +1,56 @@
-import asyncio, json, time, os, base64
-from typing import List, Dict, Any, Optional
+# backend/app.py
+import asyncio
+import base64
+import hashlib
+import json
+import os
+import time
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Header
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
+from nacl.signing import VerifyKey
+from nacl.exceptions import BadSignatureError
 
-# ==== Base64url helpers ========================================================
+# ========= helpers =========
 
 def b64u_encode(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode().rstrip("=")
 
 def b64u_decode(s: str) -> bytes:
-    pad = "=" * (-len(s) % 4)
-    return base64.urlsafe_b64decode(s + pad)
+    s += "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s.encode())
 
-# ==== App & Config =============================================================
+# ========= config/env =========
 
-app = FastAPI(title="MeCloneMe API (mini)")
+NONCE_TTL    = int(os.getenv("NONCE_TTL", "300"))     # 5 min
+SESSION_TTL  = int(os.getenv("SESSION_TTL", "900"))   # 15 min
+RATE_MAX     = int(os.getenv("RATE_MAX", "30"))       # req per window
+RATE_WINDOW  = int(os.getenv("RATE_WINDOW", "10"))    # seconds
 
-NONCE_TTL = int(os.getenv("NONCE_TTL", "300"))      # 5 min
-SESSION_TTL = int(os.getenv("SESSION_TTL", "900"))  # 15 min
-RATE_WINDOW = int(os.getenv("RATE_WINDOW", "10"))   # sekundy
-RATE_MAX = int(os.getenv("RATE_MAX", "30"))         # max żądań / okno / IP
+# ========= stores (in-memory; demo) =========
 
-# Proste "pamięci" w RAM
-NONCES: Dict[str, int] = {}                      # nonce -> expiry (ts)
-PUBKEYS: Dict[str, str] = {}                     # kid -> pub (base64url 32B)
-SESSIONS: Dict[str, Dict[str, Any]] = {}         # sess_id -> {kid, exp}
-PROFILES: Dict[str, Dict[str, Any]] = {}         # kid -> {displayName, avatarColor}
-RATE: Dict[str, List[int]] = {}                  # ip -> list[timestamps]
+NONCES: Dict[str, int]   = {}            # nonce -> expiry ts
+PUBKEYS: Dict[str, str]  = {}            # kid   -> pubkey(base64url 32B)
+SESSIONS: Dict[str, Dict[str, Any]] = {} # sess  -> {"kid":..., "exp":...}
+RATE: Dict[str, List[int]] = {}          # ip -> [timestamps]
 
-# ==== NaCl (Ed25519) ===========================================================
-from nacl.signing import VerifyKey
-from nacl.exceptions import BadSignatureError
+# ========= rate limit =========
 
-# ==== Pydantic models ===========================================================
+def rate_check(request: Request) -> None:
+    ip = (request.client.host if request and request.client else "unknown")
+    now = int(time.time())
+    window = RATE.setdefault(ip, [])
+    # drop old
+    while window and window[0] <= now - RATE_WINDOW:
+        window.pop(0)
+    window.append(now)
+    if len(window) > RATE_MAX:
+        raise HTTPException(429, "rate-limit")
+
+# ========= models =========
+
 class ChallengeResp(BaseModel):
     nonce: str
     aud: str
@@ -45,31 +61,28 @@ class VerifyReq(BaseModel):
 
 class PubReq(BaseModel):
     kid: str
-    pub: str  # base64url 32B ed25519
+    pub: str  # base64url(32B ed25519)
 
 class ShadowFrame(BaseModel):
     ts: int
-    kid: Optional[str] | None = None
+    kid: Optional[str] = None
     vec: Dict[str, Any] = {}
 
-class Profile(BaseModel):
-    displayName: Optional[str] = None
-    avatarColor: Optional[str] = None
+# ========= WS manager =========
 
-# ==== WebSocket live-log =======================================================
 class WSManager:
     def __init__(self) -> None:
         self.active: List[WebSocket] = []
 
-    async def connect(self, ws: WebSocket):
+    async def connect(self, ws: WebSocket) -> None:
         await ws.accept()
         self.active.append(ws)
 
-    async def disconnect(self, ws: WebSocket):
+    async def disconnect(self, ws: WebSocket) -> None:
         if ws in self.active:
             self.active.remove(ws)
 
-    async def broadcast(self, data: Dict[str, Any]):
+    async def broadcast(self, data: Dict[str, Any]) -> None:
         text = json.dumps(data)
         stale: List[WebSocket] = []
         for ws in list(self.active):
@@ -78,15 +91,154 @@ class WSManager:
             except Exception:
                 stale.append(ws)
         for ws in stale:
-            await self.disconnect(ws)
+            try:
+                await self.disconnect(ws)
+            except Exception:
+                pass
 
 ws_manager = WSManager()
+
+# ========= FastAPI =========
+
+app = FastAPI(title="MeCloneMe API (mini)")
+
+# ========= Mini panel (desktop) =========
+
+PANEL_HTML = """<!doctype html>
+<meta charset="utf-8"/>
+<title>Guardian — mini panel</title>
+<style>
+  body{font-family:ui-sans-serif,system-ui,sans-serif;padding:16px}
+  h1{margin:0 0 12px}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .card{border:1px solid #eee;border-radius:12px;padding:12px}
+  pre{background:#f7f7f7;border:1px solid #eee;border-radius:8px;
+      padding:12px;height:260px;overflow:auto;white-space:pre-wrap}
+  .row{border:1px solid #eee;border-radius:12px;padding:12px;margin-top:16px}
+  .muted{color:#666}
+  .status{margin-left:8px}
+  .barwrap{background:#eee;height:8px;border-radius:8px}
+  .bar{height:100%;width:0%;background:#3ba55d;border-radius:8px}
+  .ctl{margin-top:10px}
+  button{padding:6px 10px;border:1px solid #ddd;border-radius:8px;background:#fafafa;cursor:pointer}
+</style>
+<h1>Guardian — mini panel</h1>
+
+<div class="grid">
+  <div class="card">
+    <h2>Challenge</h2>
+    <pre id="challenge">…</pre>
+  </div>
+  <div class="card">
+    <h2>Live log <span id="ws-status" class="status muted">WS: connecting…</span></h2>
+    <pre id="log"></pre>
+  </div>
+</div>
+
+<div class="row">
+  <h3>Postęp projektu (tylko lokalnie — zapis w przeglądarce)</h3>
+  <div id="progress-root"></div>
+</div>
+
+<script>
+(async function () {
+  const challengeBox = document.getElementById('challenge');
+  const log = document.getElementById('log');
+  const statusEl = document.getElementById('ws-status');
+
+  function setStatus(txt, color){ statusEl.textContent = 'WS: '+txt; statusEl.style.color = color||'#0a0'; }
+
+  // 1) Show a fresh challenge
+  try{
+    const r = await fetch('/auth/challenge');
+    const x = await r.json();
+    challengeBox.textContent = JSON.stringify(x,null,2);
+  }catch(e){
+    challengeBox.textContent = 'API offline';
+  }
+
+  // 2) WebSocket (with auto-reconnect)
+  let ws, retry;
+  function connectWS(){
+    clearTimeout(retry);
+    try{
+      const proto = location.protocol==='https:' ? 'wss' : 'ws';
+      ws = new WebSocket(`${proto}://${location.host}/shadow/ws`);
+      setStatus('connecting…','#999');
+
+      ws.onopen = () => setStatus('connected','#0a0');
+      ws.onerror = () => setStatus('error','#c00');
+      ws.onclose = () => { setStatus('reconnecting…','#c90'); retry=setTimeout(connectWS,2000); }
+      ws.onmessage = (e)=>{
+        try{
+          const m = JSON.parse(e.data);
+          log.textContent += JSON.stringify(m)+'\\n';
+          log.scrollTop = log.scrollHeight;
+        }catch(_){}
+      };
+    }catch(_){
+      setStatus('error','#c00');
+      retry=setTimeout(connectWS,2000);
+    }
+  }
+  connectWS();
+
+  // 3) Progress bars (saved in localStorage)
+  const FIELDS = [
+    ['Guardian/Auth','prog-guard'],
+    ['AR Engine (R&D)','prog-ar'],
+    ['App Shell / UI','prog-ui'],
+    ['Cloud & Deploy','prog-cloud'],
+    ['MVP (całość)','prog-mvp']
+  ];
+  const root = document.getElementById('progress-root');
+  FIELDS.forEach(([label,key])=>{
+    const row=document.createElement('div');
+    row.style.display='grid';
+    row.style.gridTemplateColumns='160px 1fr 48px 40px';
+    row.style.alignItems='center'; row.style.gap='8px'; row.style.margin='6px 0';
+
+    const name=document.createElement('div'); name.textContent=label;
+
+    const barwrap=document.createElement('div'); barwrap.className='barwrap';
+    const bar=document.createElement('div'); bar.className='bar'; barwrap.appendChild(bar);
+
+    const input=document.createElement('input'); input.type='number'; input.min='0'; input.max='100';
+    input.value=localStorage.getItem(key)||'0';
+    const pct=document.createElement('div'); pct.textContent=(input.value|0)+'%';
+
+    function update(){
+      const v=Math.max(0,Math.min(100,parseInt(input.value||'0',10)));
+      input.value=String(v); pct.textContent=v+'%'; bar.style.width=v+'%';
+      localStorage.setItem(key,String(v));
+    }
+    input.oninput=update; update();
+
+    row.appendChild(name); row.appendChild(barwrap); row.appendChild(input); row.appendChild(pct);
+    root.appendChild(row);
+  });
+
+  const ctl=document.createElement('div'); ctl.className='ctl';
+  const save=document.createElement('button'); save.textContent='💾 Zapisz';
+  const reset=document.createElement('button'); reset.textContent='↺ Reset'; reset.style.marginLeft='8px';
+  save.onclick=()=>alert('Zapisane lokalnie ✅');
+  reset.onclick=()=>{ localStorage.clear(); location.reload(); };
+  ctl.appendChild(save); ctl.appendChild(reset); root.appendChild(ctl);
+})();
+</script>
+"""
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return HTMLResponse(PANEL_HTML)
+
+# ========= WebSocket & shadow ingest =========
 
 @app.websocket("/shadow/ws")
 async def shadow_ws(ws: WebSocket):
     await ws_manager.connect(ws)
     try:
-        # czytamy, ale nic nie robimy z wejściem
+        # echo loop (we don't consume messages now)
         while True:
             await ws.receive_text()
     except WebSocketDisconnect:
@@ -94,118 +246,36 @@ async def shadow_ws(ws: WebSocket):
 
 @app.post("/shadow/ingest")
 async def shadow_ingest(frame: ShadowFrame):
+    # (optional) persist a simple jsonl
+    try:
+        os.makedirs("logs", exist_ok=True)
+        with open("logs/shadow.jsonl", "a") as f:
+            f.write(json.dumps(frame.dict()) + "\n")
+    except Exception:
+        pass
     await ws_manager.broadcast(frame.dict())
     return {"ok": True}
 
-# ==== Mini panel (desktop) =====================================================
-PANEL_HTML = """<!doctype html><meta charset=utf-8><title>Guardian – mini panel</title>
-<body style=font-family:system-ui,ui-sans-serif,sans-serif;margin:16px>
-<h1>Guardian — mini panel</h1>
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
-  <div style="border:1px solid #eee;border-radius:12px;padding:12px">
-    <h2>Challenge</h2>
-    <pre id=challenge style="background:#f7f7f7;border:1px solid #eee;padding:12px;border-radius:8px">...</pre>
-  </div>
-  <div style="border:1px solid #eee;border-radius:12px;padding:12px">
-    <h2>Live log <span id=wsState style="color:#888">WS: connecting…</span></h2>
-    <pre id=log style="background:#f7f7f7;border:1px solid #eee;padding:12px;height:260px;overflow:auto;border-radius:8px"></pre>
-  </div>
-</div>
+# ========= Challenge / Verify =========
 
-<div style="margin-top:24px;border:1px solid #eee;border-radius:12px;padding:12px">
-  <h2>Postęp projektu (tylko lokalnie — zapis w przeglądarce)</h2>
-  <div id=bars></div>
-  <button id=save>💾 Zapisz</button> <button id=reset>↺ Reset</button>
-</div>
-
-<script>
-const $ = (id)=>document.getElementById(id);
-fetch('/auth/challenge').then(r=>r.json()).then(x=>{
-  $('challenge').textContent = JSON.stringify(x,null,2);
-}).catch(()=>{$('challenge').textContent = 'API offline';});
-
-// Live WS
-const state = $('wsState');
-let ws = new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/shadow/ws');
-ws.onopen = ()=>{ state.textContent='WS: connected'; state.style.color='#0a0'; logMsg({vec:{sys:'ws-connected'}, ts:Math.floor(Date.now()/1000)}); };
-ws.onclose = ()=>{ state.textContent='WS: closed'; state.style.color='#a00'; };
-ws.onmessage = (e)=>{ try { logMsg(JSON.parse(e.data)); } catch{} };
-function logMsg(m){ const log=$('log'); log.textContent += JSON.stringify(m)+"\n"; log.scrollTop = log.scrollHeight; }
-
-// Pasek postępu (lekki)
-const ITEMS = [
-  ['Guardian/Auth','auth'],
-  ['AR Engine (R&D)','ar'],
-  ['App Shell / UI','ui'],
-  ['Cloud & Deploy','cloud'],
-  ['MVP (całość)','mvp']
-];
-const storeKey='progress.v1';
-let data = JSON.parse(localStorage.getItem(storeKey) || '{}');
-function render(){
-  const wrap=$('bars'); wrap.innerHTML='';
-  ITEMS.forEach(([label,key])=>{
-    const val = (data[key]??0)|0; const id='val_'+key;
-    const row=document.createElement('div'); row.style.display='grid'; row.style.gridTemplateColumns='160px 1fr 40px 40px'; row.style.alignItems='center'; row.style.gap='8px'; row.style.margin='6px 0';
-    row.innerHTML=`<div>${label}</div><div style="background:#eee;height:8px;border-radius:6px;overflow:hidden"><div style="height:8px;background:#2ea043;width:${val}%"></div></div><input id="${id}" value="${val}" size=2 /><div>${val}%</div>`;
-    wrap.appendChild(row);
-  });
-}
-render();
-$('save').onclick=()=>{ ITEMS.forEach(([_,k])=>{ const v=+document.getElementById('val_'+k).value||0; data[k]=Math.max(0,Math.min(100,v)); }); localStorage.setItem(storeKey,JSON.stringify(data)); render(); };
-$('reset').onclick=()=>{ data={}; localStorage.removeItem(storeKey); render(); };
-</script>
-</body>"""
-
-@app.get("/", response_class=HTMLResponse)
-def index():
-    return HTMLResponse(PANEL_HTML)
-
-# ==== /auth/challenge ==========================================================
 @app.get("/auth/challenge", response_model=ChallengeResp)
-def challenge(aud: str = "mobile"):
+def challenge(request: Request, aud: str = "mobile"):
+    rate_check(request)
     now = int(time.time())
-    # sprzątaj stare nonces
+    # generate 16B nonce hex
+    nonce = os.urandom(16).hex()
+    NONCES[nonce] = now + NONCE_TTL
+
+    # cleanup old
     for n, exp in list(NONCES.items()):
         if exp < now:
             NONCES.pop(n, None)
-    # wygeneruj i zapamiętaj
-    nonce = os.urandom(16).hex()
-    NONCES[nonce] = now + NONCE_TTL
+
     return {"nonce": nonce, "aud": aud, "ts": now}
 
-# ==== Admin: rejestracja klucza publicznego (demo/dev) =========================
-@app.post("/admin/register_pubkey")
-async def register_pubkey(req: PubReq):
-    try:
-        if len(b64u_decode(req.pub)) != 32:
-            return {"ok": False, "reason": "bad-pubkey"}
-    except Exception:
-        return {"ok": False, "reason": "bad-pubkey"}
-    PUBKEYS[req.kid] = req.pub
-    return {"ok": True, "registered": list(PUBKEYS.keys())}
-
-# ==== Rate limiting (IP) =======================================================
-
-def rate_ok(ip: str) -> bool:
-    now = int(time.time())
-    bucket = RATE.setdefault(ip, [])
-    # drop stare
-    while bucket and bucket[0] < now - RATE_WINDOW:
-        bucket.pop(0)
-    if len(bucket) >= RATE_MAX:
-        return False
-    bucket.append(now)
-    return True
-
-# ==== /guardian/verify (JWS Ed25519) ===========================================
 @app.post("/guardian/verify")
 async def guardian_verify(req: VerifyReq, request: Request):
-    # rate limit
-    ip = (request.client.host if request.client else "?")
-    if not rate_ok(ip):
-        return {"ok": False, "reason": "rate-limit"}
-
+    rate_check(request)
     try:
         parts = req.jws.split(".")
         if len(parts) != 3:
@@ -224,217 +294,271 @@ async def guardian_verify(req: VerifyReq, request: Request):
 
         verify_key = VerifyKey(b64u_decode(PUBKEYS[kid]))
         signed = (h_b + "." + p_b).encode()
+
         try:
             verify_key.verify(signed, sig)
         except BadSignatureError:
             return {"ok": False, "reason": "bad-signature"}
 
-        # checks app-level
         now = int(time.time())
-        if abs(now - int(payload.get("ts", 0))) > NONCE_TTL:
+        try:
+            ts = int(payload["ts"])
+        except Exception:
+            return {"ok": False, "reason": "bad-ts"}
+
+        if abs(now - ts) > NONCE_TTL:
             return {"ok": False, "reason": "nonce-expired"}
+
         aud = payload.get("aud")
         nonce = payload.get("nonce")
-        if (not aud) or (not nonce):
+        if not aud or not nonce:
             return {"ok": False, "reason": "missing-claims"}
+
         exp = NONCES.get(nonce)
         if not exp or exp < now:
             return {"ok": False, "reason": "nonce-expired"}
-        NONCES.pop(nonce, None)  # jednorazowy
 
-        # success → utwórz sesję
-        sess = "sess_" + os.urandom(16).hex()
-        sess_exp = now + SESSION_TTL
-        SESSIONS[sess] = {"kid": kid, "exp": sess_exp}
+        # consume nonce
+        NONCES.pop(nonce, None)
 
+        # mint short session
+        sess = "sess_" + hashlib.sha256(
+            f"{kid}.{now}.{os.urandom(8)}".encode()
+        ).hexdigest()[:24]
+        SESSIONS[sess] = {"kid": kid, "exp": now + SESSION_TTL}
+
+        # live log
         frame = {"ts": now, "kid": kid, "vec": {"auth": "ok", "aud": aud}}
         asyncio.create_task(ws_manager.broadcast(frame))
-        return {"ok": True, "payload": payload, "session": sess, "exp": sess_exp}
+
+        return {"ok": True, "payload": payload, "session": sess, "exp": SESSIONS[sess]["exp"]}
     except Exception as e:
         return {"ok": False, "reason": "server-error", "detail": str(e)}
 
-# ==== Session helpers & protected endpoints ====================================
+# ========= session utils / protected =========
 
-def bearer_token(auth: Optional[str]) -> Optional[str]:
-    if not auth: return None
-    parts = auth.split()
-    if len(parts) == 2 and parts[0].lower()=="bearer":
-        return parts[1]
-    return None
-
-
-def require_session(token: Optional[str]):
-    if not token: return None
-    s = SESSIONS.get(token)
-    if not s: return None
+def require_bearer(request: Request) -> Dict[str, Any]:
+    auth = request.headers.get("authorization") or request.headers.get("Authorization")
+    if not auth or not auth.lower().startswith("bearer "):
+        raise HTTPException(401, "missing-token")
+    token = auth.split(" ", 1)[1].strip()
+    sess = SESSIONS.get(token)
+    if not sess:
+        raise HTTPException(401, "invalid-token")
     now = int(time.time())
-    if s["exp"] < now:  # expired
+    if sess["exp"] < now:
         SESSIONS.pop(token, None)
-        return None
-    return s
+        raise HTTPException(401, "expired")
+    return {"id": token, **sess}
 
 @app.get("/protected/hello")
-async def protected_hello(Authorization: Optional[str] = Header(default=None)):
-    tok = bearer_token(Authorization)
-    s = require_session(tok)
-    if not s:
-        return {"ok": False, "reason": "unauthorized"}
-    return {"ok": True, "msg": "hello dev-user", "kid": s["kid"], "exp": s["exp"]}
+def protected_hello(request: Request):
+    sess = require_bearer(request)
+    return {"ok": True, "msg": "hello dev-user", "kid": sess["kid"], "exp": sess["exp"]}
 
-@app.post("/session/refresh")
-async def session_refresh(Authorization: Optional[str] = Header(default=None)):
-    tok = bearer_token(Authorization)
-    s = require_session(tok)
-    if not s:
-        return {"ok": False, "reason": "unauthorized"}
-    s["exp"] = int(time.time()) + SESSION_TTL
-    return {"ok": True, "exp": s["exp"]}
+@app.post("/guardian/refresh")
+def guardian_refresh(request: Request):
+    sess = require_bearer(request)
+    now = int(time.time())
+    sess["exp"] = now + SESSION_TTL
+    SESSIONS[sess["id"]] = {"kid": sess["kid"], "exp": sess["exp"]}
+    return {"ok": True, "exp": sess["exp"]}
 
-@app.post("/session/logout")
-async def session_logout(Authorization: Optional[str] = Header(default=None)):
-    tok = bearer_token(Authorization)
-    if tok and tok in SESSIONS:
-        SESSIONS.pop(tok, None)
+@app.post("/guardian/logout")
+def guardian_logout(request: Request):
+    sess = require_bearer(request)
+    SESSIONS.pop(sess["id"], None)
     return {"ok": True}
 
-# ==== Lightweight profile (/me) ================================================
-@app.get("/me")
-async def get_me(Authorization: Optional[str] = Header(default=None)):
-    tok = bearer_token(Authorization)
-    s = require_session(tok)
-    if not s:
-        return {"ok": False, "reason": "unauthorized"}
-    kid = s["kid"]
-    prof = PROFILES.get(kid) or {"displayName": "dev-user", "avatarColor": "#2ea043"}
-    return {"ok": True, "kid": kid, "profile": prof}
+# ========= admin: register key =========
 
-@app.post("/me")
-async def set_me(p: Profile, Authorization: Optional[str] = Header(default=None)):
-    tok = bearer_token(Authorization)
-    s = require_session(tok)
-    if not s:
-        return {"ok": False, "reason": "unauthorized"}
-    kid = s["kid"]
-    cur = PROFILES.get(kid, {})
-    if p.displayName is not None:
-        cur["displayName"] = p.displayName
-    if p.avatarColor is not None:
-        cur["avatarColor"] = p.avatarColor
-    PROFILES[kid] = cur
-    return {"ok": True, "profile": cur}
+@app.post("/admin/register_pubkey")
+def register_pubkey(req: PubReq, request: Request):
+    rate_check(request)
+    try:
+        if len(b64u_decode(req.pub)) != 32:
+            return {"ok": False, "reason": "bad-pubkey"}
+    except Exception:
+        return {"ok": False, "reason": "bad-pubkey"}
+    PUBKEYS[req.kid] = req.pub
+    return {"ok": True, "registered": list(PUBKEYS.keys())}
 
-# ==== Mobile page (Signer) =====================================================
-MOBILE_HTML = """<!doctype html><meta charset=utf-8><title>Guardian — Mobile Signer</title>
-<meta name=viewport content="width=device-width,initial-scale=1">
+# ========= Mobile signer (demo UI) =========
+
+MOBILE_HTML = """<!doctype html>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Guardian — Mobile Signer</title>
 <style>
-body{font-family:ui-sans-serif,system-ui;margin:16px;line-height:1.35}
-h1{font-size:22px;margin:0 0 12px}
-.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.card{border:1px solid #eee;border-radius:12px;padding:12px}
-textarea,input,button{width:100%;padding:10px;border:1px solid #ddd;border-radius:8px}
-pre{background:#f7f7f7;border:1px solid #eee;border-radius:8px;padding:10px;white-space:pre-wrap;color:#333;font-size:13px}
-button{cursor:pointer}
-small{color:#666}
+  body{font-family:ui-sans-serif,system-ui,sans-serif;line-height:1.45;margin:16px}
+  h1{font-size:22px;margin:0 0 14px}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .col{display:grid;gap:14px}
+  .card{border:1px solid #eee;border-radius:12px;padding:10px}
+  b{display:block;margin:0 0 6px}
+  input,textarea,button{width:100%;padding:8px;border:1px solid #ddd;border-radius:8px}
+  textarea{height:70px}
+  pre{background:#f7f7f7;border:1px solid #eee;border-radius:8px;padding:10px;white-space:pre-wrap}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:6px}
+  .muted{color:#666;font-size:12px}
+  .btn{background:#fafafa;cursor:pointer}
+  .ok{color:#0a0}
 </style>
+
 <h1>Guardian — Mobile Signer</h1>
-<div class=row>
-  <div class=card>
-    <b>1) Klucz prywatny (PRIV, seed 32B)</b>
-    <input id=kid placeholder=\"kid\" value=\"dev-key-1\" style=\"margin:8px 0\">
-    <textarea id=priv rows=3 placeholder=\"Wklej PRIV z terminala\"></textarea>
-    <div class=muted><small>PRIV to seed 32B w base64url (z terminala). Strona zapisuje go lokalnie w przeglądarce.</small></div>
-    <button id=save style=\"margin-top:8px\">💾 Zapisz w przeglądarce</button>
-  </div>
-  <div class=card>
-    <b>2) Rejestracja PUB</b>
-    <button id=register>🕊️ Zarejestruj PUB na serwerze</button>
-    <pre id=regOut></pre>
-  </div>
-</div>
 
-<div class=row style=\"margin-top:12px\">
-  <div class=card>
-    <b>3) Challenge</b>
-    <button id=getCh>🎯 Pobierz /auth/challenge</button>
-    <pre id=chOut></pre>
-  </div>
-  <div class=card>
-    <b>4) Podpisz JWS i zweryfikuj</b>
-    <button id=verify>🔐 Podpisz & /guardian/verify</button>
-    <pre id=verOut></pre>
-  </div>
-</div>
+<div class="grid">
+  <div class="col">
+    <div class="card">
+      <b>1) Klucz prywatny (PRIV, seed 32B)</b>
+      <input id="kid" placeholder="dev-key-1" value="dev-key-1"/>
+      <textarea id="priv" placeholder="Wklej PRIV z terminala"></textarea>
+      <div class="muted">PRIV to seed 32B w base64url (z terminala). Strona zapisuje go lokalnie w przeglądarce.</div>
+      <button id="save" class="btn">💾 Zapisz w przeglądarce</button>
+    </div>
 
-<div class=card style=\"margin-top:12px\">
-  <b>5) Token (Bearer)</b>
-  <input id=tok value=\"\" readonly>
-  <div style=\"display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:8px\">
-    <button id=ping>🔒 Ping /protected/hello</button>
-    <button id=refresh>🔄 Refresh</button>
-    <button id=logout>🚪 Logout</button>
+    <div class="card">
+      <b>3) Challenge</b>
+      <button id="getCh" class="btn">🎯 Pobierz /auth/challenge</button>
+      <pre id="chOut"></pre>
+    </div>
+
+    <div class="card">
+      <b>5) Token (Bearer)</b>
+      <div class="row">
+        <button id="ping" class="btn">🔒 Ping /protected/hello</button>
+        <button id="refresh" class="btn">🔄 Refresh</button>
+      </div>
+      <div class="row">
+        <button id="logout" class="btn">🚪 Logout</button>
+        <div class="muted" id="expLbl">Wygasa za: –s</div>
+      </div>
+      <pre id="tokOut">{ "ok": true }</pre>
+    </div>
   </div>
-  <div style=\"margin-top:6px\">Wygasa za: <span id=expLeft>—</span></div>
-  <pre id=pingOut></pre>
+
+  <div class="col">
+    <div class="card">
+      <b>2) Rejestracja PUB</b>
+      <button id="register" class="btn">🪪 Zarejestruj PUB na serwerze</button>
+      <pre id="regOut"></pre>
+    </div>
+
+    <div class="card">
+      <b>4) Podpisz JWS i zweryfikuj</b>
+      <button id="verify" class="btn">🔐 Podpisz &amp; /guardian/verify</button>
+      <pre id="verOut"></pre>
+    </div>
+  </div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/tweetnacl@1.0.3/nacl.min.js"></script>
 <script>
-const $ = id=>document.getElementById(id);
-const enc = new TextEncoder();
-function b64u(b){ return btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''); }
-function fromB64u(s){ s=s.replace(/-/g,'+').replace(/_/g,'/'); while(s.length%4) s+='='; const bin=atob(s), out=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) out[i]=bin.charCodeAt(i); return out; }
+const enc = new TextEncoder(), dec = new TextDecoder();
+const b64u = b => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');
+const fromB64U = s => { s=s.replace(/-/g,'+').replace(/_/g,'/'); while(s.length%4)s+='='; const bin=atob(s), out=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) out[i]=bin.charCodeAt(i); return out; };
 
-const LS_KEY='guardian_priv_seed';
-$("priv").value = localStorage.getItem(LS_KEY)||'';
-$("save").onclick=()=>{ localStorage.setItem(LS_KEY, $("priv").value.trim()); alert('Zapisano PRIV w przeglądarce.'); };
+const LS_KEY = "guardian_priv_seed";
+const $ = id => document.getElementById(id);
+$("priv").value = localStorage.getItem(LS_KEY)||"";
+$("save").onclick = ()=>{ localStorage.setItem(LS_KEY, $("priv").value.trim()); alert("Zapisano PRIV w przeglądarce."); };
 
 function getKeypair(){
-  const seedB = fromB64u($("priv").value.trim());
-  if(seedB.length!==32) throw new Error('PRIV musi być 32B (base64url)');
-  return nacl.sign.keyPair.fromSeed(seedB);
+  const seedB64U = $("priv").value.trim();
+  if(!seedB64U) throw new Error("Brak PRIV");
+  const seedBytes = fromB64U(seedB64U);
+  if(seedBytes.length !== 32) throw new Error("PRIV musi być 32B (base64url)");
+  return nacl.sign.keyPair.fromSeed(seedBytes);
 }
 
-let lastChallenge=null;
-$("register").onclick= async ()=>{
+let lastChallenge = null;
+$("getCh").onclick = async () => {
+  const r = await fetch('/auth/challenge');
+  lastChallenge = await r.json();
+  $("chOut").textContent = JSON.stringify(lastChallenge,null,2);
+};
+
+$("register").onclick = async () => {
   try{
-    const kp=getKeypair(); const pub=b64u(kp.publicKey); const kid=$("kid").value.trim()||'dev-key-1';
-    const r=await fetch('/admin/register_pubkey',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({kid, pub})});
+    const kp = getKeypair();
+    const kid = $("kid").value.trim() || "dev-key-1";
+    const pubB64U = b64u(kp.publicKey);
+    const r = await fetch('/admin/register_pubkey', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({kid, pub: pubB64U})
+    });
     $("regOut").textContent = await r.text();
-  }catch(e){ $("regOut").textContent='ERR: '+e.message; }
+  }catch(e){ $("regOut").textContent = "ERR: "+e.message; }
 };
-$("getCh").onclick= async ()=>{ const r=await fetch('/auth/challenge'); lastChallenge=await r.json(); $("chOut").textContent=JSON.stringify(lastChallenge,null,2); };
 
-function startExpiryCountdown(exp){
-  const box=$("expLeft");
-  clearInterval(window.__expTimer);
-  function tick(){ const left=Math.max(0, exp - Math.floor(Date.now()/1000)); box.textContent = left+'s'; if(left<=0) clearInterval(window.__expTimer); }
-  tick(); window.__expTimer = setInterval(tick,1000);
+let sess = null; // "sess_..."
+let sessExp = 0;
+
+function renderExp(){
+  if(!sessExp){ $("expLbl").textContent = "Wygasa za: –s"; return; }
+  const left = Math.max(0, Math.floor(sessExp - (Date.now()/1000)));
+  $("expLbl").textContent = "Wygasa za: " + left + "s";
 }
+setInterval(renderExp, 1000);
 
-$("verify").onclick= async ()=>{
+$("verify").onclick = async () => {
   try{
-    if(!lastChallenge) throw new Error('Najpierw pobierz challenge.');
-    const kid=$("kid").value.trim()||'dev-key-1';
-    const hdr={alg:'EdDSA',typ:'JWT',kid};
-    const pld={aud:lastChallenge.aud, nonce:lastChallenge.nonce, ts:Math.floor(Date.now()/1000)};
-    const h_b=b64u(enc.encode(JSON.stringify(hdr))); const p_b=b64u(enc.encode(JSON.stringify(pld)));
-    const kp=getKeypair(); const msg=enc.encode(h_b+'.'+p_b); const sig=nacl.sign.detached(msg,kp.secretKey); const jws=h_b+'.'+p_b+'.'+b64u(sig);
-    const r=await fetch('/guardian/verify',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({jws})});
-    const x=await r.json(); $("verOut").textContent=JSON.stringify(x,null,2);
-    if(x.ok){ $("tok").value=x.session; startExpiryCountdown(x.exp); }
-  }catch(e){ $("verOut").textContent='ERR: '+e.message; }
+    if(!lastChallenge) throw new Error("Najpierw pobierz challenge.");
+    const kid = $("kid").value.trim() || "dev-key-1";
+    const hdr = {alg:"EdDSA", typ:"JWT", kid};
+    const pld = {aud:lastChallenge.aud, nonce:lastChallenge.nonce, ts: Math.floor(Date.now()/1000)};
+
+    const h_b = b64u(enc.encode(JSON.stringify(hdr)));
+    const p_b = b64u(enc.encode(JSON.stringify(pld)));
+    const msg = enc.encode(h_b+"."+p_b);
+
+    const kp = getKeypair();
+    const sig = nacl.sign.detached(msg, kp.secretKey);
+    const jws = h_b+"."+p_b+"."+b64u(sig);
+
+    const r = await fetch('/guardian/verify', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({jws})
+    });
+    const out = await r.json();
+    $("verOut").textContent = JSON.stringify(out,null,2);
+
+    if(out.ok && out.session){
+      sess = out.session; sessExp = out.exp||0;
+      localStorage.setItem("sess_token", sess);
+      renderExp();
+    }
+  }catch(e){ $("verOut").textContent = "ERR: "+e.message; }
 };
 
-async function authed(path){
-  const t=$("tok").value.trim(); if(!t){ return {ok:false, reason:'no-token'}; }
-  const r=await fetch(path,{headers:{'Authorization':'Bearer '+t}}); return r.json();
+async function authed(path, method='GET'){
+  const token = sess || localStorage.getItem("sess_token") || "";
+  return fetch(path, { method, headers: { "Authorization": "Bearer "+token } });
 }
-$("ping").onclick= async ()=>{ const x=await authed('/protected/hello'); $("pingOut").textContent=JSON.stringify(x,null,2); };
-$("refresh").onclick= async ()=>{ const t=$("tok").value.trim(); if(!t) return; const r=await fetch('/session/refresh',{method:'POST', headers:{'Authorization':'Bearer '+t}}); const x=await r.json(); $("pingOut").textContent=JSON.stringify(x,null,2); if(x.ok) startExpiryCountdown(x.exp); };
-$("logout").onclick= async ()=>{ const t=$("tok").value.trim(); if(!t) return; const r=await fetch('/session/logout',{method:'POST', headers:{'Authorization':'Bearer '+t}}); const x=await r.json(); $("pingOut").textContent=JSON.stringify(x,null,2); $("tok").value=''; $("expLeft").textContent='—'; };
+
+$("ping").onclick = async () => {
+  const r = await authed('/protected/hello');
+  const x = await r.json();
+  $("tokOut").textContent = JSON.stringify(x,null,2);
+};
+
+$("refresh").onclick = async () => {
+  const r = await authed('/guardian/refresh','POST');
+  const x = await r.json();
+  $("tokOut").textContent = JSON.stringify(x,null,2);
+  if(x.ok && x.exp){ sessExp = x.exp; renderExp(); }
+};
+
+$("logout").onclick = async () => {
+  const r = await authed('/guardian/logout','POST');
+  const x = await r.json();
+  $("tokOut").textContent = JSON.stringify(x,null,2);
+  sess = null; sessExp = 0; localStorage.removeItem("sess_token"); renderExp();
+};
 </script>
 """
 
-@app.get("/mobile")
+@app.get("/mobile", response_class=HTMLResponse)
 def mobile_page():
     return HTMLResponse(MOBILE_HTML)
+
