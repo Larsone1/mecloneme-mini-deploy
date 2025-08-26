@@ -2,6 +2,7 @@ import os, time, json, base64, secrets, asyncio
 from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from nacl.signing import VerifyKey
 from nacl.exceptions import BadSignatureError
@@ -15,6 +16,7 @@ def b64u_encode(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode().rstrip("=")
 
 # ===== Config (ENV) =====
+API_VERSION = os.getenv("API_VERSION","0.1.0")
 NONCE_TTL   = int(os.getenv("NONCE_TTL", "300"))   # s
 SESSION_TTL = int(os.getenv("SESSION_TTL", "900")) # s
 RATE_MAX    = int(os.getenv("RATE_MAX", "30"))     # max calls / window
@@ -46,12 +48,12 @@ def _save_json(path: str, data) -> None:
             json.dump(data, f, ensure_ascii=False)
         os.replace(tmp, path)
     except Exception:
-        pass  # best-effort
+        pass
 
 def load_stores():
     global PUBKEYS, SESSIONS
-    PUBKEYS.update(_load_json(PUBKEYS_PATH, {}))
-    SESSIONS.update(_load_json(SESSIONS_PATH, {}))
+    PUBKEYS = _load_json(PUBKEYS_PATH, {})
+    SESSIONS = _load_json(SESSIONS_PATH, {})
 
 def save_pubkeys():
     _save_json(PUBKEYS_PATH, PUBKEYS)
@@ -87,7 +89,7 @@ class WSManager:
     async def broadcast(self, data: Dict[str, Any]):
         msg = json.dumps(data)
         stale: List[WebSocket] = []
-        for ws in list(self.active):
+        for ws in self.active:
             try:
                 await ws.send_text(msg)
             except Exception:
@@ -99,6 +101,10 @@ ws_manager = WSManager()
 
 # ===== FastAPI =====
 app = FastAPI(title="MeCloneMe API (mini)")
+app.add_middleware(CORSMiddleware,
+    allow_origins=['*'], allow_credentials=True,
+    allow_methods=['*'], allow_headers=['*']
+)
 load_stores()
 
 # ===== Mini panel (admin podgląd + progress lokalnie) =====
@@ -127,8 +133,10 @@ PANEL_HTML = """<!doctype html>
 </div>
 
 <script>
-const $ = (id)=>document.getElementById(id);
-const LS_KEY = "progress_v1";
+const $=id=>document.getElementById(id);
+const LS_KEY="guardian_progress";
+function log(m){ const el=$("log"); el.textContent += m+"\\n"; el.scrollTop = el.scrollHeight; }
+
 const FIELDS = [
   ["Guardian/Auth","ga"],
   ["AR Engine (R&D)","ar"],
@@ -189,12 +197,11 @@ function saveState(state){
   const wsUrl = (location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/shadow/ws";
   try{
     const ws = new WebSocket(wsUrl);
-    ws.onopen = ()=>{$("ws").textContent="WS: connected";$("ws").style.color="#2e7d32";}
-    ws.onclose= ()=>{$("ws").textContent="WS: closed";$("ws").style.color="#b71c1c";}
-    ws.onmessage = (e)=>{
-      const log = $("log");
-      log.textContent += e.data+"\\n";
-      log.scrollTop = log.scrollHeight;
+    ws.onmessage = (ev)=>{
+      try{
+        const j = JSON.parse(ev.data);
+        log(JSON.stringify(j));
+      }catch(e){ log(ev.data); }
     };
   }catch(e){ $("ws").textContent="WS: error";$("ws").style.color="#b71c1c"; }
 
@@ -253,11 +260,11 @@ MOBILE_HTML = """<!doctype html>
 
 <div class="card" style="margin-top:10px">
   <b>5) Token (Bearer)</b><br><br>
-  <button id="ping">🔒 Ping /protected/hello</button>
-  <button id="refresh">🔄 Refresh</button>
-  <button id="logout">🚪 Logout</button>
-  <div style="margin-top:6px">Wygasa za: <span id="eta">-s</span></div>
+  <button id="ping">🔎 /protected/hello</button>
+  <button id="refresh">🔁 /guardian/refresh</button>
+  <button id="logout">🚪 /guardian/logout</button>
   <pre id="pingOut"></pre>
+  <div>ETA tokenu: <span id="eta">-</span></div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/tweetnacl@1.0.3/nacl.min.js"></script>
@@ -265,7 +272,7 @@ MOBILE_HTML = """<!doctype html>
 const $=id=>document.getElementById(id);
 const enc = new TextEncoder();
 
-const b64u = b => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');
+const b64u = b => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
 const fromB64u = s => {
   s = s.replace(/-/g,'+').replace(/_/g,'/'); while(s.length%4) s+='=';
   const bin = atob(s), out = new Uint8Array(bin.length);
@@ -290,7 +297,7 @@ $("register").onclick = async ()=>{
     const kp = getKeypair();
     const pub = b64u(kp.publicKey);
     const kid = $("kid").value.trim() || "dev-key-1";
-    const r = await fetch("/admin/register_pubkey",{
+    const r = await fetch("/guardian/register_pubkey",{
       method:"POST",
       headers:{"Content-Type":"application/json"},
       body: JSON.stringify({kid, pub})
@@ -352,17 +359,16 @@ $("logout").onclick = async ()=>{
 """
 
 # ===== Pydantic models =====
+class PubKeyReq(BaseModel):
+    kid: str
+    pub: str
+
 class VerifyReq(BaseModel):
     jws: str
 
-class PubReq(BaseModel):
-    kid: str
-    pub: str  # base64url (32B ed25519)
-
 class ShadowFrame(BaseModel):
     ts: int
-    kid: Optional[str] = None
-    vec: Dict[str, Any] = {}
+    vec: Dict[str, Any]
 
 # ===== Utilities =====
 def bad(reason: str, **extra):
@@ -393,7 +399,7 @@ async def emit(kind: str, **vec):
 
 # ===== Routes =====
 @app.get("/", response_class=HTMLResponse)
-def index():
+def root():
     return HTMLResponse(PANEL_HTML)
 
 @app.get("/mobile", response_class=HTMLResponse)
@@ -404,8 +410,21 @@ def mobile_page():
 def healthz():
     return {"ok": True, "ts": int(time.time())}
 
+@app.get("/api/health")
+def api_health():
+    return {
+        "ok": True,
+        "version": API_VERSION,
+        "ts": int(time.time()),
+        "counts": {
+            "nonces": len(NONCES),
+            "pubkeys": len(PUBKEYS),
+            "sessions": len(SESSIONS)
+        }
+    }
+
 @app.websocket("/shadow/ws")
-async def shadow_ws(ws: WebSocket):
+async def ws_shadow(ws: WebSocket):
     await ws_manager.connect(ws)
     try:
         while True:
@@ -438,10 +457,11 @@ async def challenge(request: Request, aud: str = "mobile"):
     for n, exp in list(NONCES.items()):
         if exp < now:
             NONCES.pop(n, None)
-    return {"nonce": nonce, "aud": aud, "ts": now}
+    await emit("challenge", aud=aud, nonce=nonce)
+    return ok(aud=aud, nonce=nonce, ttl=NONCE_TTL)
 
-@app.post("/admin/register_pubkey")
-async def register_pubkey(request: Request, req: PubReq):
+@app.post("/guardian/register_pubkey")
+async def register_pubkey(req: PubKeyReq, request: Request):
     ip = request.client.host if request.client else "?"
     if not rate_check(ip):
         await emit("rate", ip=ip, status="limit")
@@ -473,15 +493,15 @@ async def guardian_verify(request: Request, req: VerifyReq):
         payload = json.loads(b64u_decode(p_b))
         sig = b64u_decode(s_b)
     except Exception:
-        return bad("bad-format")
+        return bad("bad-jws")
 
-    if header.get("alg") != "EdDSA":
-        return bad("alg-not-supported")
-
+    # verify header
     kid = header.get("kid")
-    if not kid or kid not in PUBKEYS:
-        return bad("unknown-kid")
+    alg = header.get("alg")
+    if alg != "EdDSA" or not kid or kid not in PUBKEYS:
+        return bad("bad-header")
 
+    # verify signature
     try:
         vk = VerifyKey(b64u_decode(PUBKEYS[kid]))
         vk.verify((h_b+"."+p_b).encode(), sig)
@@ -555,3 +575,4 @@ async def logout(request: Request):
 @app.get("/ar/ping")
 def ar_ping():
     return {"ok": True, "engine":"stub", "ts": int(time.time())}
+
