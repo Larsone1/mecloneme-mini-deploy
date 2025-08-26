@@ -16,7 +16,7 @@ def b64u_encode(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode().rstrip("=")
 
 # ===== Config (ENV) =====
-API_VERSION = os.getenv("API_VERSION","0.1.3")
+API_VERSION = os.getenv("API_VERSION","0.1.4")
 NONCE_TTL   = int(os.getenv("NONCE_TTL", "300"))   # s
 SESSION_TTL = int(os.getenv("SESSION_TTL", "900")) # s
 RATE_MAX    = int(os.getenv("RATE_MAX", "30"))     # max calls / window
@@ -123,6 +123,7 @@ class WSManager:
             except Exception:
                 stale.append(ws)
         for ws in stale:
+            await ws.close()
             await self.disconnect(ws)
 
 ws_manager = WSManager()
@@ -153,7 +154,7 @@ async def audit_mw(request: Request, call_next):
         REQ_COUNT += 1
         write_event("http", ip=ip, ua=ua, method=method, path=path, status=status, ms=ms)
 
-# ===== Mini panel (admin + progress + quick tests) =====
+# ===== Mini panel (admin + progress + quick tests + N18) =====
 PANEL_HTML = """<!doctype html>
 <meta charset="utf-8"><title>Guardian — mini panel</title>
 <body style="font-family: system-ui, -apple-system, Segoe UI, Roboto; margin:16px">
@@ -175,6 +176,30 @@ PANEL_HTML = """<!doctype html>
   <div style="margin-top:8px">
     <button id="save">💾 Zapisz</button>
     <button id="reset">↩︎ Reset</button>
+  </div>
+</div>
+
+<div style="border:1px solid #eee;border-radius:8px;padding:12px;margin-top:16px">
+  <h2>CEO — N18 widżet (live)</h2>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+    <div>
+      <canvas id="spark" width="640" height="90" style="width:100%;border:1px solid #eee;border-radius:6px"></canvas>
+      <div style="font-size:12px;color:#666;margin-top:4px">Sparkline: ostatnie p95(ms). Auto-refresh co 5s.</div>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button id="start">▶︎ Start</button>
+        <button id="stop">⏸ Stop</button>
+        <button id="once">↻ Odśwież teraz</button>
+      </div>
+      <pre id="healthOut" style="background:#f7f7f7;border:1px solid #eee;border-radius:8px;min-height:80px;padding:10px;margin-top:8px"></pre>
+    </div>
+    <div>
+      <b>Top ścieżki</b>
+      <ol id="topPaths" style="margin-top:6px"></ol>
+      <b>Statusy</b>
+      <pre id="codes" style="background:#f7f7f7;border:1px solid #eee;border-radius:8px;min-height:60px;padding:10px"></pre>
+      <b>Latencja (ms)</b>
+      <div id="latStats" style="font-family:ui-monospace, Menlo, monospace;"></div>
+    </div>
   </div>
 </div>
 
@@ -219,7 +244,45 @@ function renderBars(state){
   });
 }
 
-// Init
+// N18 widget — sparkline + summary
+let timer=null; const series=[];
+function drawSpark(values){
+  const cv=$("spark"); const ctx=cv.getContext("2d");
+  ctx.clearRect(0,0,cv.width,cv.height);
+  if(values.length<2) return;
+  const pad=6, w=cv.width-pad*2, h=cv.height-pad*2;
+  const min=Math.min(...values), max=Math.max(...values);
+  const norm=v => (max===min?0.5:(v-min)/(max-min));
+  ctx.beginPath();
+  values.forEach((v,i)=>{
+    const x=pad + (i/(values.length-1))*w;
+    const y=pad + (1-norm(v))*h;
+    if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  });
+  ctx.lineWidth=2; ctx.strokeStyle="#2e7d32"; ctx.stroke();
+}
+
+async function loadSummary(){
+  const r=await fetch('/api/logs/summary?n=500'); const j=await r.json();
+  const ul=$("topPaths"); ul.innerHTML="";
+  (j.paths_top5||[]).forEach(([p,c])=>{ const li=document.createElement('li'); li.textContent=p+"  ("+c+")"; ul.appendChild(li); });
+  $("codes").textContent=JSON.stringify(j.statuses||{},null,2);
+  const lat=j.latency_ms||{};
+  $("latStats").textContent=`p50=${lat.p50||0}ms  p95=${lat.p95||0}ms  avg=${lat.avg||0}ms  max=${lat.max||0}ms`;
+}
+
+async function loadHealth(){
+  const r=await fetch('/api/health/detail?n=200'); const j=await r.json();
+  $("healthOut").textContent=JSON.stringify({ts:j.ts, uptime_s:j.uptime_s, codes:j.codes, latency_ms:j.latency_ms, sample:j.sample_size},null,2);
+  // sparkline data = p95 history
+  const p95=(j.latency_ms&&j.latency_ms.p95)||0;
+  series.push(p95); while(series.length>60) series.shift();
+  drawSpark(series);
+}
+
+function start(){ if(timer) return; timer=setInterval(async()=>{ try{ await loadHealth(); await loadSummary(); }catch(e){} }, 5000); }
+function stop(){ if(timer){ clearInterval(timer); timer=null; } }
+
 (async function init(){
   // challenge preview
   try{ const r=await fetch('/auth/challenge'); $("challenge").textContent=JSON.stringify(await r.json(),null,2); }
@@ -237,17 +300,15 @@ function renderBars(state){
   document.getElementById("save").onclick=()=>localStorage.setItem(LS_KEY,JSON.stringify(state));
   document.getElementById("reset").onclick=()=>{ localStorage.removeItem(LS_KEY); location.reload(); };
 
-  // Token autofill from localStorage
+  // Admin quick tests — token persistence
   const TOKKEY="guardian_session";
   $("admTok").value=localStorage.getItem(TOKKEY)||"";
   $("admTok").oninput=()=>localStorage.setItem(TOKKEY,$("admTok").value.trim());
-
-  // helpers
   function tok(){ return $("admTok").value.trim(); }
   const origin=location.origin;
   async function copy(text){ try{ await navigator.clipboard.writeText(text); $("admOut").textContent="Skopiowano do schowka."; }catch(e){ $("admOut").textContent="Nie udało się skopiować."; } }
 
-  // Buttons
+  // Admin buttons
   $("btnTail").onclick=async()=>{ const r=await fetch('/admin/events/tail?n=50',{headers:{Authorization:'Bearer '+tok()}}); $("admOut").textContent=await r.text(); };
   $("btnCSV").onclick=async()=>{
     const r=await fetch('/admin/events/export.csv?n=200',{headers:{Authorization:'Bearer '+tok()}});
@@ -257,11 +318,13 @@ function renderBars(state){
   $("btnSummary").onclick=async()=>{ const r=await fetch('/api/logs/summary?n=500'); $("admOut").textContent=JSON.stringify(await r.json(),null,2); };
   $("btnHealth").onclick=async()=>{ const r=await fetch('/api/health/detail?n=200'); $("admOut").textContent=JSON.stringify(await r.json(),null,2); };
   $("btnPurge").onclick=async()=>{ if(!confirm('Na pewno usunąć zawartość events.jsonl?')) return; const r=await fetch('/admin/events/purge',{method:'POST',headers:{Authorization:'Bearer '+tok()}}); $("admOut").textContent=await r.text(); };
-
-  // Copy curl buttons
   $("btnTailCurl").onclick=()=>copy(`curl -H "Authorization: Bearer ${tok()}" "${origin}/admin/events/tail?n=50"`);
   $("btnCSVCurl").onclick=()=>copy(`curl -H "Authorization: Bearer ${tok()}" -o events.csv "${origin}/admin/events/export.csv?n=200"`);
   $("btnPurgeCurl").onclick=()=>copy(`curl -X POST -H "Authorization: Bearer ${tok()}" "${origin}/admin/events/purge"`);
+
+  // N18 controls
+  $("start").onclick=start; $("stop").onclick=stop; $("once").onclick=async()=>{ await loadHealth(); await loadSummary(); };
+  await loadHealth(); await loadSummary(); start();
 })();
 </script>
 </body>
@@ -385,7 +448,7 @@ $("verify").onclick = async ()=>{
     $("verOut").textContent = JSON.stringify(j,null,2);
     if(j.ok && j.session){
       session=j.session; exp=j.exp;
-      localStorage.setItem("guardian_session", session); // 🍒 zapisz token dla panelu
+      localStorage.setItem("guardian_session", session); // zapisz token dla panelu
       clearInterval(ticker); ticker=setInterval(tick,1000); tick();
     }
   }catch(e){ $("verOut").textContent = "ERR: "+e.message; }
@@ -741,3 +804,4 @@ def health_detail(n: int = Query(200, ge=20, le=5000)):
 @app.get("/ar/ping")
 def ar_ping():
     return {"ok": True, "engine":"stub", "ts": int(time.time())}
+
