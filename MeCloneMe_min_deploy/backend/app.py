@@ -16,7 +16,7 @@ def b64u_encode(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode().rstrip("=")
 
 # ===== Config (ENV) =====
-API_VERSION = os.getenv("API_VERSION","0.1.6")
+API_VERSION = os.getenv("API_VERSION","0.1.8")
 NONCE_TTL   = int(os.getenv("NONCE_TTL", "300"))        # s
 SESSION_TTL = int(os.getenv("SESSION_TTL", "900"))      # s
 RATE_MAX    = int(os.getenv("RATE_MAX", "30"))          # max calls / window
@@ -94,7 +94,7 @@ def tail_jsonl(path: str, n: int) -> List[Dict[str, Any]]:
     except FileNotFoundError:
         return []
 
-# ===== Rate limiting (prosty sliding window) =====
+# ===== Rate limiting (sliding window) =====
 def rate_check(ip: str) -> bool:
     now = int(time.time())
     buf = RATE.get(ip, [])
@@ -157,7 +157,7 @@ async def audit_mw(request: Request, call_next):
         REQ_COUNT += 1
         write_event("http", ip=ip, ua=ua, method=method, path=path, status=status, ms=ms)
 
-# ===== Helpers (computations shared by endpoints) =====
+# ===== Helpers =====
 def _quantiles(vals: List[int]) -> Dict[str, int]:
     if not vals: return {"p50":0,"p95":0,"avg":0,"max":0}
     p50 = int(statistics.quantiles(vals, n=100)[49]) if len(vals) >= 2 else vals[0]
@@ -495,7 +495,7 @@ def admin_csv(request: Request, n: int = Query(500, ge=1, le=5000)):
         for h in headers:
             v = fr.get(h, "")
             if isinstance(v, (dict, list)): v = json.dumps(v, ensure_ascii=False)
-            s = str(v).replace('"','""')
+            s = str(v).replace('"','"\"')
             if any(c in s for c in [",", "\n", '"']): s = f'"{s}"'
             vals.append(s)
         buf.write(",".join(vals) + "\n")
@@ -557,7 +557,7 @@ def snaps_get(request: Request, name: str):
     except Exception as e:
         return bad("snap-not-found", error=str(e))
 
-# ===== Logs summary, rollup, heatmap & health detail =====
+# ===== Logs APIs: summary, rollups, heatmaps =====
 @app.get("/api/logs/summary")
 def logs_summary(n: int = Query(1000, ge=10, le=10000)):
     return _compute_summary(n)
@@ -573,20 +573,51 @@ def logs_heatmap(minutes: int = Query(60, ge=5, le=1440), n: int = Query(20000, 
     cells = [{"t": c["t"], "count": c["count"]} for c in roll]
     return {"ok": True, "minutes": minutes, "max": maxc, "cells": cells}
 
-@app.get("/api/health/detail")
-def health_detail(n: int = Query(200, ge=20, le=5000)):
-    return _compute_health(n)
+@app.get("/api/logs/heatmap_status")
+def logs_heatmap_status(minutes: int = Query(60, ge=5, le=1440), n: int = Query(30000, ge=200, le=80000)):
+    now = int(time.time())
+    floor_start = now - minutes*60
+    rows = [r for r in tail_jsonl(EVENTS_JSONL, n) if r.get("kind")=="http" and r.get("ts",0)>=floor_start]
+    idx: Dict[int, Dict[str,int]] = {}
+    for r in rows:
+        m = (int(r.get("ts",0)) // 60) * 60
+        idx.setdefault(m, {"2":0,"4":0,"5":0,"T":0})
+        code = str(r.get("status","200"))
+        if code.startswith("5"): idx[m]["5"] += 1
+        elif code.startswith("4"): idx[m]["4"] += 1
+        else: idx[m]["2"] += 1
+        idx[m]["T"] += 1
+    series = []
+    maxc = 0
+    for m in range((floor_start//60)*60, (now//60)*60 + 60, 60):
+        b = idx.get(m, {"2":0,"4":0,"5":0,"T":0})
+        series.append({"t":m,"count":b["T"],"c2xx":b["2"],"c4xx":b["4"],"c5xx":b["5"]})
+        maxc = max(maxc, b["T"])
+    return {"ok": True, "minutes": minutes, "max": maxc, "cells": series[-minutes:]}
 
-# ===== DIAG: echo =====
+# ===== Rate window stats =====
+@app.get("/api/rate/window_stats")
+def rate_window_stats(top: int = Query(10, ge=1, le=100)):
+    now = int(time.time())
+    out = []
+    for ip, buf in list(RATE.items()):
+        pruned = [t for t in buf if t > now - RATE_WINDOW]
+        RATE[ip] = pruned
+        if pruned:
+            out.append({"ip": ip, "count": len(pruned)})
+    out.sort(key=lambda x: x["count"], reverse=True)
+    return {"ok": True, "now": now, "window_s": RATE_WINDOW, "max": RATE_MAX, "total_ips": len(out), "ips": out[:top]}
+
+# ===== DIAG: echo (public) + echo_signed (EdDSA + nonce) =====
+class JWSReq(BaseModel):
+    jws: str
+
 @app.get("/api/diag/echo")
 def diag_echo(request: Request):
     headers = {}
     for k,v in request.headers.items():
         kl = k.lower()
-        if kl in ("authorization","cookie"):
-            headers[k] = "***"
-        else:
-            headers[k] = v
+        headers[k] = "***" if kl in ("authorization","cookie") else v
     return {
         "ok": True,
         "ts": int(time.time()),
@@ -598,6 +629,38 @@ def diag_echo(request: Request):
         "ua": request.headers.get("user-agent","")
     }
 
+@app.post("/api/diag/echo_signed")
+def diag_echo_signed(req: JWSReq, request: Request):
+    try:
+        h_b, p_b, s_b = req.jws.split(".")
+        header = json.loads(b64u_decode(h_b))
+        payload = json.loads(b64u_decode(p_b))
+        sig = b64u_decode(s_b)
+    except Exception:
+        return bad("bad-jws")
+    kid = header.get("kid"); alg = header.get("alg")
+    if alg != "EdDSA" or not kid or kid not in PUBKEYS:
+        return bad("bad-header")
+    try:
+        vk = VerifyKey(b64u_decode(PUBKEYS[kid]))
+        vk.verify((h_b+"."+p_b).encode(), sig)
+    except BadSignatureError:
+        return bad("bad-signature")
+    now = int(time.time())
+    try:
+        if abs(now - int(payload["ts"])) > NONCE_TTL: return bad("nonce-expired")
+        if payload.get("aud") != "diag": return bad("bad-aud")
+        nonce = payload.get("nonce"); exp = NONCES.get(nonce)
+        if not exp or exp < now: return bad("nonce-expired")
+        NONCES.pop(nonce, None)
+    except Exception:
+        return bad("bad-payload")
+    base = diag_echo(request)
+    base["verified"] = True
+    base["kid"] = kid
+    base["payload"] = payload
+    return base
+
 # ===== AR engine (stub / R&D) =====
 @app.get("/ar/ping")
 def ar_ping():
@@ -607,9 +670,7 @@ def ar_ping():
 PANEL_HTML = """<!doctype html>
 <meta charset="utf-8"><title>Guardian — mini panel</title>
 <style>
-  :root{
-    --ok:#2e7d32; --warn:#e09100; --crit:#c62828; --btn:#f3f3f3; --bd:#e5e5e5;
-  }
+  :root{ --ok:#2e7d32; --warn:#e09100; --crit:#c62828; --btn:#f3f3f3; --bd:#e5e5e5; }
   body{font-family: system-ui,-apple-system,Segoe UI,Roboto;margin:16px}
   .card{border:1px solid var(--bd);border-radius:8px;padding:12px}
   .btn{padding:6px 10px;border:1px solid var(--bd);border-radius:8px;background:var(--btn);cursor:pointer}
@@ -688,6 +749,17 @@ PANEL_HTML = """<!doctype html>
 </div>
 
 <div class="card" style="margin-top:16px">
+  <h2>Heatmap status (60m)</h2>
+  <div id="heatmapS" class="grid"></div>
+  <div style="font-size:12px;color:#666;margin-top:6px">Kolor: zielony=2xx, pomarańczowy=4xx, czerwony=5xx (intensywność ~ liczba żądań).</div>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <h2>Rate-limiter monitor</h2>
+  <div id="rateBox" style="font-family:ui-monospace,Menlo,monospace"></div>
+</div>
+
+<div class="card" style="margin-top:16px">
   <h2>Diag & Snapshots</h2>
   <div style="margin:6px 0">
     Token (Bearer) do snapshotów (z <code>/mobile</code> po verify):
@@ -722,15 +794,8 @@ PANEL_HTML = """<!doctype html>
 
 <script>
 const $=id=>document.getElementById(id);
-
-// Toast
 function toast(msg){ const t=$("toast"); t.textContent=msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"), 1200); }
-
-// Active buttons
-function setActive(button){ const group=button.getAttribute("data-group"); if(!group) return;
-  document.querySelectorAll('[data-group="'+group+'"]').forEach(b=>b.classList.remove("active")); button.classList.add("active"); }
-
-// Progress bars (local only)
+function setActive(button){ const group=button.getAttribute("data-group"); if(!group) return; document.querySelectorAll('[data-group="'+group+'"]').forEach(b=>b.classList.remove("active")); button.classList.add("active"); }
 const LS_KEY="guardian_progress";
 const FIELDS=[["Guardian/Auth","ga"],["AR Engine (R&D)","ar"],["App Shell / UI","ui"],["Cloud & Deploy","cd"],["MVP (całość)","mvp"]];
 function renderBars(state){
@@ -740,8 +805,7 @@ function renderBars(state){
     wrap.style.display="grid";wrap.style.gridTemplateColumns="200px 1fr 42px 42px";wrap.style.gap="8px";wrap.style.alignItems="center";wrap.style.margin="6px 0";
     const lab=document.createElement("div"); lab.textContent=label;
     const bar=document.createElement("div"); bar.style.height="8px";bar.style.background="#eee";bar.style.borderRadius="4px";
-    const inner=document.createElement("div"); inner.style.height="100%";inner.style.width=(state[key]||0)+"%";inner.style.background="var(--ok)";inner.style.borderRadius="4px";
-    bar.appendChild(inner);
+    const inner=document.createElement("div"); inner.style.height="100%";inner.style.width=(state[key]||0)+"%";inner.style.background="var(--ok)";inner.style.borderRadius="4px";bar.appendChild(inner);
     const input=document.createElement("input"); input.type="number";input.min=0;input.max=100;input.value=state[key]||0;input.style.width="42px";
     const pct=document.createElement("div"); pct.textContent=(state[key]||0)+"%";
     input.oninput=()=>{let v=Math.max(0,Math.min(100,parseInt(input.value||"0",10)));inner.style.width=v+"%";pct.textContent=v+"%";state[key]=v;};
@@ -749,7 +813,7 @@ function renderBars(state){
   });
 }
 
-// N18 sparkline
+// Sparkline + loaders
 let timer=null; const series=[];
 function drawSpark(values){
   const cv=$("spark"); const ctx=cv.getContext("2d"); ctx.clearRect(0,0,cv.width,cv.height);
@@ -761,30 +825,35 @@ function drawSpark(values){
   values.forEach((v,i)=>{ const x=pad + (i/(values.length-1))*w; const y=pad + (1-norm(v))*h; if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y); });
   ctx.lineWidth=2; ctx.strokeStyle="var(--ok)"; ctx.stroke();
 }
-
-// Heatmap
 function renderHeatmap(cells,max){
   const root=$("heatmap"); root.innerHTML="";
-  if(!cells.length){ root.textContent="No data"; return; }
+  cells.forEach(c=>{ const div=document.createElement("div"); div.className="cell"; const a=max? (c.count/max):0; div.style.background=`rgba(46,125,50, ${0.1+0.9*a})`; div.title=new Date(c.t*1000).toLocaleTimeString()+" – "+c.count+" req/min"; root.appendChild(div); });
+}
+function renderHeatmapS(cells,max){
+  const root=$("heatmapS"); root.innerHTML="";
   cells.forEach(c=>{
     const div=document.createElement("div"); div.className="cell";
-    const a=max? (c.count/max):0;
-    div.style.background = `rgba(46,125,50, ${0.1 + 0.9*a})`;
-    const dt = new Date(c.t*1000).toLocaleTimeString();
-    div.title = `${dt} – ${c.count} req/min`;
+    let color="#2e7d32"; if(c.c5xx>0) color="#c62828"; else if(c.c4xx>0) color="#e09100";
+    const a=max? (c.count/max):0; div.style.background=`${color}33`; div.style.background=`rgba(${color=='#c62828'?'198,40,40':color=='#e09100'?'224,145,0':'46,125,50'}, ${0.15+0.85*a})`;
+    div.title=new Date(c.t*1000).toLocaleTimeString()+` – 2xx:${c.c2xx} 4xx:${c.c4xx} 5xx:${c.c5xx}`;
     root.appendChild(div);
   });
 }
+function renderRateBox(stats){
+  const box=$("rateBox"); const lines=[];
+  lines.push(`window=${stats.window_s}s, limit=${stats.max}/ip, ips=${stats.total_ips}`);
+  (stats.ips||[]).forEach((r,i)=>{ const bar="█".repeat(Math.max(1, Math.round((r.count/stats.max)*10))); lines.push(`${i+1}. ${r.ip.padEnd(15)} ${strPad(r.count,3)} ${bar}`); });
+  box.textContent=lines.join("\\n");
+}
+function strPad(n, w){ const s=String(n); return " ".repeat(Math.max(0,w-s.length))+s; }
 
-// State + helpers
 const TOKKEY="guardian_session";
-$("admTok").value=localStorage.getItem(TOKKEY)||"";
-$("admTok").oninput=()=>localStorage.setItem(TOKKEY,$("admTok").value.trim());
+$("admTok").value=localStorage.getItem(TOKKEY)||""; $("admTok").oninput=()=>localStorage.setItem(TOKKEY,$("admTok").value.trim());
 function tok(){ return $("admTok").value.trim(); }
 function copy(text){ navigator.clipboard.writeText(text).then(()=>toast("Skopiowano")).catch(()=>toast("Nie udało się skopiować")); }
 async function withBusy(btn, fn){ try{ btn.setAttribute("disabled",""); setActive(btn); await fn(); } finally{ btn.removeAttribute("disabled"); } }
 
-// Data loaders
+// Loaders
 async function loadSummary(){ const r=await fetch('/api/logs/summary?n=500'); const j=await r.json();
   const ul=$("topPaths"); ul.innerHTML=""; (j.paths_top5||[]).forEach(([p,c])=>{ const li=document.createElement('li'); li.textContent=p+"  ("+c+")"; ul.appendChild(li); });
   $("codes").textContent=JSON.stringify(j.statuses||{},null,2);
@@ -797,27 +866,28 @@ async function loadHealth(){ const r=await fetch('/api/health/detail?n=200'); co
   if(p95>=j.thresholds.crit){ alert.classList.add("crit"); txt.textContent=`CRIT: p95=${p95}ms (>= ${j.thresholds.crit})`; }
   else if(p95>=j.thresholds.warn){ alert.classList.add("warn"); txt.textContent=`WARN: p95=${p95}ms (>= ${j.thresholds.warn})`; }
   else { alert.style.display="none"; txt.textContent=""; } }
-async function loadRollup(){ const r=await fetch('/api/logs/rollup?minutes=60'); const j=await r.json();
-  const vals=(j.series||[]).map(pt=>pt.p95||0); if(vals.length){ series.length=0; vals.forEach(v=>series.push(v)); drawSpark(series); } }
+async function loadRollup(){ const r=await fetch('/api/logs/rollup?minutes=60'); const j=await r.json(); const vals=(j.series||[]).map(pt=>pt.p95||0); if(vals.length){ series.length=0; vals.forEach(v=>series.push(v)); drawSpark(series); } }
 async function loadHeat(){ const r=await fetch('/api/logs/heatmap?minutes=60'); const j=await r.json(); renderHeatmap(j.cells||[], j.max||0); }
+async function loadHeatStatus(){ const r=await fetch('/api/logs/heatmap_status?minutes=60'); const j=await r.json(); renderHeatmapS(j.cells||[], j.max||0); }
+async function loadRateStats(){ const r=await fetch('/api/rate/window_stats?top=8'); const j=await r.json(); renderRateBox(j); }
 
 // Init
 (async function init(){
   try{ const r=await fetch('/auth/challenge'); $("challenge").textContent=JSON.stringify(await r.json(),null,2); } catch(e){ $("challenge").textContent="API offline"; }
-  try{ const wsUrl=(location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/shadow/ws"; const ws=new WebSocket(wsUrl);
-    ws.onmessage=(ev)=>{ try{ const j=JSON.parse(ev.data); const el=$("log"); el.textContent+=JSON.stringify(j)+"\\n"; el.scrollTop=el.scrollHeight; }catch(e){} }; }
-  catch(e){ const el=document.querySelector("#ws"); el.textContent="WS: error"; el.style.color="#c62828"; }
+  try{
+    const wsUrl=(location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/shadow/ws";
+    const ws=new WebSocket(wsUrl);
+    ws.onmessage=(ev)=>{ try{ const j=JSON.parse(ev.data); const el=$("log"); el.textContent+=JSON.stringify(j)+"\\n"; el.scrollTop=el.scrollHeight; }catch(e){} };
+  }catch(e){ const el=document.querySelector("#ws"); el.textContent="WS: error"; el.style.color="#c62828"; }
 
   const state=JSON.parse(localStorage.getItem(LS_KEY)||"{}"); renderBars(state);
   $("save").onclick=()=>{ localStorage.setItem(LS_KEY,JSON.stringify(state)); toast("Zapisano"); };
   $("reset").onclick=()=>{ localStorage.removeItem(LS_KEY); location.reload(); };
 
-  // CEO controls
-  $("start").onclick=()=>{ if(!window._n18){ window._n18=setInterval(async()=>{ await loadHealth(); await loadSummary(); await loadRollup(); await loadHeat(); },5000); } setActive($("start")); };
+  $("start").onclick=()=>{ if(!window._n18){ window._n18=setInterval(async()=>{ await loadHealth(); await loadSummary(); await loadRollup(); await loadHeat(); await loadHeatStatus(); await loadRateStats(); },5000); } setActive($("start")); };
   $("stop").onclick=()=>{ if(window._n18){ clearInterval(window._n18); window._n18=null; } setActive($("stop")); };
-  $("once").onclick=()=>withBusy($("once"), async()=>{ await loadHealth(); await loadSummary(); await loadRollup(); await loadHeat(); });
+  $("once").onclick=()=>withBusy($("once"), async()=>{ await loadHealth(); await loadSummary(); await loadRollup(); await loadHeat(); await loadHeatStatus(); await loadRateStats(); });
 
-  // Diag & snapshots
   $("btnEcho").onclick=()=>withBusy($("btnEcho"), async()=>{ const r=await fetch('/api/diag/echo'); $("diagOut").textContent=JSON.stringify(await r.json(),null,2); });
   $("btnEchoCurl").onclick=()=>{ setActive($("btnEchoCurl")); copy(`curl "${location.origin}/api/diag/echo"`); };
   $("btnSnapSave").onclick=()=>withBusy($("btnSnapSave"), async()=>{ const r=await fetch('/admin/snaps/save',{method:'POST',headers:{Authorization:'Bearer '+tok()}}); const j=await r.json(); $("diagOut").textContent=JSON.stringify(j,null,2); if(j.file) toast("Snapshot zapisany: "+j.file); });
@@ -831,7 +901,6 @@ async function loadHeat(){ const r=await fetch('/api/logs/heatmap?minutes=60'); 
     const a=document.createElement('a'); a.href=url; a.download=last; a.click(); URL.revokeObjectURL(url); toast("Pobrano "+last);
   });
 
-  // Admin quick tests
   const origin=location.origin;
   $("btnTail").onclick=()=>withBusy($("btnTail"), async()=>{ const r=await fetch('/admin/events/tail?n=50',{headers:{Authorization:'Bearer '+tok()}}); $("admOut").textContent=await r.text(); });
   $("btnCSV").onclick=()=>withBusy($("btnCSV"), async()=>{ const r=await fetch('/admin/events/export.csv?n=200',{headers:{Authorization:'Bearer '+tok()}}); const blob=await r.blob(); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='events.csv'; a.click(); URL.revokeObjectURL(url); $("admOut").textContent="Pobrano events.csv"; });
@@ -842,8 +911,7 @@ async function loadHeat(){ const r=await fetch('/api/logs/heatmap?minutes=60'); 
   $("btnCSVCurl").onclick=()=>{ setActive($("btnCSVCurl")); copy(`curl -H "Authorization: Bearer ${tok()}" -o events.csv "${origin}/admin/events/export.csv?n=200"`); };
   $("btnPurgeCurl").onclick=()=>{ setActive($("btnPurgeCurl")); copy(`curl -X POST -H "Authorization: Bearer ${tok()}" "${origin}/admin/events/purge"`); };
 
-  // First load
-  await loadHealth(); await loadSummary(); await loadRollup(); await loadHeat(); $("start").click();
+  await loadHealth(); await loadSummary(); await loadRollup(); await loadHeat(); await loadHeatStatus(); await loadRateStats(); $("start").click();
 })();
 </script>
 </body>
@@ -901,6 +969,13 @@ MOBILE_HTML = """<!doctype html>
   <div>ETA tokenu: <span id="eta">-</span></div>
 </div>
 
+<div class="card" style="margin-top:10px">
+  <b>6) Echo (signed, aud=diag)</b><br><br>
+  <button id="getDiag">🎯 Pobierz /auth/challenge?aud=diag</button>
+  <button id="echoSigned">🔐 Podpisz & /api/diag/echo_signed</button>
+  <pre id="diagOut"></pre>
+</div>
+
 <script src="https://cdn.jsdelivr.net/npm/tweetnacl@1.0.3/nacl.min.js"></script>
 <script>
 const $=id=>document.getElementById(id);
@@ -918,7 +993,7 @@ $("register").onclick = async ()=>{ try{ const kp=getKeypair(); const pub=b64u(k
   const r=await fetch("/guardian/register_pubkey",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({kid,pub})}); $("regOut").textContent=await r.text();
 }catch(e){ $("regOut").textContent="ERR: "+e.message; }};
 
-let last=null, session=null, exp=0, ticker=null;
+let last=null, lastDiag=null, session=null, exp=0, ticker=null;
 function tick(){ const eta=Math.max(0, exp - Math.floor(Date.now()/1000)); $("eta").textContent=eta+"s"; }
 
 $("getCh").onclick = async ()=>{ const r=await fetch("/auth/challenge"); last=await r.json(); $("chOut").textContent=JSON.stringify(last,null,2); };
@@ -936,5 +1011,16 @@ $("verify").onclick = async ()=>{ try{
 $("ping").onclick = async ()=>{ const r=await fetch("/protected/hello",{ headers:{"Authorization":"Bearer "+(session||"")}}); $("pingOut").textContent=await r.text(); };
 $("refresh").onclick = async ()=>{ const r=await fetch("/guardian/refresh",{ method:"POST", headers:{"Authorization":"Bearer "+(session||"")}}); const j=await r.json(); if(j.ok){ exp=j.exp; } $("pingOut").textContent=JSON.stringify(j,null,2); };
 $("logout").onclick = async ()=>{ const r=await fetch("/guardian/logout",{ method:"POST", headers:{"Authorization":"Bearer "+(session||"")}}); const j=await r.json(); session=null; exp=0; tick(); $("pingOut").textContent=JSON.stringify(j,null,2); };
+
+$("getDiag").onclick = async ()=>{ const r=await fetch("/auth/challenge?aud=diag"); lastDiag=await r.json(); $("diagOut").textContent=JSON.stringify(lastDiag,null,2); };
+$("echoSigned").onclick = async ()=>{ try{
+  if(!lastDiag) throw new Error("Najpierw pobierz challenge (aud=diag)."); const kid=$("kid").value.trim()||"dev-key-1";
+  const hdr={alg:"EdDSA", typ:"JWT", kid}; const pld={aud:lastDiag.aud, nonce:lastDiag.nonce, ts: Math.floor(Date.now()/1000)};
+  const h=b64u(enc.encode(JSON.stringify(hdr))); const p=b64u(enc.encode(JSON.stringify(pld))); const kp=getKeypair();
+  const sig=nacl.sign.detached(new TextEncoder().encode(h+"."+p), kp.secretKey);
+  const jws=h+"."+p+"."+b64u(sig);
+  const r=await fetch("/api/diag/echo_signed",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({jws})});
+  $("diagOut").textContent=JSON.stringify(await r.json(),null,2);
+}catch(e){ $("diagOut").textContent="ERR: "+e.message; } };
 </script>
 """
