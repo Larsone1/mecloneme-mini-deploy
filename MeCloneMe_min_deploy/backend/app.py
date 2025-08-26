@@ -16,7 +16,7 @@ def b64u_encode(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode().rstrip("=")
 
 # ===== Config (ENV) =====
-API_VERSION = os.getenv("API_VERSION","0.1.2")
+API_VERSION = os.getenv("API_VERSION","0.1.3")
 NONCE_TTL   = int(os.getenv("NONCE_TTL", "300"))   # s
 SESSION_TTL = int(os.getenv("SESSION_TTL", "900")) # s
 RATE_MAX    = int(os.getenv("RATE_MAX", "30"))     # max calls / window
@@ -180,114 +180,88 @@ PANEL_HTML = """<!doctype html>
 
 <div style="border:1px solid #eee;border-radius:8px;padding:12px;margin-top:16px">
   <h2>Admin — szybkie testy</h2>
-  <div style="margin:6px 0">Token (Bearer) z <code>/mobile</code> po <i>verify</i>:
+  <div style="margin:6px 0">
+    Token (Bearer) z <code>/mobile</code> po <i>verify</i> (zapamięta się lokalnie):
     <input id="admTok" placeholder="sess_xxx" style="width:320px">
   </div>
   <div style="display:flex;gap:8px;flex-wrap:wrap;margin:6px 0">
     <button id="btnTail">📜 Tail (50)</button>
+    <button id="btnTailCurl">📋 Copy cURL: Tail</button>
     <button id="btnCSV">⬇️ CSV (200)</button>
+    <button id="btnCSVCurl">📋 Copy cURL: CSV</button>
     <button id="btnSummary">📊 Summary (500)</button>
     <button id="btnHealth">🩺 Health detail</button>
     <button id="btnPurge" style="color:#b71c1c;border-color:#b71c1c">🧹 Purge log</button>
+    <button id="btnPurgeCurl" style="color:#b71c1c;border-color:#b71c1c">📋 Copy cURL: Purge</button>
   </div>
   <pre id="admOut" style="background:#f7f7f7;border:1px solid #eee;border-radius:8px;min-height:120px;padding:12px"></pre>
 </div>
 
 <script>
 const $=id=>document.getElementById(id);
+
+// Progress bars (local only)
 const LS_KEY="guardian_progress";
-function log(m){ const el=$("log"); el.textContent += m+"\\n"; el.scrollTop = el.scrollHeight; }
-
-const FIELDS = [
-  ["Guardian/Auth","ga"],
-  ["AR Engine (R&D)","ar"],
-  ["App Shell / UI","ui"],
-  ["Cloud & Deploy","cd"],
-  ["MVP (całość)","mvp"]
-];
-
+const FIELDS=[["Guardian/Auth","ga"],["AR Engine (R&D)","ar"],["App Shell / UI","ui"],["Cloud & Deploy","cd"],["MVP (całość)","mvp"]];
 function renderBars(state){
-  const root = $("bars");
-  root.innerHTML = "";
+  const root=$("bars"); root.innerHTML="";
   FIELDS.forEach(([label,key])=>{
-    const wrap = document.createElement("div");
-    wrap.style.display="grid";
-    wrap.style.gridTemplateColumns="200px 1fr 42px 42px";
-    wrap.style.gap="8px";
-    wrap.style.alignItems="center";
-    wrap.style.margin="6px 0";
-    const lab = document.createElement("div");
-    lab.textContent = label;
-    const bar = document.createElement("div");
-    bar.style.height="8px";bar.style.background="#eee";bar.style.borderRadius="4px";
-    const inner = document.createElement("div");
-    inner.style.height="100%";inner.style.width=(state[key]||0)+"%";
-    inner.style.background="#2e7d32";inner.style.borderRadius="4px";
+    const wrap=document.createElement("div");
+    wrap.style.display="grid";wrap.style.gridTemplateColumns="200px 1fr 42px 42px";wrap.style.gap="8px";wrap.style.alignItems="center";wrap.style.margin="6px 0";
+    const lab=document.createElement("div"); lab.textContent=label;
+    const bar=document.createElement("div"); bar.style.height="8px";bar.style.background="#eee";bar.style.borderRadius="4px";
+    const inner=document.createElement("div"); inner.style.height="100%";inner.style.width=(state[key]||0)+"%";inner.style.background="#2e7d32";inner.style.borderRadius="4px";
     bar.appendChild(inner);
-    const input = document.createElement("input");
-    input.type="number";input.min=0;input.max=100;input.value=state[key]||0;input.style.width="42px";
-    const labelPct = document.createElement("div");
-    labelPct.textContent=(state[key]||0)+"%";
-    input.oninput = ()=>{ 
-      let v = Math.max(0, Math.min(100, parseInt(input.value||"0",10)));
-      inner.style.width = v+"%";
-      labelPct.textContent = v+"%";
-      state[key]=v;
-    };
-    wrap.append(lab, bar, input, labelPct);
-    root.appendChild(wrap);
+    const input=document.createElement("input"); input.type="number";input.min=0;input.max=100;input.value=state[key]||0;input.style.width="42px";
+    const pct=document.createElement("div"); pct.textContent=(state[key]||0)+"%";
+    input.oninput=()=>{let v=Math.max(0,Math.min(100,parseInt(input.value||"0",10)));inner.style.width=v+"%";pct.textContent=v+"%";state[key]=v;};
+    wrap.append(lab,bar,input,pct); root.appendChild(wrap);
   });
 }
 
+// Init
 (async function init(){
-  try{
-    const r = await fetch('/auth/challenge');
-    const j = await r.json();
-    $("challenge").textContent = JSON.stringify(j,null,2);
-  }catch(e){ $("challenge").textContent = "API offline"; }
+  // challenge preview
+  try{ const r=await fetch('/auth/challenge'); $("challenge").textContent=JSON.stringify(await r.json(),null,2); }
+  catch(e){ $("challenge").textContent="API offline"; }
 
-  const wsUrl = (location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/shadow/ws";
+  // WS live log
   try{
-    const ws = new WebSocket(wsUrl);
-    ws.onmessage = (ev)=>{
-      try{ log(JSON.stringify(JSON.parse(ev.data))); }
-      catch(e){ log(ev.data); }
-    };
+    const wsUrl=(location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/shadow/ws";
+    const ws=new WebSocket(wsUrl);
+    ws.onmessage=(ev)=>{ try{ const j=JSON.parse(ev.data); const el=document.getElementById("log"); el.textContent+=JSON.stringify(j)+"\\n"; el.scrollTop=el.scrollHeight; }catch(e){ } };
   }catch(e){ const el=document.querySelector("#ws"); el.textContent="WS: error"; el.style.color="#b71c1c"; }
 
-  const state = JSON.parse(localStorage.getItem(LS_KEY)||"{}");
-  renderBars(state);
-  document.getElementById("save").onclick = ()=>localStorage.setItem(LS_KEY, JSON.stringify(state));
-  document.getElementById("reset").onclick = ()=>{ localStorage.removeItem(LS_KEY); location.reload(); };
+  // progress bars state
+  const state=JSON.parse(localStorage.getItem(LS_KEY)||"{}"); renderBars(state);
+  document.getElementById("save").onclick=()=>localStorage.setItem(LS_KEY,JSON.stringify(state));
+  document.getElementById("reset").onclick=()=>{ localStorage.removeItem(LS_KEY); location.reload(); };
 
-  // Admin quick tests
+  // Token autofill from localStorage
+  const TOKKEY="guardian_session";
+  $("admTok").value=localStorage.getItem(TOKKEY)||"";
+  $("admTok").oninput=()=>localStorage.setItem(TOKKEY,$("admTok").value.trim());
+
+  // helpers
   function tok(){ return $("admTok").value.trim(); }
-  $("btnTail").onclick = async ()=>{
-    const r = await fetch('/admin/events/tail?n=50',{headers:{Authorization:'Bearer '+tok()}});
-    $("admOut").textContent = await r.text();
+  const origin=location.origin;
+  async function copy(text){ try{ await navigator.clipboard.writeText(text); $("admOut").textContent="Skopiowano do schowka."; }catch(e){ $("admOut").textContent="Nie udało się skopiować."; } }
+
+  // Buttons
+  $("btnTail").onclick=async()=>{ const r=await fetch('/admin/events/tail?n=50',{headers:{Authorization:'Bearer '+tok()}}); $("admOut").textContent=await r.text(); };
+  $("btnCSV").onclick=async()=>{
+    const r=await fetch('/admin/events/export.csv?n=200',{headers:{Authorization:'Bearer '+tok()}});
+    const blob=await r.blob(); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='events.csv'; a.click(); URL.revokeObjectURL(url);
+    $("admOut").textContent="Pobrano events.csv";
   };
-  $("btnCSV").onclick = async ()=>{
-    const r = await fetch('/admin/events/export.csv?n=200',{headers:{Authorization:'Bearer '+tok()}});
-    const blob = await r.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = 'events.csv'; a.click();
-    URL.revokeObjectURL(url);
-    $("admOut").textContent = "Pobrano events.csv";
-  };
-  $("btnSummary").onclick = async ()=>{
-    const r = await fetch('/api/logs/summary?n=500');
-    $("admOut").textContent = JSON.stringify(await r.json(),null,2);
-  };
-  $("btnHealth").onclick = async ()=>{
-    const r = await fetch('/api/health/detail?n=200');
-    $("admOut").textContent = JSON.stringify(await r.json(),null,2);
-  };
-  $("btnPurge").onclick = async ()=>{
-    if(!confirm('Na pewno usunąć zawartość events.jsonl?')) return;
-    const r = await fetch('/admin/events/purge',{method:'POST', headers:{Authorization:'Bearer '+tok()}});
-    $("admOut").textContent = await r.text();
-  };
+  $("btnSummary").onclick=async()=>{ const r=await fetch('/api/logs/summary?n=500'); $("admOut").textContent=JSON.stringify(await r.json(),null,2); };
+  $("btnHealth").onclick=async()=>{ const r=await fetch('/api/health/detail?n=200'); $("admOut").textContent=JSON.stringify(await r.json(),null,2); };
+  $("btnPurge").onclick=async()=>{ if(!confirm('Na pewno usunąć zawartość events.jsonl?')) return; const r=await fetch('/admin/events/purge',{method:'POST',headers:{Authorization:'Bearer '+tok()}}); $("admOut").textContent=await r.text(); };
+
+  // Copy curl buttons
+  $("btnTailCurl").onclick=()=>copy(`curl -H "Authorization: Bearer ${tok()}" "${origin}/admin/events/tail?n=50"`);
+  $("btnCSVCurl").onclick=()=>copy(`curl -H "Authorization: Bearer ${tok()}" -o events.csv "${origin}/admin/events/export.csv?n=200"`);
+  $("btnPurgeCurl").onclick=()=>copy(`curl -X POST -H "Authorization: Bearer ${tok()}" "${origin}/admin/events/purge"`);
 })();
 </script>
 </body>
@@ -409,7 +383,11 @@ $("verify").onclick = async ()=>{
     const r = await fetch("/guardian/verify",{method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({jws})});
     const j = await r.json();
     $("verOut").textContent = JSON.stringify(j,null,2);
-    if(j.ok && j.session){ session=j.session; exp=j.exp; clearInterval(ticker); ticker=setInterval(tick,1000); tick(); }
+    if(j.ok && j.session){
+      session=j.session; exp=j.exp;
+      localStorage.setItem("guardian_session", session); // 🍒 zapisz token dla panelu
+      clearInterval(ticker); ticker=setInterval(tick,1000); tick();
+    }
   }catch(e){ $("verOut").textContent = "ERR: "+e.message; }
 };
 
@@ -711,13 +689,12 @@ def admin_csv(request: Request, n: int = Query(500, ge=1, le=5000)):
 def admin_purge(request: Request):
     token = _auth_token(request)
     if not require_session(token): return bad("unauthorized")
-    # backup & truncate
     try:
         if os.path.exists(EVENTS_JSONL):
             ts = int(time.time())
             os.replace(EVENTS_JSONL, f"{EVENTS_JSONL}.{ts}.bak")
         open(EVENTS_JSONL, "w", encoding="utf-8").close()
-        write_event("admin.purge")  # zapisze już do nowego, pustego pliku
+        write_event("admin.purge")
         return ok(msg="purged")
     except Exception as e:
         return bad("purge-failed", error=str(e))
@@ -748,15 +725,7 @@ def logs_summary(n: int = Query(1000, ge=10, le=10000)):
     lat_q = _quantiles(lat)
     err4 = sum(v for k,v in by_status.items() if k.startswith("4"))
     err5 = sum(v for k,v in by_status.items() if k.startswith("5"))
-    return {
-        "ok": True,
-        "total": total,
-        "paths_top5": top_paths,
-        "methods": by_method,
-        "statuses": by_status,
-        "latency_ms": lat_q,
-        "errors": {"4xx": err4, "5xx": err5}
-    }
+    return {"ok": True,"total": total,"paths_top5": top_paths,"methods": by_method,"statuses": by_status,"latency_ms": lat_q,"errors": {"4xx": err4, "5xx": err5}}
 
 @app.get("/api/health/detail")
 def health_detail(n: int = Query(200, ge=20, le=5000)):
@@ -766,17 +735,7 @@ def health_detail(n: int = Query(200, ge=20, le=5000)):
     codes: Dict[str,int] = {}
     for r in rows:
         k = str(r.get("status","?")); codes[k] = codes.get(k,0)+1
-    return {
-        "ok": True,
-        "ts": int(time.time()),
-        "version": API_VERSION,
-        "uptime_s": int(time.time()) - BOOT_TS,
-        "req_count": REQ_COUNT,
-        "rate_window_s": RATE_WINDOW,
-        "latency_ms": lat_q,
-        "codes": codes,
-        "sample_size": len(rows)
-    }
+    return {"ok": True,"ts": int(time.time()),"version": API_VERSION,"uptime_s": int(time.time()) - BOOT_TS,"req_count": REQ_COUNT,"rate_window_s": RATE_WINDOW,"latency_ms": lat_q,"codes": codes,"sample_size": len(rows)}
 
 # ===== AR engine (stub / R&D) =====
 @app.get("/ar/ping")
