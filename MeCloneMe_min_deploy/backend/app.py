@@ -61,38 +61,127 @@ ws_manager = WSManager()
 
 # ---------- Mini panel na / (podgląd challenge + live log) ----------
 
-PANEL_HTML = """
-<!doctype html><meta charset="utf-8"><title>Guardian Mini Panel</title>
-<body style="font-family:system-ui, -apple-system, sans-serif; padding:16px">
+PANEL_HTML = """<!doctype html><meta charset="utf-8"><title>Guardian – mini panel</title>
+<body style="font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding:16px">
 <h1>Guardian — mini panel</h1>
+
 <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
   <div style="border:1px solid #eee;border-radius:12px;padding:12px">
     <h2>Challenge</h2>
-    <pre id="challenge" style="background:#f7f7f7;padding:12px;border-radius:8px">...</pre>
+    <pre id="challenge" style="background:#f7f7f7;border:1px solid #eee;border-radius:8px;padding:12px">...</pre>
   </div>
+
   <div style="border:1px solid #eee;border-radius:12px;padding:12px">
-    <h2>Live log</h2>
-    <pre id="log" style="background:#f7f7f7;padding:12px;border-radius:8px;height:260px;overflow:auto"></pre>
+    <h2 style="display:flex;align-items:center;gap:10px">
+      Live log
+      <small id="wsStatus" style="font-weight:600;color:#a00">WS: disconnected</small>
+    </h2>
+    <pre id="log" style="background:#f7f7f7;border:1px solid #eee;border-radius:8px;padding:12px;height:260px;overflow:auto"></pre>
+  </div>
+
+  <div style="grid-column:1 / span 2;border:1px solid #eee;border-radius:12px;padding:12px">
+    <h2>Postęp projektu (tylko lokalnie – zapis w przeglądarce)</h2>
+    <div id="bars" style="display:grid;gap:12px">
+      <!-- jeden wiersz paska -->
+      <div class="pr">
+        <div style="min-width:160px">Guardian/Auth</div>
+        <div class="meter"><div id="bar-auth" class="fill"></div></div>
+        <input id="num-auth" data-k="auth" class="progress-num" type="number" min="0" max="100" value="0" style="width:64px">
+        <div id="label-auth" style="width:44px;text-align:right">0%</div>
+      </div>
+      <div class="pr">
+        <div style="min-width:160px">AR Engine (R&amp;D)</div>
+        <div class="meter"><div id="bar-ar" class="fill"></div></div>
+        <input id="num-ar" data-k="ar" class="progress-num" type="number" min="0" max="100" value="0" style="width:64px">
+        <div id="label-ar" style="width:44px;text-align:right">0%</div>
+      </div>
+      <div class="pr">
+        <div style="min-width:160px">App Shell / UI</div>
+        <div class="meter"><div id="bar-ui" class="fill"></div></div>
+        <input id="num-ui" data-k="ui" class="progress-num" type="number" min="0" max="100" value="0" style="width:64px">
+        <div id="label-ui" style="width:44px;text-align:right">0%</div>
+      </div>
+      <div class="pr">
+        <div style="min-width:160px">Cloud &amp; Deploy</div>
+        <div class="meter"><div id="bar-infra" class="fill"></div></div>
+        <input id="num-infra" data-k="infra" class="progress-num" type="number" min="0" max="100" value="0" style="width:64px">
+        <div id="label-infra" style="width:44px;text-align:right">0%</div>
+      </div>
+      <div class="pr">
+        <div style="min-width:160px">MVP (całość)</div>
+        <div class="meter"><div id="bar-mvp" class="fill"></div></div>
+        <input id="num-mvp" data-k="mvp" class="progress-num" type="number" min="0" max="100" value="5" style="width:64px">
+        <div id="label-mvp" style="width:44px;text-align:right">5%</div>
+      </div>
+    </div>
+    <div style="margin-top:12px;display:flex;gap:8px">
+      <button id="saveAll">💾 Zapisz</button>
+      <button id="resetAll">↺ Reset</button>
+    </div>
   </div>
 </div>
-<script>
-  fetch('/auth/challenge').then(r=>r.json()).then(x=>{
-    document.getElementById('challenge').textContent = JSON.stringify(x,null,2);
-  }).catch(()=>{document.getElementById('challenge').textContent='API offline';});
 
-  const log = document.getElementById('log');
+<style>
+  .pr{display:grid;grid-template-columns:160px 1fr 64px 44px;gap:8px;align-items:center}
+  .meter{height:14px;background:#eee;border-radius:10px;overflow:hidden;box-shadow:inset 0 0 0 1px #e0e0e0}
+  .fill{height:100%;width:0%;
+        background:linear-gradient(90deg,#7dd3fc,#34d399);
+        transition:width .25s ease}
+  button{padding:6px 10px;border:1px solid #ddd;border-radius:8px;background:#fff;cursor:pointer}
+  button:hover{background:#f7f7f7}
+</style>
+
+<script>
+(async function(){
+  // 1) pobierz /auth/challenge
   try{
-    const ws = new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/shadow/ws');
-    ws.onmessage = e=>{
-      try{
-        const m = JSON.parse(e.data);
-        if(m.vec){ log.textContent += JSON.stringify(m)+'\\n'; log.scrollTop = log.scrollHeight; }
-      }catch(_){}
-    };
-  }catch(e){ log.textContent='WS error: '+e; }
+    const r = await fetch('/auth/challenge');
+    const x = await r.json();
+    document.getElementById('challenge').textContent = JSON.stringify(x,null,2);
+  }catch(e){
+    document.getElementById('challenge').textContent = 'API offline';
+  }
+
+  // 2) Live log via WebSocket
+  const log = document.getElementById('log');
+  const s = document.getElementById('wsStatus');
+  function append(m){
+    log.textContent += JSON.stringify(m)+'\\n';
+    log.scrollTop = log.scrollHeight;
+  }
+  const url = (location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/shadow/ws';
+  let ws = new WebSocket(url);
+  ws.onopen = ()=>{ s.textContent='WS: connected'; s.style.color='#0a0'; };
+  ws.onclose = ()=>{ s.textContent='WS: disconnected'; s.style.color='#a00'; };
+  ws.onerror = (e)=>{ s.textContent='WS: error'; s.style.color='#a00'; };
+  ws.onmessage = (e)=>{ try{ const m = JSON.parse(e.data); if(m.vec){ append(m); } }catch{} };
+
+  // 3) Pasek postępu – lokalny (localStorage)
+  const KEYS = ['auth','ar','ui','infra','mvp'];
+  function setVal(k,val,save=true){
+    val = Math.max(0,Math.min(100,parseInt(val||0,10)));
+    document.getElementById('bar-'+k).style.width = val+'%';
+    document.getElementById('num-'+k).value = val;
+    document.getElementById('label-'+k).textContent = val+'%';
+    if(save){ localStorage.setItem('p_'+k, String(val)); }
+  }
+  function load(){
+    KEYS.forEach(k=>{
+      const v = localStorage.getItem('p_'+k);
+      setVal(k, v==null ? (k==='mvp'?5:0) : v, false);
+    });
+  }
+  document.addEventListener('input',(ev)=>{
+    if(ev.target.classList.contains('progress-num')){
+      setVal(ev.target.dataset.k, ev.target.value);
+    }
+  });
+  document.getElementById('saveAll').onclick = ()=>{ KEYS.forEach(k=>setVal(k, document.getElementById('num-'+k).value)); alert('Zapisano lokalnie ✅'); };
+  document.getElementById('resetAll').onclick = ()=>{ KEYS.forEach(k=>{ localStorage.removeItem('p_'+k); }); load(); };
+  load();
+})();
 </script>
-</body>
-"""
+</body>"""
 
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -137,7 +226,9 @@ def challenge(aud: str = "mobile"):
 
 @app.websocket("/shadow/ws")
 async def shadow_ws(ws: WebSocket):
-    await ws_manager.connect(ws)
+    await ws_manager.connect(ws)    # wyślij „hello”, żeby od razu było widać połączenie
+    await ws.send_text(json.dumps({"ts": int(time.time()), "vec": {"sys": "ws-connected"}}))
+
     try:
         while True:
             await ws.receive_text()   # nie wykorzystujemy wejścia
