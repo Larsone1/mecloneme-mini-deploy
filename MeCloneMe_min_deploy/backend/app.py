@@ -1,5 +1,7 @@
 import os, time, json, base64, secrets, re
 from typing import Dict, Any, List, Optional
+from datetime import datetime, timedelta
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Query
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,7 +15,7 @@ def b64u_decode(s: str) -> bytes:
     return base64.urlsafe_b64decode(s.encode())
 
 # ===== Config (ENV) =====
-API_VERSION = os.getenv("API_VERSION", "0.3.4")
+API_VERSION = os.getenv("API_VERSION", "0.3.5")
 NONCE_TTL   = int(os.getenv("NONCE_TTL", "300"))
 SESSION_TTL = int(os.getenv("SESSION_TTL", "3600"))
 P95_WARN    = int(os.getenv("P95_WARN", "300"))
@@ -25,7 +27,7 @@ THEME       = os.getenv("THEME", "dark")  # dark | light
 # ===== Models =====
 class PubKey(BaseModel):
     kid: str
-    key: str
+    key: str  # base64url public key (Ed25519)
 
 class Challenge(BaseModel):
     aud: str
@@ -88,6 +90,7 @@ PUBKEYS: Dict[str, str] = {}
 SESSIONS: Dict[str, Dict[str, Any]] = {}
 RATE: Dict[str, List[int]] = {}
 ALERTS: List[Dict[str, Any]] = []
+LAST_ALERT_TS: Dict[str, int] = {}
 
 PUBKEYS_PATH = os.path.join(DATA_DIR, "pubkeys.json")
 SESSIONS_PATH = os.path.join(DATA_DIR, "sessions.json")
@@ -97,10 +100,9 @@ PROGRESS_PATH = os.path.join(DATA_DIR, "progress.json")
 
 BOOT_TS = int(time.time())
 REQ_COUNT = 0
-LAST_ALERT_TS: Dict[str, int] = {}
 
-METRICS_TTL = float(os.getenv("METRICS_TTL", "2"))
-AUDIT_SAMPLE_N = int(os.getenv("AUDIT_SAMPLE_N", "1"))
+METRICS_TTL = float(os.getenv("METRICS_TTL", "2"))            # seconds to cache /metrics
+AUDIT_SAMPLE_N = int(os.getenv("AUDIT_SAMPLE_N", "1"))        # 1 = every request; 10 ≈ 10%
 SKIP_AUDIT_PATHS = set((os.getenv("SKIP_AUDIT_PATHS", "/metrics,/health,/ar/ping").split(",")))
 METRICS_CACHE = {"ts": 0.0, "body": ""}
 
@@ -136,7 +138,6 @@ def write_shadow(**fields):
     except Exception:
         pass
 
-
 def tail_jsonl(path: str, n: int) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     try:
@@ -149,7 +150,6 @@ def tail_jsonl(path: str, n: int) -> List[Dict[str, Any]]:
     except Exception:
         pass
     return rows
-
 
 def load_stores():
     global PUBKEYS, SESSIONS
@@ -201,7 +201,7 @@ def new_session(kid: str) -> SessionInfo:
     _save_json(SESSIONS_PATH, SESSIONS)
     return SessionInfo(kid=kid, sid=sid, exp=exp)
 
-# ===== Rate limiting =====
+# ===== Rate helper =====
 def rate_is_hot(ip: str) -> Optional[int]:
     cnt = len(RATE.get(ip, []))
     return cnt if cnt >= int(RATE_MAX * 0.8) else None
@@ -261,7 +261,6 @@ def _percentile(values: List[int], p: float) -> int:
     d1 = xs[c] * (k - f)
     return int(d0 + d1)
 
-
 def _lat_stats(vals: List[int]) -> Dict[str, int]:
     if not vals:
         return {"p50": 0, "p95": 0, "avg": 0, "max": 0}
@@ -273,7 +272,6 @@ def _lat_stats(vals: List[int]) -> Dict[str, int]:
     }
 
 # ===== Metrics builders =====
-
 def _compute_summary(n: int) -> Dict[str, Any]:
     rows = [r for r in tail_jsonl(EVENTS_JSONL, n) if r.get("kind") == "http"]
     by_status: Dict[str, int] = {}
@@ -292,7 +290,6 @@ def _compute_summary(n: int) -> Dict[str, Any]:
         "methods": by_method,
         "latency_ms": _lat_stats(lat),
     }
-
 
 def _compute_series(minutes: int = 30) -> Dict[str, Any]:
     rows = [r for r in tail_jsonl(EVENTS_JSONL, minutes * 60) if r.get("kind") == "http"]
@@ -313,7 +310,6 @@ def _compute_series(minutes: int = 30) -> Dict[str, Any]:
         q = _lat_stats(vals) if vals else {"p50": 0, "p95": 0, "avg": 0, "max": 0}
         series.append({"t": m, "p95": q["p95"], "count": counts.get(m, 0)})
     return {"ok": True, "series": series[-minutes:]}
-
 
 def _compute_health(n: int) -> Dict[str, Any]:
     rows = [r for r in tail_jsonl(EVENTS_JSONL, n) if r.get("kind") == "http"]
@@ -343,7 +339,6 @@ def _compute_health(n: int) -> Dict[str, Any]:
     }
 
 # ===== Theming =====
-
 def _theme_vars(theme: str) -> Dict[str, str]:
     if theme == "light":
         return {
@@ -355,25 +350,29 @@ def _theme_vars(theme: str) -> Dict[str, str]:
         "ok": "#4ade80", "warn": "#fbbf24", "crit": "#f87171", "btn": "#0f1720"
     }
 
-# ===== UI renderers (safe .format with escaped braces) =====
-
+# ===== UI renderers (safe tokens, no .format in HTML) =====
 def render_panel_html() -> str:
     v = _theme_vars(THEME)
+    css = (
+        ":root{"
+        f" --bg:{v['bg']}; --tx:{v['tx']}; --bd:{v['bd']}; --card:{v['card']}; --btn:{v['btn']};"
+        f" --ok:{v['ok']}; --warn:{v['warn']}; --crit:{v['crit']}; }}"
+    )
     tpl = '''<!doctype html>
 <meta charset="utf-8"><title>MeCloneMe — Panel (mini)</title>
 <style>
-  :root {{ --bg:{bg}; --tx:{tx}; --bd:{bd}; --card:{card}; --btn:{btn}; --ok:{ok}; --warn:{warn}; --crit:{crit}; }}
-  html,body {{ background:var(--bg); color:var(--tx); height:100%; margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto; }}
-  .wrap {{ padding:16px; max-width:980px; margin:0 auto; }}
-  .card {{ border:1px solid var(--bd); border-radius:10px; padding:12px; background:var(--card); margin:10px 0; }}
-  .btn {{ padding:8px 12px; border:1px solid var(--bd); border-radius:8px; background:var(--btn); color:var(--tx); cursor:pointer; }}
-  .btn[disabled] {{ opacity:.5; cursor:default; }}
-  .row {{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; }}
-  .kv {{ font:12px/1.2 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas; }}
-  .meter {{ height:10px; background:var(--bd); border-radius:999px; position:relative; overflow:hidden; }}
-  .meter>i {{ position:absolute; left:0; top:0; bottom:0; background:linear-gradient(90deg,var(--ok),#22d3ee); border-radius:999px; }}
-  .grid {{ display:grid; grid-template-columns:1fr 1fr; gap:10px; }}
-  @media (max-width:720px) {{ .grid {{ grid-template-columns:1fr; }} }}
+  __CSS__
+  html,body { background:var(--bg); color:var(--tx); height:100%; margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto; }
+  .wrap { padding:16px; max-width:980px; margin:0 auto; }
+  .card { border:1px solid var(--bd); border-radius:10px; padding:12px; background:var(--card); margin:10px 0; }
+  .btn { padding:8px 12px; border:1px solid var(--bd); border-radius:8px; background:var(--btn); color:var(--tx); cursor:pointer; }
+  .btn[disabled] { opacity:.5; cursor:default; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .kv { font:12px/1.2 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas; }
+  .meter { height:10px; background:var(--bd); border-radius:999px; position:relative; overflow:hidden; }
+  .meter>i { position:absolute; left:0; top:0; bottom:0; background:linear-gradient(90deg,var(--ok),#22d3ee); border-radius:999px; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  @media (max-width:720px) { .grid { grid-template-columns:1fr; } }
 </style>
 <div class="wrap">
   <div class="card">
@@ -382,8 +381,9 @@ def render_panel_html() -> str:
       <button id="diag" class="btn">Diag challenge</button>
       <a href="/ar/stub/avatar.svg?mood=happy" class="btn" target="_blank">AR avatar (SVG)</a>
       <button id="refreshProgress" class="btn">Odśwież postęp</button>
+      <button id="refreshGantt" class="btn">Odśwież Gantta</button>
     </div>
-    <small>v{api_version} • motyw: {theme}</small>
+    <small>v__API_VERSION__ • motyw: __THEME__</small>
   </div>
 
   <div class="grid">
@@ -397,6 +397,7 @@ def render_panel_html() -> str:
       <h3 style="margin:6px 0">Postęp MeCloneMe</h3>
       <div class="meter"><i id="overall" style="width:0%"></i></div>
       <div id="list" style="margin-top:8px"></div>
+      <div style="margin-top:10px"><img id="gantt" alt="Gantt" src="/progress/gantt.svg" style="max-width:100%;border:1px solid var(--bd);border-radius:8px"></div>
     </div>
   </div>
 
@@ -412,33 +413,38 @@ $("health").onclick=async()=>{ const r=await fetch("/api/health"); $("metOut").t
 $("spark").onclick=async()=>{ const r=await fetch("/api/series"); const j=await r.json(); const cv=$("sparkCanvas"),ctx=cv.getContext("2d"); ctx.clearRect(0,0,cv.width,cv.height); const s=j.series||[]; if(!s.length) return; const pad=6,w=cv.width-pad*2,h=cv.height-pad*2; const maxC=Math.max(...s.map(x=>x.count)); ctx.beginPath(); s.forEach((x,i)=>{const y=h*(1-(x.count/(maxC||1))); const X=pad+i*(w/(s.length-1)); if(i)ctx.lineTo(X,y); else ctx.moveTo(X,y);}); ctx.lineWidth=2; ctx.strokeStyle=getComputedStyle(document.documentElement).getPropertyValue('--ok'); ctx.stroke(); };
 async function loadProgress(){ const r=await fetch('/progress'); const j=await r.json(); const ov=j.overall||0; $("overall").style.width=ov+"%"; const box=$("list"); box.innerHTML=''; const mods=j.modules||{}; Object.entries(mods).forEach(([k,v])=>{ const row=document.createElement('div'); row.style.margin='8px 0'; row.innerHTML=`<div style="display:flex;justify-content:space-between"><b>${k}</b><span>${v}%</span></div><div class="meter"><i style="width:${v}%"></i></div>`; box.appendChild(row); }); }
 $("refreshProgress").onclick=loadProgress; loadProgress();
+$("refreshGantt").onclick=()=>{ const img=$("gantt"); img.src='/progress/gantt.svg?ts='+Date.now(); };
 </script>
 '''
-    return tpl.format(api_version=API_VERSION, theme=THEME, **v)
-
+    return tpl.replace("__CSS__", css).replace("__API_VERSION__", API_VERSION).replace("__THEME__", THEME)
 
 def render_mobile_html() -> str:
     v = _theme_vars(THEME)
+    css = (
+        ":root{"
+        f" --bg:{v['bg']}; --tx:{v['tx']}; --bd:{v['bd']}; --ok:{v['ok']}; --warn:{v['warn']}; --crit:{v['crit']}; }}"
+    )
     tpl = '''<!doctype html>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Mobile stub</title>
 <style>
-  :root {{ --bg:{bg}; --tx:{tx}; --bd:{bd}; --ok:{ok}; --warn:{warn}; --crit:{crit}; }}
-  body {{ background:var(--bg); color:var(--tx); font-family:system-ui; margin:12px; }}
-  .card {{ border:1px solid var(--bd); border-radius:12px; padding:12px; background:rgba(255,255,255,.02); }}
-  .meter {{ height:10px; background:var(--bd); border-radius:999px; position:relative; overflow:hidden; }}
-  .meter>i {{ position:absolute; left:0; top:0; bottom:0; background:linear-gradient(90deg,var(--ok),#22d3ee); border-radius:999px; }}
+  __CSS__
+  body { background:var(--bg); color:var(--tx); font-family:system-ui; margin:12px; }
+  .card { border:1px solid var(--bd); border-radius:12px; padding:12px; background:rgba(255,255,255,.02); }
+  .meter { height:10px; background:var(--bd); border-radius:999px; position:relative; overflow:hidden; }
+  .meter>i { position:absolute; left:0; top:0; bottom:0; background:linear-gradient(90deg,var(--ok),#22d3ee); border-radius:999px; }
 </style>
 <h2>Mobile (dark)</h2>
 <div class="card">
   <div>Postęp MeCloneMe</div>
   <div class="meter"><i id="ov" style="width:0%"></i></div>
+  <img id="ganttM" alt="Gantt" src="/progress/gantt.svg" style="width:100%;margin-top:8px;border:1px solid var(--bd);border-radius:8px"/>
   <pre id="mods" style="font:12px/1.2 ui-monospace"></pre>
 </div>
 <script>
 (async()=>{ const r=await fetch('/progress'); const j=await r.json(); document.getElementById('ov').style.width=(j.overall||0)+'%'; document.getElementById('mods').textContent=JSON.stringify(j.modules||{},null,2); })();
 </script>
 '''
-    return tpl.format(**v)
+    return tpl.replace("__CSS__", css)
 
 # ===== UI endpoints =====
 @app.get("/", response_class=HTMLResponse)
@@ -533,8 +539,7 @@ def metrics():
     summ = _compute_summary(1000)
     health = _compute_health(300)
     lines: List[str] = []
-    def h(x: str):
-        lines.append(x)
+    def h(x: str): lines.append(x)
     h("# HELP mecloneme_uptime_seconds Service uptime in seconds")
     h("# TYPE mecloneme_uptime_seconds gauge")
     h(f"mecloneme_uptime_seconds {int(time.time())-BOOT_TS}")
@@ -577,11 +582,6 @@ def ar_stub_avatar(mood: str = Query("neutral"), scale: int = Query(64, ge=32, l
     mouth_y = size*0.68
     k = {"happy": -0.18, "neutral": 0.0, "sad": 0.18}.get(mood, 0.0)
     mouth = f"M {size*0.25} {mouth_y} Q {size*0.5} {mouth_y + size*k} {size*0.75} {mouth_y}"
-    svg = (
-        f"<svg xmlns='http://www.w3.org/2000/svg' width='{size}' height='{size}' viewBox='0 0 {size} {size}'>"
-        f"<circle cx='{size/2 - eye_dx}' cy='{eye_y}' r='{size*0.06}' fill='#111'/>)"
-    )
-    # Keep it simple to avoid heavy strings
     svg = f"""
 <svg xmlns='http://www.w3.org/2000/svg' width='{size}' height='{size}' viewBox='0 0 {size} {size}'>
   <circle cx='{size/2 - eye_dx}' cy='{eye_y}' r='{size*0.06}' fill='#111'/>
@@ -596,7 +596,6 @@ def ar_stub_state():
     return {"ok": True, "mood": "neutral", "ts": int(time.time())}
 
 # ===== Export / Telemetry =====
-
 def _http_post_json(url: str, payload: Dict[str, Any], headers: Optional[Dict[str, str]] = None, timeout_s: int = 3) -> Dict[str, Any]:
     import urllib.request, json as _json
     data = _json.dumps(payload).encode()
@@ -610,7 +609,6 @@ def _http_post_json(url: str, payload: Dict[str, Any], headers: Optional[Dict[st
         return {"status": resp.status, "body": body}
 
 @app.post("/export/webhook")
-
 def export_webhook(inp: ExportWebhook):
     payload = inp.payload or {"ok": True, "src": "mecloneme"}
     tries = [0.0, 0.5, 1.0]
@@ -626,7 +624,6 @@ def export_webhook(inp: ExportWebhook):
     return {"ok": 200 <= (last.get("status") or 0) < 300, "last": last}
 
 @app.post("/export/s3")
-
 def export_s3_like(inp: ExportS3Like):
     import urllib.request
     if not (inp.content_b64 or inp.text):
@@ -641,15 +638,71 @@ def export_s3_like(inp: ExportS3Like):
     except Exception as e:
         return JSONResponse({"ok": False, "err": str(e)}, status_code=502)
 
-# ===== Progress API =====
-@app.get("/progress")
+# ===== Progress API + Gantt =====
+GANTT_PLAN = [
+    ("N01 — SSOT / Router-README", 0, 3),
+    ("N27 — Docs & OpenAPI",       0, 12),
+    ("N18 — Panel CEO",            0, 7),
+    ("N22 — Testy & QA",           2, 5),
+    ("N30 — Core (Live+AR+Guardian)", 0, 12),
+    ("N04 — Mobile (Camera/Mic)",  3, 10),
+    ("N05 — Desktop (Bridge)",     6, 8),
+    ("N09 — Guardian",             8, 12),
+    ("N21 — SDK / API Clients",    10, 6),
+]
 
+@app.get("/progress")
 def get_progress():
     mods = _load_progress()
     return {"ok": True, "overall": _progress_overall(mods), "modules": mods}
 
-@app.post("/admin/progress")
+@app.get("/progress/gantt.json")
+def gantt_json():
+    today = datetime.utcnow().date()
+    items = []
+    for name, off, dur in GANTT_PLAN:
+        start = today + timedelta(days=off)
+        end = start + timedelta(days=dur)
+        items.append({"module": name, "start": start.isoformat(), "end": end.isoformat(), "duration": dur})
+    return {"ok": True, "today": today.isoformat(), "items": items}
 
+@app.get("/progress/gantt.svg", response_class=PlainTextResponse)
+def gantt_svg():
+    days_total = 30
+    row_h = 22
+    pad_x, pad_y = 60, 20
+    width = 900
+    height = pad_y*2 + row_h*len(GANTT_PLAN)
+    day_w = (width - pad_x - 20) / days_total
+    v = _theme_vars(THEME)
+    grid = v['bd']; bar = v['ok']; text = v['tx']
+
+    parts = [f"<svg xmlns='http://www.w3.org/2000/svg' width='{width}' height='{height}' viewBox='0 0 {width} {height}'>",
+             f"<rect x='0' y='0' width='{width}' height='{height}' fill='transparent'/>",
+             f"<g stroke='{grid}' stroke-width='1'>"]
+    for d in range(days_total+1):
+        x = pad_x + d*day_w
+        parts.append(f"<line x1='{x:.1f}' y1='{pad_y-6}' x2='{x:.1f}' y2='{height-pad_y}' opacity='0.5' />")
+    parts.append("</g>")
+
+    parts.append(f"<g fill='{text}' font-size='11'>")
+    for d in range(0, days_total+1, 5):
+        x = pad_x + d*day_w
+        parts.append(f"<text x='{x:.1f}' y='{pad_y-8}' text-anchor='middle'>{d}d</text>")
+    parts.append("</g>")
+
+    y = pad_y
+    parts.append(f"<g fill='{text}' font-size='12'>")
+    for name, off, dur in GANTT_PLAN:
+        parts.append(f"<text x='6' y='{y+row_h-6}'>{name}</text>")
+        x = pad_x + off*day_w
+        w = max(1.5, dur*day_w)
+        parts.append(f"<rect x='{x:.1f}' y='{y+4}' rx='5' ry='5' width='{w:.1f}' height='{row_h-8}' fill='{bar}' opacity='0.9' />")
+        y += row_h
+    parts.append("</g></svg>")
+    return PlainTextResponse("".join(parts), media_type="image/svg+xml")
+
+@app.post("/admin/progress")
 def set_progress(payload: Dict[str, Any]):
     mods = _load_progress()
     if "modules" in payload and isinstance(payload["modules"], dict):
@@ -673,6 +726,7 @@ async def emit_alert(level: str, msg: str, cooldown_s: int = 5, **extra):
     last = LAST_ALERT_TS.get(key, 0)
     if now - last < cooldown_s:
         return
+    LAST_ALERTTS = now
     LAST_ALERT_TS[key] = now
     entry = Alert(level=level, msg=msg, ts=now, extra=extra).dict()
     ALERTS.append(entry)
@@ -680,13 +734,11 @@ async def emit_alert(level: str, msg: str, cooldown_s: int = 5, **extra):
     write_shadow(kind="alert", **entry)
 
 @app.get("/alerts")
-
 def list_alerts():
     return {"ok": True, "alerts": ALERTS[-50:]}
 
 # ===== Snapshots / Ingest =====
 @app.post("/snapshots")
-
 def save_snapshot(s: Snapshot):
     name = re.sub(r"[^a-zA-Z0-9_-]", "_", s.tag)[:48]
     path = os.path.join(SNAPS_DIR, f"{name}_{int(time.time())}.json")
@@ -695,7 +747,6 @@ def save_snapshot(s: Snapshot):
     return {"ok": True, "path": path}
 
 @app.post("/ingest")
-
 def ingest(inp: IngestPayload):
     write_shadow(kind="ingest", tag=inp.tag, data=inp.data)
     write_event("ingest", tag=inp.tag)
