@@ -16,7 +16,7 @@ def b64u_encode(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode().rstrip("=")
 
 # ===== Config (ENV) =====
-API_VERSION = os.getenv("API_VERSION","0.2.0")
+API_VERSION = os.getenv("API_VERSION","0.3.0")
 NONCE_TTL   = int(os.getenv("NONCE_TTL", "300"))
 SESSION_TTL = int(os.getenv("SESSION_TTL", "900"))
 RATE_MAX    = int(os.getenv("RATE_MAX", "30"))
@@ -66,7 +66,10 @@ def save_sessions(): _save_json(SESSIONS_PATH, SESSIONS)
 
 # ===== Events (JSONL) =====
 def write_event(kind: str, **data) -> None:
-    rec = {"ts": int(time.time()), "kind": kind, **data}
+    # pozwól nadpisać ts gdy przychodzi z zewnątrz (ingest)
+    ts_override = data.pop("ts", None)
+    rec = {"ts": ts_override if isinstance(ts_override, int) else int(time.time()),
+           "kind": kind, **data}
     try:
         with open(EVENTS_JSONL, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -224,6 +227,10 @@ def api_health():
     return {"ok":True, "version":API_VERSION, "ts":int(time.time()),
             "uptime":int(time.time())-BOOT_TS,
             "counts":{"requests":REQ_COUNT,"nonces":len(NONCES),"pubkeys":len(PUBKEYS),"sessions":len(SESSIONS)}}
+
+@app.get("/api/health/detail")
+def health_detail(n: int = Query(300, ge=50, le=10000)):
+    return _compute_health(n)
 
 @app.get("/api/version")
 def api_version():
@@ -430,6 +437,25 @@ def admin_purge(request: Request):
     except Exception as e:
         return bad("purge-failed", error=str(e))
 
+# >>> NEW: /admin/events/ingest (pojedynczy lub lista) <<<
+@app.post("/admin/events/ingest")
+async def admin_ingest(request: Request):
+    token=_auth_token(request)
+    if not require_session(token): return bad("unauthorized")
+    try:
+        body = await request.json()
+    except Exception:
+        return bad("bad-json")
+    def store(evt: Dict[str, Any]):
+        if not isinstance(evt, dict): return
+        kind = evt.get("kind","ext")
+        data = dict(evt); data.pop("kind", None)
+        write_event(kind, **data)
+    if isinstance(body, list):
+        for e in body: store(e)
+        return ok(stored=len(body))
+    store(body); return ok(stored=1)
+
 # ===== Snapshots („notebooks”) =====
 @app.post("/admin/snaps/save")
 def snaps_save(request: Request, minutes: int = Query(60, ge=5, le=1440), n: int = Query(5000, ge=200, le=50000)):
@@ -568,6 +594,7 @@ def metrics():
         h(f'mecloneme_http_status_recent_total{{code="{code}"}} {count}')
     body="\n".join(lines)+"\n"
     return PlainTextResponse(body, media_type="text/plain; version=0.0.4")
+
 # ===== AR engine (stub) =====
 @app.get("/ar/ping")
 def ar_ping(): return {"ok":True, "engine":"stub", "ts":int(time.time())}
@@ -621,7 +648,11 @@ PANEL_HTML = """<!doctype html>
 </div>
 
 <div class="card" style="margin-top:16px">
-  <h2>CEO — N18 widżet (live)</h2>
+  <h2>CEO — N18 widżet (live) <span style="font-size:12px;color:#666">(Kiosk mode + autorefresh)</span></h2>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin:6px 0">
+    <button id="kiosk" class="btn" data-group="n18">🖥️ Kiosk: OFF</button>
+    <button id="fs" class="btn" data-group="n18">⛶ Fullscreen</button>
+  </div>
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
     <div>
       <canvas id="spark" width="640" height="90" style="width:100%;border:1px solid #eee;border-radius:6px"></canvas>
@@ -677,8 +708,13 @@ PANEL_HTML = """<!doctype html>
 <div class="card" style="margin-top:16px">
   <h2>Diag & Snapshots</h2>
   <div style="margin:6px 0">
-    Token (Bearer) do snapshotów (z <code>/mobile</code> po verify):
-    <input id="admTok" placeholder="sess_xxx" style="width:320px">
+    <div>Token (Bearer) do snapshotów (z <code>/mobile</code> po verify):</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:6px">
+      <input id="admTok" placeholder="sess_xxx" style="width:320px">
+      <button id="tokLoad" class="btn" data-group="diag">📥 Use stored</button>
+      <button id="tokSave" class="btn" data-group="diag">💾 Save</button>
+      <button id="tokClear" class="btn" data-group="diag">🗑️ Clear</button>
+    </div>
   </div>
   <div style="display:flex;gap:8px;flex-wrap:wrap;margin:6px 0">
     <button id="btnEcho" class="btn" data-group="diag">🔎 Echo</button>
@@ -722,6 +758,19 @@ const $=id=>document.getElementById(id);
 function toast(msg){ const t=$("toast"); t.textContent=msg; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"), 1200); }
 function setActive(button){ const group=button.getAttribute("data-group"); if(!group) return; document.querySelectorAll('[data-group="'+group+'"]').forEach(b=>b.classList.remove("active")); button.classList.add("active"); }
 
+// === Token store (multi-env) ===
+const TOK_SINGLE="guardian_session";
+const TOKMAP_KEY="guardian_tokens";
+function getTokMap(){ try{return JSON.parse(localStorage.getItem(TOKMAP_KEY)||"{}")}catch(_){return{}} }
+function setTokForOrigin(token){ const m=getTokMap(); m[location.origin]=token; localStorage.setItem(TOKMAP_KEY, JSON.stringify(m)); }
+function getTokForOrigin(){ return getTokMap()[location.origin] || "" }
+
+// === Kiosk helpers ===
+let wake=null;
+async function wakeOn(){ try{ if("wakeLock" in navigator){ wake = await navigator.wakeLock.request("screen"); wake.addEventListener?.("release",()=>{});} }catch(e){} }
+async function goFullscreen(){ try{ await (document.documentElement.requestFullscreen?.()||Promise.resolve()); }catch(e){} }
+
+// === Progress bars ===
 const LS_KEY="guardian_progress";
 const FIELDS=[["Guardian/Auth","ga"],["AR Engine (R&D)","ar"],["App Shell / UI","ui"],["Cloud & Deploy","cd"],["MVP (całość)","mvp"]];
 function renderBars(state){ const root=$("bars"); root.innerHTML="";
@@ -758,7 +807,13 @@ function renderRateBox(stats){ const box=$("rateBox"); const lines=[];
   (stats.ips||[]).forEach((r,i)=>{ const bar="█".repeat(Math.max(1, Math.round((r.count/stats.max)*10))); lines.push(`${i+1}. ${r.ip.padEnd(15)} ${String(r.count).padStart(3)} ${bar}`); });
   box.textContent=lines.join("\\n"); }
 
-const TOKKEY="guardian_session"; $("admTok").value=localStorage.getItem(TOKKEY)||""; $("admTok").oninput=()=>localStorage.setItem(TOKKEY,$("admTok").value.trim());
+const TOKKEY="guardian_session"; 
+$("admTok").value=localStorage.getItem(TOKKEY)||getTokForOrigin()||"";
+$("admTok").oninput=()=>localStorage.setItem(TOKKEY,$("admTok").value.trim());
+$("tokLoad").onclick=()=>{ setActive($("tokLoad")); const t=getTokForOrigin(); $("admTok").value=t; localStorage.setItem(TOKKEY,t); toast(t? "Załadowano token z pamięci":"Brak zapisanego."); };
+$("tokSave").onclick=()=>{ setActive($("tokSave")); const t=$("admTok").value.trim(); setTokForOrigin(t); localStorage.setItem(TOKKEY,t); toast("Token zapisany"); };
+$("tokClear").onclick=()=>{ setActive($("tokClear")); $("admTok").value=""; localStorage.removeItem(TOKKEY); setTokForOrigin(""); toast("Token wyczyszczony"); };
+
 function tok(){ return $("admTok").value.trim(); }
 function copy(text){ navigator.clipboard.writeText(text).then(()=>toast("Skopiowano")).catch(()=>toast("Nie udało się skopiować")); }
 async function withBusy(btn, fn){ try{ btn.setAttribute("disabled",""); setActive(btn); await fn(); } finally{ btn.removeAttribute("disabled"); } }
@@ -775,7 +830,6 @@ function pushAlert(rec){ const ul=$("alerts"); const li=document.createElement("
   li.appendChild(pill); li.append(" "); li.appendChild(document.createTextNode(`[${new Date(rec.ts*1000).toLocaleTimeString()}] ${rec.title}`));
   if(rec.meta){ li.appendChild(document.createElement("br")); li.appendChild(document.createTextNode(JSON.stringify(rec.meta))); }
   ul.insertBefore(li, ul.firstChild); while(ul.children.length>15) ul.removeChild(ul.lastChild); beep(); lastAlert=Math.max(lastAlert, rec.ts); }
-
 async function pollAlerts(){ const r=await fetch('/api/alerts/poll?since='+lastAlert); const j=await r.json(); (j.items||[]).forEach(pushAlert); }
 
 // Loaders
@@ -784,7 +838,7 @@ async function loadSummary(){ const r=await fetch('/api/logs/summary?n=500'); co
   $("codes").textContent=JSON.stringify(j.statuses||{},null,2);
   const lat=j.latency_ms||{}; $("latStats").textContent=`p50=${lat.p50||0}ms  p95=${lat.p95||0}ms  avg=${lat.avg||0}ms  max=${lat.max||0}ms`;
   $("p95").textContent=lat.p95||0; $("e4").textContent=(j.errors&&j.errors["4xx"])||0; $("e5").textContent=(j.errors&&j.errors["5xx"])||0; }
-async function loadHealth(){ const r=await fetch('/api/health/detail?n=200'); const j=await r.json();
+async function loadHealth(){ const r=await fetch('/api/health/detail?n=300'); const j=await r.json();
   $("healthOut").textContent=JSON.stringify({ts:j.ts, uptime_s:j.uptime_s, codes:j.codes, latency_ms:j.latency_ms, sample:j.sample_size},null,2);
   $("uptime").textContent=j.uptime_s+"s"; const p95=(j.latency_ms&&j.latency_ms.p95)||0; const alert=$("alert"), txt=$("alertText"); alert.className=""; alert.style.display="block";
   if(p95>=j.thresholds.crit){ alert.classList.add("crit"); txt.textContent=`CRIT: p95=${p95}ms (>= ${j.thresholds.crit})`; }
@@ -810,6 +864,16 @@ async function loadRateStats(){ const r=await fetch('/api/rate/window_stats?top=
   $("stop").onclick=()=>{ if(window._n18){ clearInterval(window._n18); window._n18=null; } setActive($("stop")); };
   $("once").onclick=()=>withBusy($("once"), async()=>{ await loadHealth(); await loadSummary(); await loadRollup(); await loadHeat(); await loadHeatStatus(); await loadRateStats(); await pollAlerts(); });
 
+  // Kiosk: pamiętaj w LS i auto-włącz
+  const KIOSK_KEY="guardian_kiosk";
+  function setKioskUI(on){ $("kiosk").textContent= on? "🖥️ Kiosk: ON":"🖥️ Kiosk: OFF"; }
+  $("kiosk").onclick=async ()=>{ const on=localStorage.getItem(KIOSK_KEY)==="1"; const next = !on; localStorage.setItem(KIOSK_KEY", next? "1":"0"); setKioskUI(next); if(next){ $("start").click(); await wakeOn(); } setActive($("kiosk")); };
+  $("fs").onclick=()=>{ setActive($("fs")); goFullscreen(); };
+
+  setKioskUI(localStorage.getItem(KIOSK_KEY)==="1");
+  if(localStorage.getItem(KIOSK_KEY)==="1"){ $("start").click(); await wakeOn(); goFullscreen(); }
+
+  // Diag + Admin
   $("btnEcho").onclick=()=>withBusy($("btnEcho"), async()=>{ const r=await fetch('/api/diag/echo'); $("diagOut").textContent=JSON.stringify(await r.json(),null,2); });
   $("btnEchoCurl").onclick=()=>{ setActive($("btnEchoCurl")); copy(`curl "${location.origin}/api/diag/echo"`); };
   $("btnSnapSave").onclick=()=>withBusy($("btnSnapSave"), async()=>{ const r=await fetch('/admin/snaps/save',{method:'POST',headers:{Authorization:'Bearer '+tok()}}); const j=await r.json(); $("diagOut").textContent=JSON.stringify(j,null,2); if(j.file) toast("Snapshot zapisany: "+j.file); });
@@ -828,7 +892,7 @@ async function loadRateStats(){ const r=await fetch('/api/rate/window_stats?top=
   $("btnTail").onclick=()=>withBusy($("btnTail"), async()=>{ const r=await fetch('/admin/events/tail?n=50',{headers:{Authorization:'Bearer '+tok()}}); $("admOut").textContent=await r.text(); });
   $("btnCSV").onclick=()=>withBusy($("btnCSV"), async()=>{ const r=await fetch('/admin/events/export.csv?n=200',{headers:{Authorization:'Bearer '+tok()}}); const blob=await r.blob(); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='events.csv'; a.click(); URL.revokeObjectURL(url); $("admOut").textContent="Pobrano events.csv"; });
   $("btnSummary").onclick=()=>withBusy($("btnSummary"), async()=>{ const r=await fetch('/api/logs/summary?n=500'); $("admOut").textContent=JSON.stringify(await r.json(),null,2); });
-  $("btnHealth").onclick=()=>withBusy($("btnHealth"), async()=>{ const r=await fetch('/api/health/detail?n=200'); const j=await r.json(); $("admOut").textContent=JSON.stringify(j,null,2); });
+  $("btnHealth").onclick=()=>withBusy($("btnHealth"), async()=>{ const r=await fetch('/api/health/detail?n=300'); const j=await r.json(); $("admOut").textContent=JSON.stringify(j,null,2); });
   $("btnPurge").onclick=()=>withBusy($("btnPurge"), async()=>{ if(!confirm('Na pewno usunąć zawartość events.jsonl?')) return; const r=await fetch('/admin/events/purge',{method:'POST',headers:{Authorization:'Bearer '+tok()}}); $("admOut").textContent=await r.text(); });
   $("btnTailCurl").onclick=()=>{ setActive($("btnTailCurl")); copy(`curl -H "Authorization: Bearer ${tok()}" "${origin}/admin/events/tail?n=50"`); };
   $("btnCSVCurl").onclick=()=>{ setActive($("btnCSVCurl")); copy(`curl -H "Authorization: Bearer ${tok()}" -o events.csv "${origin}/admin/events/export.csv?n=200"`); };
@@ -839,6 +903,7 @@ async function loadRateStats(){ const r=await fetch('/api/rate/window_stats?top=
   $("btnSearchCurl").onclick=()=>{ setActive($("btnSearchCurl")); const qs=new URLSearchParams({n:$("nSearch").value,path_re:$("re").value,status:$("st").value,method:$("md").value}).toString();
     copy(`curl -H "Authorization: Bearer ${tok()}" "${origin}/admin/events/search?${qs}"`); };
 
+  // Autostart „live”
   await loadHealth(); await loadSummary(); await loadRollup(); await loadHeat(); await loadHeatStatus(); await loadRateStats(); await pollAlerts(); $("start").click();
 })();
 </script>
@@ -911,6 +976,10 @@ const enc=new TextEncoder();
 const b64u=b=>btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
 const fromB64u=s=>{ s=s.replace(/-/g,'+').replace(/_/g,'/'); while(s.length%4) s+='='; const bin=atob(s), out=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) out[i]=bin.charCodeAt(i); return out; };
 
+const TOK_SINGLE="guardian_session";
+const TOKMAP_KEY="guardian_tokens";
+function setTokForOrigin(token){ try{ const m=JSON.parse(localStorage.getItem(TOKMAP_KEY)||"{}"); m[location.origin]=token; localStorage.setItem(TOKMAP_KEY, JSON.stringify(m)); }catch(_){ } }
+
 const LS_KEY="guardian_priv_seed"; $("priv").value=localStorage.getItem(LS_KEY)||""; $("save").onclick=()=>{ localStorage.setItem(LS_KEY,$("priv").value.trim()); alert("Zapisano PRIV w przeglądarce."); };
 
 function getKeypair(){ const seedB64u=$("priv").value.trim(); if(!seedB64u) throw new Error("Brak PRIV"); const seed=fromB64u(seedB64u); if(seed.length!==32) throw new Error("PRIV (seed) musi być 32 bajty!"); return nacl.sign.keyPair.fromSeed(seed); }
@@ -930,7 +999,7 @@ $("verify").onclick=async ()=>{ try{
   const kp=getKeypair(); const sig=nacl.sign.detached(msg, kp.secretKey); const jws=h+"."+p+"."+b64u(sig);
   const r=await fetch("/guardian/verify",{method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({jws})});
   const j=await r.json(); $("verOut").textContent=JSON.stringify(j,null,2);
-  if(j.ok && j.session){ session=j.session; exp=j.exp; localStorage.setItem("guardian_session", session); clearInterval(ticker); ticker=setInterval(tick,1000); tick(); }
+  if(j.ok && j.session){ session=j.session; exp=j.exp; localStorage.setItem(TOK_SINGLE, session); setTokForOrigin(session); clearInterval(ticker); ticker=setInterval(tick,1000); tick(); }
 }catch(e){ $("verOut").textContent="ERR: "+e.message; }};
 
 $("ping").onclick=async ()=>{ const r=await fetch("/protected/hello",{ headers:{"Authorization":"Bearer "+(session||"")}}); $("pingOut").textContent=await r.text(); };
