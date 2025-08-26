@@ -26,12 +26,44 @@ PUBKEYS: Dict[str, str] = {}                # kid -> public key (base64url 32B)
 SESSIONS: Dict[str, Dict[str, Any]] = {}    # sid -> {kid, exp}
 RATE: Dict[str, List[int]] = {}             # ip -> [timestamps]
 
+# ===== Simple persistence (best-effort) =====
+DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
+PUBKEYS_PATH  = os.path.join(DATA_DIR, "pubkeys.json")
+SESSIONS_PATH = os.path.join(DATA_DIR, "sessions.json")
+
+def _load_json(path: str, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+def _save_json(path: str, data) -> None:
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:
+        pass  # best-effort
+
+def load_stores():
+    global PUBKEYS, SESSIONS
+    PUBKEYS.update(_load_json(PUBKEYS_PATH, {}))
+    SESSIONS.update(_load_json(SESSIONS_PATH, {}))
+
+def save_pubkeys():
+    _save_json(PUBKEYS_PATH, PUBKEYS)
+
+def save_sessions():
+    _save_json(SESSIONS_PATH, SESSIONS)
+
 # ===== Rate limiting (prosty sliding window) =====
 def rate_check(ip: str) -> bool:
     now = int(time.time())
-    window = RATE_WINDOW
     buf = RATE.get(ip, [])
-    buf = [t for t in buf if t > now - window]
+    buf = [t for t in buf if t > now - RATE_WINDOW]
     if len(buf) >= RATE_MAX:
         RATE[ip] = buf
         return False
@@ -67,8 +99,9 @@ ws_manager = WSManager()
 
 # ===== FastAPI =====
 app = FastAPI(title="MeCloneMe API (mini)")
+load_stores()
 
-# ===== Mini panel (admin-podgląd + progress lokalnie) =====
+# ===== Mini panel (admin podgląd + progress lokalnie) =====
 PANEL_HTML = """<!doctype html>
 <meta charset="utf-8"><title>Guardian — mini panel</title>
 <body style="font-family: system-ui, -apple-system, Segoe UI, Roboto; margin:16px">
@@ -350,8 +383,13 @@ def require_session(token: str) -> Optional[Dict[str, Any]]:
         return None
     if s["exp"] < int(time.time()):
         SESSIONS.pop(token, None)
+        save_sessions()
         return None
     return s
+
+async def emit(kind: str, **vec):
+    frame = {"ts": int(time.time()), "vec": {kind: vec}}
+    await ws_manager.broadcast(frame)
 
 # ===== Routes =====
 @app.get("/", response_class=HTMLResponse)
@@ -362,11 +400,14 @@ def index():
 def mobile_page():
     return HTMLResponse(MOBILE_HTML)
 
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "ts": int(time.time())}
+
 @app.websocket("/shadow/ws")
 async def shadow_ws(ws: WebSocket):
     await ws_manager.connect(ws)
     try:
-        # odczyt nie jest używany — utrzymujemy połączenie
         while True:
             await ws.receive_text()
     except WebSocketDisconnect:
@@ -374,13 +415,21 @@ async def shadow_ws(ws: WebSocket):
 
 @app.post("/shadow/ingest")
 async def shadow_ingest(frame: ShadowFrame):
+    # zapis do pliku (best-effort)
+    try:
+        os.makedirs("logs", exist_ok=True)
+        with open("logs/shadow.jsonl","a",encoding="utf-8") as f:
+            f.write(json.dumps(frame.dict())+"\n")
+    except Exception:
+        pass
     await ws_manager.broadcast(frame.dict())
     return ok()
 
 @app.get("/auth/challenge")
-def challenge(request: Request, aud: str = "mobile"):
+async def challenge(request: Request, aud: str = "mobile"):
     ip = request.client.host if request.client else "?"
-    if not rate_check(ip): 
+    if not rate_check(ip):
+        await emit("rate", ip=ip, status="limit")
         return bad("rate-limit")
     now = int(time.time())
     nonce = secrets.token_hex(16)
@@ -392,9 +441,10 @@ def challenge(request: Request, aud: str = "mobile"):
     return {"nonce": nonce, "aud": aud, "ts": now}
 
 @app.post("/admin/register_pubkey")
-def register_pubkey(request: Request, req: PubReq):
+async def register_pubkey(request: Request, req: PubReq):
     ip = request.client.host if request.client else "?"
-    if not rate_check(ip): 
+    if not rate_check(ip):
+        await emit("rate", ip=ip, status="limit")
         return bad("rate-limit")
     try:
         if len(b64u_decode(req.pub)) != 32:
@@ -402,12 +452,15 @@ def register_pubkey(request: Request, req: PubReq):
     except Exception:
         return bad("bad-pubkey")
     PUBKEYS[req.kid] = req.pub
+    save_pubkeys()
+    await emit("admin", action="register_pubkey", kid=req.kid)
     return ok(registered=list(PUBKEYS.keys()))
 
 @app.post("/guardian/verify")
 async def guardian_verify(request: Request, req: VerifyReq):
     ip = request.client.host if request.client else "?"
-    if not rate_check(ip): 
+    if not rate_check(ip):
+        await emit("rate", ip=ip, status="limit")
         return bad("rate-limit")
 
     # compact JWS: h.p.s (base64url)
@@ -455,39 +508,50 @@ async def guardian_verify(request: Request, req: VerifyReq):
     sid = "sess_" + secrets.token_hex(16)
     sess_exp = now + SESSION_TTL
     SESSIONS[sid] = {"kid": kid, "exp": sess_exp}
+    save_sessions()
 
-    # live log
-    frame = {"ts": now, "kid": kid, "vec": {"auth":"ok","aud":aud}}
-    asyncio.create_task(ws_manager.broadcast(frame))
-
+    await emit("auth", status="ok", aud=aud, kid=kid)
     return ok(payload=payload, session=sid, exp=sess_exp)
 
 @app.get("/protected/hello")
-def protected_hello(request: Request):
+async def protected_hello(request: Request):
     ip = request.client.host if request.client else "?"
-    if not rate_check(ip): 
+    if not rate_check(ip):
+        await emit("rate", ip=ip, status="limit")
         return bad("rate-limit")
     auth = request.headers.get("authorization") or ""
     token = auth.split(" ",1)[1] if auth.lower().startswith("bearer ") else ""
     sess = require_session(token)
     if not sess:
+        await emit("unauth", path="/protected/hello", ip=ip)
         return bad("unauthorized")
+    await emit("hello", kid=sess["kid"])
     return ok(msg="hello dev-user", kid=sess["kid"], exp=sess["exp"])
 
 @app.post("/guardian/refresh")
-def refresh(request: Request):
+async def refresh(request: Request):
     auth = request.headers.get("authorization") or ""
     token = auth.split(" ",1)[1] if auth.lower().startswith("bearer ") else ""
     sess = require_session(token)
     if not sess:
+        await emit("unauth", path="/guardian/refresh")
         return bad("unauthorized")
     sess["exp"] = int(time.time()) + SESSION_TTL
+    save_sessions()
+    await emit("session", action="refresh", kid=sess["kid"], exp=sess["exp"])
     return ok(exp=sess["exp"])
 
 @app.post("/guardian/logout")
-def logout(request: Request):
+async def logout(request: Request):
     auth = request.headers.get("authorization") or ""
     token = auth.split(" ",1)[1] if auth.lower().startswith("bearer ") else ""
-    if token in SESSIONS:
-        SESSIONS.pop(token, None)
+    s = SESSIONS.pop(token, None)
+    save_sessions()
+    if s:
+        await emit("session", action="logout", kid=s["kid"])
     return ok()
+
+# ===== AR engine (stub / R&D) =====
+@app.get("/ar/ping")
+def ar_ping():
+    return {"ok": True, "engine":"stub", "ts": int(time.time())}
