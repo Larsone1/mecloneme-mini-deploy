@@ -511,6 +511,7 @@ def _http_post_json(url: str, payload: Dict[str, Any], headers: Optional[Dict[st
         return {"status": resp.status, "body": body}
 
 @app.post("/export/webhook")
+
 def export_webhook(inp: ExportWebhook):
     """Forward JSON payload to an external webhook with tiny retry logic."""
     payload = inp.payload or {"ok": True, "src": "mecloneme"}
@@ -534,6 +535,7 @@ class ExportS3Like(BaseModel):
     method: Optional[str] = "PUT"
 
 @app.post("/export/s3")
+
 def export_s3_like(inp: ExportS3Like):
     """Upload to a pre-signed URL (S3-compatible). No external deps."""
     import urllib.request
@@ -548,6 +550,18 @@ def export_s3_like(inp: ExportS3Like):
             return {"ok": 200 <= resp.status < 400, "status": resp.status}
     except Exception as e:
         return JSONResponse({"ok": False, "err": str(e)}, status_code=502)
+
+# ===== Ingest (przywrócony, lekki) =====
+class IngestPayload(BaseModel):
+    tag: Optional[str] = "default"
+    data: Dict[str, Any]
+
+@app.post("/ingest")
+
+def ingest(inp: IngestPayload):
+    write_shadow(kind="ingest", tag=inp.tag, data=inp.data)
+    write_event("ingest", tag=inp.tag)
+    return {"ok": True}
 
 # ===== HTML (panel + mobile) =====
 PANEL_HTML = """<!doctype html>
