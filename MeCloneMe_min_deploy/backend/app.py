@@ -1,23 +1,19 @@
-import os, time, json, base64, secrets, io, re
+import os, time, json, base64, secrets, re
 from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Query
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from nacl.signing import VerifyKey
-from nacl.exceptions import BadSignatureError
 
-# ===== Base64url helpers =====
+# ===== Helpers: base64url =====
 def b64u_decode(s: str) -> bytes:
     s = s or ""
     s += "=" * (-len(s) % 4)
     return base64.urlsafe_b64decode(s.encode())
 
-def b64u_encode(b: bytes) -> str:
-    return base64.urlsafe_b64encode(b).decode().rstrip("=")
-
 # ===== Config (ENV) =====
-API_VERSION = os.getenv("API_VERSION", "0.3.3")
+API_VERSION = os.getenv("API_VERSION", "0.3.4")
 NONCE_TTL   = int(os.getenv("NONCE_TTL", "300"))
 SESSION_TTL = int(os.getenv("SESSION_TTL", "3600"))
 P95_WARN    = int(os.getenv("P95_WARN", "300"))
@@ -29,7 +25,7 @@ THEME       = os.getenv("THEME", "dark")  # dark | light
 # ===== Models =====
 class PubKey(BaseModel):
     kid: str
-    key: str  # base64url-encoded public key (Ed25519)
+    key: str
 
 class Challenge(BaseModel):
     aud: str
@@ -49,7 +45,7 @@ class Snapshot(BaseModel):
     payload: Dict[str, Any]
 
 class Alert(BaseModel):
-    level: str  # ok|warn|crit
+    level: str
     msg: str
     ts: int
     extra: Optional[Dict[str, Any]] = None
@@ -80,13 +76,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ===== Stores =====
-PUBKEYS: Dict[str, str] = {}              # kid -> base64url(pubkey)
-SESSIONS: Dict[str, Dict[str, Any]] = {}  # sid -> {kid, exp}
-RATE: Dict[str, List[int]] = {}           # ip -> [timestamps]
-ALERTS: List[Dict[str, Any]] = []         # rolling alerts
-
-# ===== Simple persistence =====
+# ===== Stores & persistence =====
 DATA_DIR = "data"
 LOG_DIR = "logs"
 SNAPS_DIR = os.path.join(LOG_DIR, "snaps")
@@ -94,11 +84,11 @@ os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(SNAPS_DIR, exist_ok=True)
 
-# ===== Lightweight tuning (Render-friendly) =====
-METRICS_TTL = float(os.getenv("METRICS_TTL", "2"))  # seconds to cache /metrics
-AUDIT_SAMPLE_N = int(os.getenv("AUDIT_SAMPLE_N", "1"))  # 1 = log every request; 10 = ~10% sampled
-SKIP_AUDIT_PATHS = set((os.getenv("SKIP_AUDIT_PATHS", "/metrics,/health,/ar/ping").split(",")))
-METRICS_CACHE = {"ts": 0.0, "body": ""}
+PUBKEYS: Dict[str, str] = {}
+SESSIONS: Dict[str, Dict[str, Any]] = {}
+RATE: Dict[str, List[int]] = {}
+ALERTS: List[Dict[str, Any]] = []
+
 PUBKEYS_PATH = os.path.join(DATA_DIR, "pubkeys.json")
 SESSIONS_PATH = os.path.join(DATA_DIR, "sessions.json")
 EVENTS_JSONL = os.path.join(LOG_DIR, "events.jsonl")
@@ -107,9 +97,14 @@ PROGRESS_PATH = os.path.join(DATA_DIR, "progress.json")
 
 BOOT_TS = int(time.time())
 REQ_COUNT = 0
-LAST_ALERT_TS: Dict[str, int] = {}  # throttling
+LAST_ALERT_TS: Dict[str, int] = {}
 
-# ===== Utils (persistence) =====
+METRICS_TTL = float(os.getenv("METRICS_TTL", "2"))
+AUDIT_SAMPLE_N = int(os.getenv("AUDIT_SAMPLE_N", "1"))
+SKIP_AUDIT_PATHS = set((os.getenv("SKIP_AUDIT_PATHS", "/metrics,/health,/ar/ping").split(",")))
+METRICS_CACHE = {"ts": 0.0, "body": ""}
+
+# ===== Utils =====
 def _load_json(path: str, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -129,8 +124,7 @@ def write_event(kind: str, **fields):
     fields["ts"] = int(time.time())
     try:
         with open(EVENTS_JSONL, "a", encoding="utf-8") as f:
-            f.write(json.dumps(fields, ensure_ascii=False) + "
-")
+            f.write(json.dumps(fields, ensure_ascii=False) + "\n")
     except Exception:
         pass
 
@@ -138,8 +132,7 @@ def write_shadow(**fields):
     fields["ts"] = int(time.time())
     try:
         with open(SHADOW_JSONL, "a", encoding="utf-8") as f:
-            f.write(json.dumps(fields, ensure_ascii=False) + "
-")
+            f.write(json.dumps(fields, ensure_ascii=False) + "\n")
     except Exception:
         pass
 
@@ -163,7 +156,7 @@ def load_stores():
     PUBKEYS = _load_json(PUBKEYS_PATH, {})
     SESSIONS = _load_json(SESSIONS_PATH, {})
 
-# ===== Progress (MeCloneMe global) =====
+# ===== Progress defaults =====
 PROGRESS_DEFAULT: Dict[str, int] = {
     "N01 — SSOT / Router-README": 55,
     "N18 — Panel CEO": 35,
@@ -186,15 +179,14 @@ def _load_progress() -> Dict[str, int]:
 def _save_progress(obj: Dict[str, int]):
     _save_json(PROGRESS_PATH, obj)
 
-
 def _progress_overall(mods: Dict[str, int]) -> int:
     if not mods:
         return 0
     vals = [max(0, min(100, int(v))) for v in mods.values()]
     return int(sum(vals) / len(vals))
 
-# ===== Sessions & Nonces =====
-NONCES: Dict[str, int] = {}  # nonce -> exp
+# ===== Nonces & Sessions =====
+NONCES: Dict[str, int] = {}
 
 def new_nonce(aud: str) -> Challenge:
     nonce = base64.urlsafe_b64encode(secrets.token_bytes(24)).decode().rstrip("=")
@@ -209,34 +201,12 @@ def new_session(kid: str) -> SessionInfo:
     _save_json(SESSIONS_PATH, SESSIONS)
     return SessionInfo(kid=kid, sid=sid, exp=exp)
 
-def get_session(sid: str) -> Optional[SessionInfo]:
-    s = SESSIONS.get(sid)
-    if not s:
-        return None
-    if s["exp"] < int(time.time()):
-        SESSIONS.pop(sid, None)
-        _save_json(SESSIONS_PATH, SESSIONS)
-        return None
-    return SessionInfo(kid=s["kid"], sid=sid, exp=s["exp"])
-
 # ===== Rate limiting =====
-RATE: Dict[str, List[int]] = {}
-
-def rate_allow(ip: str) -> bool:
-    now = int(time.time())
-    buf = RATE.get(ip, [])
-    buf = [t for t in buf if t > now - RATE_WINDOW]
-    allowed = len(buf) < RATE_MAX
-    buf.append(now)
-    RATE[ip] = buf
-    return allowed
-
-
 def rate_is_hot(ip: str) -> Optional[int]:
     cnt = len(RATE.get(ip, []))
     return cnt if cnt >= int(RATE_MAX * 0.8) else None
 
-# ===== WS (echo stub) =====
+# ===== WebSocket echo =====
 @app.websocket("/ws/echo")
 async def ws_echo(ws: WebSocket):
     await ws.accept()
@@ -247,13 +217,12 @@ async def ws_echo(ws: WebSocket):
     except WebSocketDisconnect:
         pass
 
-# ===== HTTP middleware: audit + metrics =====
+# ===== Middleware: audit & metrics =====
 @app.middleware("http")
 async def audit_mw(request: Request, call_next):
     global REQ_COUNT
     t0 = time.perf_counter()
     ip = request.client.host if request.client else "?"
-    ua = (request.headers.get("user-agent") or "")[:160]
     path = request.url.path
     method = request.method
     status = 500
@@ -269,14 +238,14 @@ async def audit_mw(request: Request, call_next):
             return
         if AUDIT_SAMPLE_N > 1 and (reqno % AUDIT_SAMPLE_N) != 0:
             return
-        write_event("http", ip=ip, ua=ua, method=method, path=path, status=status, ms=ms)
+        write_event("http", ip=ip, method=method, path=path, status=status, ms=ms)
         if status >= 500:
             await emit_alert("crit", "HTTP 5xx", cooldown_s=10, path=path, code=status)
         hot = rate_is_hot(ip)
         if hot is not None:
             await emit_alert("warn", "Rate hot", cooldown_s=15, ip=ip, count=hot, limit=RATE_MAX)
 
-# ===== Percentiles =====
+# ===== Percentiles helpers =====
 def _percentile(values: List[int], p: float) -> int:
     if not values:
         return 0
@@ -307,32 +276,21 @@ def _lat_stats(vals: List[int]) -> Dict[str, int]:
 
 def _compute_summary(n: int) -> Dict[str, Any]:
     rows = [r for r in tail_jsonl(EVENTS_JSONL, n) if r.get("kind") == "http"]
-    total = len(rows)
+    by_status: Dict[str, int] = {}
     by_path: Dict[str, int] = {}
     by_method: Dict[str, int] = {}
-    by_status: Dict[str, int] = {}
     lat: List[int] = []
     for r in rows:
-        p = r.get("path", "?")
-        by_path[p] = by_path.get(p, 0) + 1
-        m = r.get("method", "?")
-        by_method[m] = by_method.get(m, 0) + 1
-        s = str(r.get("status", "?"))
-        by_status[s] = by_status.get(s, 0) + 1
+        by_status[str(r.get("status", "?"))] = by_status.get(str(r.get("status", "?")), 0) + 1
+        by_path[r.get("path", "?")] = by_path.get(r.get("path", "?"), 0) + 1
+        by_method[r.get("method", "?")] = by_method.get(r.get("method", "?"), 0) + 1
         if isinstance(r.get("ms"), int):
             lat.append(r["ms"])
-    top_paths = sorted(by_path.items(), key=lambda x: x[1], reverse=True)[:5]
-    lat_q = _lat_stats(lat)
-    err4 = sum(v for k, v in by_status.items() if k.startswith("4"))
-    err5 = sum(v for k, v in by_status.items() if k.startswith("5"))
     return {
-        "ok": True,
-        "total": total,
-        "paths_top5": top_paths,
-        "methods": by_method,
         "statuses": by_status,
-        "errors": {"4xx": err4, "5xx": err5},
-        "latency_ms": lat_q,
+        "paths_top5": sorted(by_path.items(), key=lambda x: x[1], reverse=True)[:5],
+        "methods": by_method,
+        "latency_ms": _lat_stats(lat),
     }
 
 
@@ -384,107 +342,103 @@ def _compute_health(n: int) -> Dict[str, Any]:
         "thresholds": {"warn": P95_WARN, "crit": P95_CRIT},
     }
 
-# ===== Theming (dark/light) =====
+# ===== Theming =====
 
 def _theme_vars(theme: str) -> Dict[str, str]:
     if theme == "light":
         return {
-            "bg": "#ffffff", "text": "#111", "muted": "#e5e5e5", "card": "#fafafa",
-            "ok": "#2e7d32", "warn": "#e09100", "crit": "#c62828", "btn": "#f3f3f3", "ink": "#111"
+            "bg": "#ffffff", "tx": "#111", "bd": "#e5e5e5", "card": "#fafafa",
+            "ok": "#2e7d32", "warn": "#e09100", "crit": "#c62828", "btn": "#f3f3f3"
         }
-    # dark default
     return {
-        "bg": "#0b0e11", "text": "#eaeef3", "muted": "#1a1f24", "card": "#0f1318",
-        "ok": "#4ade80", "warn": "#fbbf24", "crit": "#f87171", "btn": "#0f1720", "ink": "#eaeef3"
+        "bg": "#0b0e11", "tx": "#eaeef3", "bd": "#1a1f24", "card": "#0f1318",
+        "ok": "#4ade80", "warn": "#fbbf24", "crit": "#f87171", "btn": "#0f1720"
     }
 
-
-# ===== UI roots (render functions) =====
+# ===== UI renderers (safe .format with escaped braces) =====
 
 def render_panel_html() -> str:
     v = _theme_vars(THEME)
-    return f"""<!doctype html>
-<meta charset=\"utf-8\"><title>MeCloneMe — Panel (mini)</title>
+    tpl = '''<!doctype html>
+<meta charset="utf-8"><title>MeCloneMe — Panel (mini)</title>
 <style>
-  :root{{ --bg:{v['bg']}; --tx:{v['text']}; --bd:{v['muted']}; --card:{v['card']}; --btn:{v['btn']}; --ok:{v['ok']}; --warn:{v['warn']}; --crit:{v['crit']}; --ink:{v['ink']}; }}
-  html,body{{background:var(--bg);color:var(--tx);height:100%;margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto}}
-  .wrap{{padding:16px;max-width:980px;margin:0 auto}}
-  .card{{border:1px solid var(--bd);border-radius:10px;padding:12px;background:var(--card);margin:10px 0}}
-  .btn{{padding:8px 12px;border:1px solid var(--bd);border-radius:8px;background:var(--btn);color:var(--tx);cursor:pointer}}
-  .btn[disabled]{{opacity:.5;cursor:default}}
-  .row{{display:flex;gap:8px;align-items:center;flex-wrap:wrap}}
-  .kv{{font:12px/1.2 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas}}
-  .meter{{height:10px;background:var(--bd);border-radius:999px;position:relative;overflow:hidden}}
-  .meter>i{{position:absolute;left:0;top:0;bottom:0;background:linear-gradient(90deg,var(--ok),#22d3ee);border-radius:999px}}
-  .ok{{color:var(--ok)}} .warn{{color:var(--warn)}} .crit{{color:var(--crit)}}
-  .grid{{display:grid;grid-template-columns:1fr 1fr;gap:10px}}
-  @media (max-width:720px){{.grid{{grid-template-columns:1fr}}}}
+  :root {{ --bg:{bg}; --tx:{tx}; --bd:{bd}; --card:{card}; --btn:{btn}; --ok:{ok}; --warn:{warn}; --crit:{crit}; }}
+  html,body {{ background:var(--bg); color:var(--tx); height:100%; margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto; }}
+  .wrap {{ padding:16px; max-width:980px; margin:0 auto; }}
+  .card {{ border:1px solid var(--bd); border-radius:10px; padding:12px; background:var(--card); margin:10px 0; }}
+  .btn {{ padding:8px 12px; border:1px solid var(--bd); border-radius:8px; background:var(--btn); color:var(--tx); cursor:pointer; }}
+  .btn[disabled] {{ opacity:.5; cursor:default; }}
+  .row {{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; }}
+  .kv {{ font:12px/1.2 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas; }}
+  .meter {{ height:10px; background:var(--bd); border-radius:999px; position:relative; overflow:hidden; }}
+  .meter>i {{ position:absolute; left:0; top:0; bottom:0; background:linear-gradient(90deg,var(--ok),#22d3ee); border-radius:999px; }}
+  .grid {{ display:grid; grid-template-columns:1fr 1fr; gap:10px; }}
+  @media (max-width:720px) {{ .grid {{ grid-template-columns:1fr; }} }}
 </style>
-<div class=wrap>
-  <div class=card>
-    <div class=row>
-      <button id=ping class=btn>Ping API</button>
-      <button id=diag class=btn>Diag challenge</button>
-      <a href=\"/ar/stub/avatar.svg?mood=happy\" class=btn target=_blank>AR avatar (SVG)</a>
-      <button id=refreshProgress class=btn>Odśwież postęp</button>
+<div class="wrap">
+  <div class="card">
+    <div class="row">
+      <button id="ping" class="btn">Ping API</button>
+      <button id="diag" class="btn">Diag challenge</button>
+      <a href="/ar/stub/avatar.svg?mood=happy" class="btn" target="_blank">AR avatar (SVG)</a>
+      <button id="refreshProgress" class="btn">Odśwież postęp</button>
     </div>
-    <small>v{API_VERSION} • motyw: {THEME}</small>
+    <small>v{api_version} • motyw: {theme}</small>
   </div>
 
-  <div class=grid>
-    <div class=card>
-      <div class=row><button id=metrics class=btn>Metrics</button><button id=health class=btn>Health</button><button id=spark class=btn>Series</button></div>
-      <pre id=metOut class=kv></pre>
-      <canvas id=sparkCanvas width=420 height=90 style=\"width:100%;max-width:420px;height:90px;border:1px solid var(--bd);border-radius:8px\"></canvas>
+  <div class="grid">
+    <div class="card">
+      <div class="row"><button id="metrics" class="btn">Metrics</button><button id="health" class="btn">Health</button><button id="spark" class="btn">Series</button></div>
+      <pre id="metOut" class="kv"></pre>
+      <canvas id="sparkCanvas" width="420" height="90" style="width:100%;max-width:420px;height:90px;border:1px solid var(--bd);border-radius:8px"></canvas>
     </div>
 
-    <div class=card>
-      <h3 style=\"margin:6px 0\">Postęp MeCloneMe</h3>
-      <div class=meter><i id=overall style=\"width:0%\"></i></div>
-      <div id=list style=\"margin-top:8px\"></div>
+    <div class="card">
+      <h3 style="margin:6px 0">Postęp MeCloneMe</h3>
+      <div class="meter"><i id="overall" style="width:0%"></i></div>
+      <div id="list" style="margin-top:8px"></div>
     </div>
   </div>
 
-  <div class=card>
-    <pre id=out class=kv></pre>
+  <div class="card">
+    <pre id="out" class="kv"></pre>
   </div>
 </div>
 <script>
 const $=id=>document.getElementById(id);
-
 $("ping").onclick=async()=>{ const r=await fetch("/api/health"); $("out").textContent=JSON.stringify(await r.json(),null,2); };
 $("metrics").onclick=async()=>{ const r=await fetch("/metrics"); $("metOut").textContent=await r.text(); };
 $("health").onclick=async()=>{ const r=await fetch("/api/health"); $("metOut").textContent=JSON.stringify(await r.json(),null,2); };
 $("spark").onclick=async()=>{ const r=await fetch("/api/series"); const j=await r.json(); const cv=$("sparkCanvas"),ctx=cv.getContext("2d"); ctx.clearRect(0,0,cv.width,cv.height); const s=j.series||[]; if(!s.length) return; const pad=6,w=cv.width-pad*2,h=cv.height-pad*2; const maxC=Math.max(...s.map(x=>x.count)); ctx.beginPath(); s.forEach((x,i)=>{const y=h*(1-(x.count/(maxC||1))); const X=pad+i*(w/(s.length-1)); if(i)ctx.lineTo(X,y); else ctx.moveTo(X,y);}); ctx.lineWidth=2; ctx.strokeStyle=getComputedStyle(document.documentElement).getPropertyValue('--ok'); ctx.stroke(); };
-
 async function loadProgress(){ const r=await fetch('/progress'); const j=await r.json(); const ov=j.overall||0; $("overall").style.width=ov+"%"; const box=$("list"); box.innerHTML=''; const mods=j.modules||{}; Object.entries(mods).forEach(([k,v])=>{ const row=document.createElement('div'); row.style.margin='8px 0'; row.innerHTML=`<div style="display:flex;justify-content:space-between"><b>${k}</b><span>${v}%</span></div><div class="meter"><i style="width:${v}%"></i></div>`; box.appendChild(row); }); }
-
 $("refreshProgress").onclick=loadProgress; loadProgress();
 </script>
-"""
+'''
+    return tpl.format(api_version=API_VERSION, theme=THEME, **v)
 
 
 def render_mobile_html() -> str:
     v = _theme_vars(THEME)
-    return f"""<!doctype html>
-<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Mobile stub</title>
+    tpl = '''<!doctype html>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Mobile stub</title>
 <style>
-  :root{{ --bg:{v['bg']}; --tx:{v['text']}; --bd:{v['muted']}; --ok:{v['ok']}; --warn:{v['warn']}; --crit:{v['crit']}; }}
-  body{{background:var(--bg);color:var(--tx);font-family:system-ui;margin:12px}}
-  .card{{border:1px solid var(--bd);border-radius:12px;padding:12px;background:rgba(255,255,255,.02)}}
-  .meter{{height:10px;background:var(--bd);border-radius:999px;position:relative;overflow:hidden}}
-  .meter>i{{position:absolute;left:0;top:0;bottom:0;background:linear-gradient(90deg,var(--ok),#22d3ee);border-radius:999px}}
+  :root {{ --bg:{bg}; --tx:{tx}; --bd:{bd}; --ok:{ok}; --warn:{warn}; --crit:{crit}; }}
+  body {{ background:var(--bg); color:var(--tx); font-family:system-ui; margin:12px; }}
+  .card {{ border:1px solid var(--bd); border-radius:12px; padding:12px; background:rgba(255,255,255,.02); }}
+  .meter {{ height:10px; background:var(--bd); border-radius:999px; position:relative; overflow:hidden; }}
+  .meter>i {{ position:absolute; left:0; top:0; bottom:0; background:linear-gradient(90deg,var(--ok),#22d3ee); border-radius:999px; }}
 </style>
 <h2>Mobile (dark)</h2>
-<div class=card>
+<div class="card">
   <div>Postęp MeCloneMe</div>
-  <div class=meter><i id=ov style=\"width:0%\"></i></div>
-  <pre id=mods style=\"font:12px/1.2 ui-monospace\"></pre>
+  <div class="meter"><i id="ov" style="width:0%"></i></div>
+  <pre id="mods" style="font:12px/1.2 ui-monospace"></pre>
 </div>
 <script>
 (async()=>{ const r=await fetch('/progress'); const j=await r.json(); document.getElementById('ov').style.width=(j.overall||0)+'%'; document.getElementById('mods').textContent=JSON.stringify(j.modules||{},null,2); })();
 </script>
-"""
+'''
+    return tpl.format(**v)
 
 # ===== UI endpoints =====
 @app.get("/", response_class=HTMLResponse)
@@ -495,12 +449,12 @@ def root():
 def mobile_page():
     return HTMLResponse(render_mobile_html())
 
-# ===== Simple health =====
+# ===== Health =====
 @app.get("/api/health")
 def health():
     return {"ok": True, "version": API_VERSION, "ts": int(time.time())}
 
-# ===== Pubkeys API =====
+# ===== Keys =====
 @app.get("/auth/keys")
 def list_keys():
     return {"ok": True, "keys": [{"kid": k, "key": v} for k, v in PUBKEYS.items()]}
@@ -547,9 +501,9 @@ def diag_echo_signed(req: SignedJWS, request: Request):
         kid = hdr.get("kid")
         if not kid or kid not in PUBKEYS:
             return bad("unknown-kid")
-        sig = b64u_decode(s)
+        sig = base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
         msg = (h + "." + p).encode()
-        pk = b64u_decode(PUBKEYS[kid])
+        pk = base64.urlsafe_b64decode(PUBKEYS[kid] + "=" * (-len(PUBKEYS[kid]) % 4))
         VerifyKey(pk).verify(msg, sig)
         payload = json.loads(b64u_decode(p))
         now = int(time.time())
@@ -570,20 +524,17 @@ def diag_echo_signed(req: SignedJWS, request: Request):
     base["payload"] = payload
     return base
 
-# ===== Prometheus exporter =====
+# ===== Metrics =====
 @app.get("/metrics")
 def metrics():
     now = time.time()
     if (now - METRICS_CACHE["ts"]) < METRICS_TTL and METRICS_CACHE["body"]:
         return PlainTextResponse(METRICS_CACHE["body"], media_type="text/plain; version=0.0.4")
-
     summ = _compute_summary(1000)
     health = _compute_health(300)
     lines: List[str] = []
-
     def h(x: str):
         lines.append(x)
-
     h("# HELP mecloneme_uptime_seconds Service uptime in seconds")
     h("# TYPE mecloneme_uptime_seconds gauge")
     h(f"mecloneme_uptime_seconds {int(time.time())-BOOT_TS}")
@@ -601,16 +552,19 @@ def metrics():
     h(f"mecloneme_latency_p95_ms {health['latency_ms']['p95']}")
     h("# HELP mecloneme_http_status_recent_total Recent sample status distribution")
     h("# TYPE mecloneme_http_status_recent_total gauge")
-    for code, count in (summ["statuses"] or {}).items():
+    for code, count in (summ.get("statuses") or {}).items():
         h(f'mecloneme_http_status_recent_total{{code="{code}"}} {count}')
-    body = "
-".join(lines) + "
-"
+    body = "\n".join(lines) + "\n"
     METRICS_CACHE["ts"] = now
     METRICS_CACHE["body"] = body
     return PlainTextResponse(body, media_type="text/plain; version=0.0.4")
 
-# ===== AR engine (stub) =====
+# ===== Series endpoint =====
+@app.get("/api/series")
+def series(minutes: int = Query(30, ge=1, le=240)):
+    return _compute_series(minutes)
+
+# ===== AR stub =====
 @app.get("/ar/ping")
 def ar_ping():
     return {"ok": True, "engine": "stub", "ts": int(time.time())}
@@ -623,12 +577,18 @@ def ar_stub_avatar(mood: str = Query("neutral"), scale: int = Query(64, ge=32, l
     mouth_y = size*0.68
     k = {"happy": -0.18, "neutral": 0.0, "sad": 0.18}.get(mood, 0.0)
     mouth = f"M {size*0.25} {mouth_y} Q {size*0.5} {mouth_y + size*k} {size*0.75} {mouth_y}"
+    svg = (
+        f"<svg xmlns='http://www.w3.org/2000/svg' width='{size}' height='{size}' viewBox='0 0 {size} {size}'>"
+        f"<circle cx='{size/2 - eye_dx}' cy='{eye_y}' r='{size*0.06}' fill='#111'/>)"
+    )
+    # Keep it simple to avoid heavy strings
     svg = f"""
-<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{size}\" height=\"{size}\" viewBox=\"0 0 {size} {size}\">
-  <circle cx=\"{size/2 - eye_dx}\" cy=\"{eye_y}\" r=\"{size*0.06}\" fill=\"#111\"/>
-  <circle cx=\"{size/2 + eye_dx}\" cy=\"{eye_y}\" r=\"{size*0.06}\" fill=\"#111\"/>
-  <path d=\"{mouth}\" stroke=\"#111\" stroke-width=\"{size*0.04}\" fill=\"none\" stroke-linecap=\"round\"/>
-</svg>"""
+<svg xmlns='http://www.w3.org/2000/svg' width='{size}' height='{size}' viewBox='0 0 {size} {size}'>
+  <circle cx='{size/2 - eye_dx}' cy='{eye_y}' r='{size*0.06}' fill='#111'/>
+  <circle cx='{size/2 + eye_dx}' cy='{eye_y}' r='{size*0.06}' fill='#111'/>
+  <path d='{mouth}' stroke='#111' stroke-width='{size*0.04}' fill='none' stroke-linecap='round'/>
+</svg>
+"""
     return PlainTextResponse(svg, media_type="image/svg+xml")
 
 @app.get("/ar/stub/state")
@@ -707,8 +667,6 @@ def set_progress(payload: Dict[str, Any]):
     return {"ok": True, "overall": _progress_overall(mods), "modules": mods}
 
 # ===== Alerts =====
-LAST_ALERT_TS: Dict[str, int] = {}
-
 async def emit_alert(level: str, msg: str, cooldown_s: int = 5, **extra):
     now = int(time.time())
     key = f"{level}:{msg}"
@@ -743,16 +701,6 @@ def ingest(inp: IngestPayload):
     write_event("ingest", tag=inp.tag)
     return {"ok": True}
 
-# ===== Admin =====
-@app.post("/admin/clear")
-
-def admin_clear():
-    for p in [EVENTS_JSONL, SHADOW_JSONL]:
-        try:
-            open(p, "w").close()
-        except Exception:
-            pass
-    return {"ok": True}
-
 # ===== Startup =====
 load_stores()
+
