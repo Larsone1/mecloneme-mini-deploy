@@ -17,13 +17,14 @@ def b64u_encode(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode().rstrip("=")
 
 # ===== Config (ENV) =====
-API_VERSION = os.getenv("API_VERSION", "0.3.2")
+API_VERSION = os.getenv("API_VERSION", "0.3.3")
 NONCE_TTL   = int(os.getenv("NONCE_TTL", "300"))
 SESSION_TTL = int(os.getenv("SESSION_TTL", "3600"))
 P95_WARN    = int(os.getenv("P95_WARN", "300"))
 P95_CRIT    = int(os.getenv("P95_CRIT", "800"))
 RATE_WINDOW = int(os.getenv("RATE_WINDOW", "60"))
 RATE_MAX    = int(os.getenv("RATE_MAX", "120"))
+THEME       = os.getenv("THEME", "dark")  # dark | light
 
 # ===== Models =====
 class PubKey(BaseModel):
@@ -53,6 +54,22 @@ class Alert(BaseModel):
     ts: int
     extra: Optional[Dict[str, Any]] = None
 
+class ExportWebhook(BaseModel):
+    url: str
+    payload: Optional[Dict[str, Any]] = None
+    headers: Optional[Dict[str, str]] = None
+
+class ExportS3Like(BaseModel):
+    url: str
+    content_b64: Optional[str] = None
+    text: Optional[str] = None
+    content_type: Optional[str] = "application/octet-stream"
+    method: Optional[str] = "PUT"
+
+class IngestPayload(BaseModel):
+    tag: Optional[str] = "default"
+    data: Dict[str, Any]
+
 # ===== App =====
 app = FastAPI(title="MeCloneMe Mini API", version=API_VERSION)
 app.add_middleware(
@@ -76,6 +93,7 @@ SNAPS_DIR = os.path.join(LOG_DIR, "snaps")
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(SNAPS_DIR, exist_ok=True)
+
 # ===== Lightweight tuning (Render-friendly) =====
 METRICS_TTL = float(os.getenv("METRICS_TTL", "2"))  # seconds to cache /metrics
 AUDIT_SAMPLE_N = int(os.getenv("AUDIT_SAMPLE_N", "1"))  # 1 = log every request; 10 = ~10% sampled
@@ -85,12 +103,13 @@ PUBKEYS_PATH = os.path.join(DATA_DIR, "pubkeys.json")
 SESSIONS_PATH = os.path.join(DATA_DIR, "sessions.json")
 EVENTS_JSONL = os.path.join(LOG_DIR, "events.jsonl")
 SHADOW_JSONL = os.path.join(LOG_DIR, "shadow.jsonl")
+PROGRESS_PATH = os.path.join(DATA_DIR, "progress.json")
 
 BOOT_TS = int(time.time())
 REQ_COUNT = 0
 LAST_ALERT_TS: Dict[str, int] = {}  # throttling
 
-# ===== Utils =====
+# ===== Utils (persistence) =====
 def _load_json(path: str, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -110,7 +129,8 @@ def write_event(kind: str, **fields):
     fields["ts"] = int(time.time())
     try:
         with open(EVENTS_JSONL, "a", encoding="utf-8") as f:
-            f.write(json.dumps(fields, ensure_ascii=False) + "\n")
+            f.write(json.dumps(fields, ensure_ascii=False) + "
+")
     except Exception:
         pass
 
@@ -118,7 +138,8 @@ def write_shadow(**fields):
     fields["ts"] = int(time.time())
     try:
         with open(SHADOW_JSONL, "a", encoding="utf-8") as f:
-            f.write(json.dumps(fields, ensure_ascii=False) + "\n")
+            f.write(json.dumps(fields, ensure_ascii=False) + "
+")
     except Exception:
         pass
 
@@ -142,10 +163,37 @@ def load_stores():
     PUBKEYS = _load_json(PUBKEYS_PATH, {})
     SESSIONS = _load_json(SESSIONS_PATH, {})
 
-def save_sessions():
-    _save_json(SESSIONS_PATH, SESSIONS)
+# ===== Progress (MeCloneMe global) =====
+PROGRESS_DEFAULT: Dict[str, int] = {
+    "N01 — SSOT / Router-README": 55,
+    "N18 — Panel CEO": 35,
+    "N22 — Testy & QA": 25,
+    "N04 — Mobile (Camera/Mic)": 20,
+    "N05 — Desktop (Bridge)": 20,
+    "N09 — Guardian": 30,
+    "N21 — SDK / API Clients": 15,
+    "N27 — Docs & OpenAPI": 30,
+    "N30 — Core (Live+AR+Guardian)": 40,
+}
 
-# ===== Nonces =====
+def _load_progress() -> Dict[str, int]:
+    obj = _load_json(PROGRESS_PATH, {})
+    if not obj:
+        obj = PROGRESS_DEFAULT.copy()
+        _save_json(PROGRESS_PATH, obj)
+    return obj
+
+def _save_progress(obj: Dict[str, int]):
+    _save_json(PROGRESS_PATH, obj)
+
+
+def _progress_overall(mods: Dict[str, int]) -> int:
+    if not mods:
+        return 0
+    vals = [max(0, min(100, int(v))) for v in mods.values()]
+    return int(sum(vals) / len(vals))
+
+# ===== Sessions & Nonces =====
 NONCES: Dict[str, int] = {}  # nonce -> exp
 
 def new_nonce(aud: str) -> Challenge:
@@ -154,13 +202,11 @@ def new_nonce(aud: str) -> Challenge:
     NONCES[nonce] = ts + NONCE_TTL
     return Challenge(aud=aud, nonce=nonce, ts=ts)
 
-# ===== Sessions =====
-
 def new_session(kid: str) -> SessionInfo:
     sid = base64.urlsafe_b64encode(secrets.token_bytes(18)).decode().rstrip("=")
     exp = int(time.time()) + SESSION_TTL
     SESSIONS[sid] = {"kid": kid, "exp": exp}
-    save_sessions()
+    _save_json(SESSIONS_PATH, SESSIONS)
     return SessionInfo(kid=kid, sid=sid, exp=exp)
 
 def get_session(sid: str) -> Optional[SessionInfo]:
@@ -169,11 +215,12 @@ def get_session(sid: str) -> Optional[SessionInfo]:
         return None
     if s["exp"] < int(time.time()):
         SESSIONS.pop(sid, None)
-        save_sessions()
+        _save_json(SESSIONS_PATH, SESSIONS)
         return None
     return SessionInfo(kid=s["kid"], sid=sid, exp=s["exp"])
 
 # ===== Rate limiting =====
+RATE: Dict[str, List[int]] = {}
 
 def rate_allow(ip: str) -> bool:
     now = int(time.time())
@@ -186,7 +233,6 @@ def rate_allow(ip: str) -> bool:
 
 
 def rate_is_hot(ip: str) -> Optional[int]:
-    """Return current count if window usage >= 80% of limit."""
     cnt = len(RATE.get(ip, []))
     return cnt if cnt >= int(RATE_MAX * 0.8) else None
 
@@ -219,10 +265,8 @@ async def audit_mw(request: Request, call_next):
         ms = int((time.perf_counter() - t0) * 1000)
         REQ_COUNT += 1
         reqno = REQ_COUNT
-        # Fast bypass for light paths
         if path in SKIP_AUDIT_PATHS:
             return
-        # Sampling to reduce IO/CPU
         if AUDIT_SAMPLE_N > 1 and (reqno % AUDIT_SAMPLE_N) != 0:
             return
         write_event("http", ip=ip, ua=ua, method=method, path=path, status=status, ms=ms)
@@ -232,8 +276,7 @@ async def audit_mw(request: Request, call_next):
         if hot is not None:
             await emit_alert("warn", "Rate hot", cooldown_s=15, ip=ip, count=hot, limit=RATE_MAX)
 
-# ===== Percentiles (robust) =====
-
+# ===== Percentiles =====
 def _percentile(values: List[int], p: float) -> int:
     if not values:
         return 0
@@ -341,14 +384,116 @@ def _compute_health(n: int) -> Dict[str, Any]:
         "thresholds": {"warn": P95_WARN, "crit": P95_CRIT},
     }
 
-# ===== UI roots =====
+# ===== Theming (dark/light) =====
+
+def _theme_vars(theme: str) -> Dict[str, str]:
+    if theme == "light":
+        return {
+            "bg": "#ffffff", "text": "#111", "muted": "#e5e5e5", "card": "#fafafa",
+            "ok": "#2e7d32", "warn": "#e09100", "crit": "#c62828", "btn": "#f3f3f3", "ink": "#111"
+        }
+    # dark default
+    return {
+        "bg": "#0b0e11", "text": "#eaeef3", "muted": "#1a1f24", "card": "#0f1318",
+        "ok": "#4ade80", "warn": "#fbbf24", "crit": "#f87171", "btn": "#0f1720", "ink": "#eaeef3"
+    }
+
+
+# ===== UI roots (render functions) =====
+
+def render_panel_html() -> str:
+    v = _theme_vars(THEME)
+    return f"""<!doctype html>
+<meta charset=\"utf-8\"><title>MeCloneMe — Panel (mini)</title>
+<style>
+  :root{{ --bg:{v['bg']}; --tx:{v['text']}; --bd:{v['muted']}; --card:{v['card']}; --btn:{v['btn']}; --ok:{v['ok']}; --warn:{v['warn']}; --crit:{v['crit']}; --ink:{v['ink']}; }}
+  html,body{{background:var(--bg);color:var(--tx);height:100%;margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto}}
+  .wrap{{padding:16px;max-width:980px;margin:0 auto}}
+  .card{{border:1px solid var(--bd);border-radius:10px;padding:12px;background:var(--card);margin:10px 0}}
+  .btn{{padding:8px 12px;border:1px solid var(--bd);border-radius:8px;background:var(--btn);color:var(--tx);cursor:pointer}}
+  .btn[disabled]{{opacity:.5;cursor:default}}
+  .row{{display:flex;gap:8px;align-items:center;flex-wrap:wrap}}
+  .kv{{font:12px/1.2 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas}}
+  .meter{{height:10px;background:var(--bd);border-radius:999px;position:relative;overflow:hidden}}
+  .meter>i{{position:absolute;left:0;top:0;bottom:0;background:linear-gradient(90deg,var(--ok),#22d3ee);border-radius:999px}}
+  .ok{{color:var(--ok)}} .warn{{color:var(--warn)}} .crit{{color:var(--crit)}}
+  .grid{{display:grid;grid-template-columns:1fr 1fr;gap:10px}}
+  @media (max-width:720px){{.grid{{grid-template-columns:1fr}}}}
+</style>
+<div class=wrap>
+  <div class=card>
+    <div class=row>
+      <button id=ping class=btn>Ping API</button>
+      <button id=diag class=btn>Diag challenge</button>
+      <a href=\"/ar/stub/avatar.svg?mood=happy\" class=btn target=_blank>AR avatar (SVG)</a>
+      <button id=refreshProgress class=btn>Odśwież postęp</button>
+    </div>
+    <small>v{API_VERSION} • motyw: {THEME}</small>
+  </div>
+
+  <div class=grid>
+    <div class=card>
+      <div class=row><button id=metrics class=btn>Metrics</button><button id=health class=btn>Health</button><button id=spark class=btn>Series</button></div>
+      <pre id=metOut class=kv></pre>
+      <canvas id=sparkCanvas width=420 height=90 style=\"width:100%;max-width:420px;height:90px;border:1px solid var(--bd);border-radius:8px\"></canvas>
+    </div>
+
+    <div class=card>
+      <h3 style=\"margin:6px 0\">Postęp MeCloneMe</h3>
+      <div class=meter><i id=overall style=\"width:0%\"></i></div>
+      <div id=list style=\"margin-top:8px\"></div>
+    </div>
+  </div>
+
+  <div class=card>
+    <pre id=out class=kv></pre>
+  </div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+
+$("ping").onclick=async()=>{ const r=await fetch("/api/health"); $("out").textContent=JSON.stringify(await r.json(),null,2); };
+$("metrics").onclick=async()=>{ const r=await fetch("/metrics"); $("metOut").textContent=await r.text(); };
+$("health").onclick=async()=>{ const r=await fetch("/api/health"); $("metOut").textContent=JSON.stringify(await r.json(),null,2); };
+$("spark").onclick=async()=>{ const r=await fetch("/api/series"); const j=await r.json(); const cv=$("sparkCanvas"),ctx=cv.getContext("2d"); ctx.clearRect(0,0,cv.width,cv.height); const s=j.series||[]; if(!s.length) return; const pad=6,w=cv.width-pad*2,h=cv.height-pad*2; const maxC=Math.max(...s.map(x=>x.count)); ctx.beginPath(); s.forEach((x,i)=>{const y=h*(1-(x.count/(maxC||1))); const X=pad+i*(w/(s.length-1)); if(i)ctx.lineTo(X,y); else ctx.moveTo(X,y);}); ctx.lineWidth=2; ctx.strokeStyle=getComputedStyle(document.documentElement).getPropertyValue('--ok'); ctx.stroke(); };
+
+async function loadProgress(){ const r=await fetch('/progress'); const j=await r.json(); const ov=j.overall||0; $("overall").style.width=ov+"%"; const box=$("list"); box.innerHTML=''; const mods=j.modules||{}; Object.entries(mods).forEach(([k,v])=>{ const row=document.createElement('div'); row.style.margin='8px 0'; row.innerHTML=`<div style="display:flex;justify-content:space-between"><b>${k}</b><span>${v}%</span></div><div class="meter"><i style="width:${v}%"></i></div>`; box.appendChild(row); }); }
+
+$("refreshProgress").onclick=loadProgress; loadProgress();
+</script>
+"""
+
+
+def render_mobile_html() -> str:
+    v = _theme_vars(THEME)
+    return f"""<!doctype html>
+<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Mobile stub</title>
+<style>
+  :root{{ --bg:{v['bg']}; --tx:{v['text']}; --bd:{v['muted']}; --ok:{v['ok']}; --warn:{v['warn']}; --crit:{v['crit']}; }}
+  body{{background:var(--bg);color:var(--tx);font-family:system-ui;margin:12px}}
+  .card{{border:1px solid var(--bd);border-radius:12px;padding:12px;background:rgba(255,255,255,.02)}}
+  .meter{{height:10px;background:var(--bd);border-radius:999px;position:relative;overflow:hidden}}
+  .meter>i{{position:absolute;left:0;top:0;bottom:0;background:linear-gradient(90deg,var(--ok),#22d3ee);border-radius:999px}}
+</style>
+<h2>Mobile (dark)</h2>
+<div class=card>
+  <div>Postęp MeCloneMe</div>
+  <div class=meter><i id=ov style=\"width:0%\"></i></div>
+  <pre id=mods style=\"font:12px/1.2 ui-monospace\"></pre>
+</div>
+<script>
+(async()=>{ const r=await fetch('/progress'); const j=await r.json(); document.getElementById('ov').style.width=(j.overall||0)+'%'; document.getElementById('mods').textContent=JSON.stringify(j.modules||{},null,2); })();
+</script>
+"""
+
+# ===== UI endpoints =====
 @app.get("/", response_class=HTMLResponse)
 def root():
-    return HTMLResponse(PANEL_HTML)
+    return HTMLResponse(render_panel_html())
 
 @app.get("/mobile", response_class=HTMLResponse)
 def mobile_page():
-    return HTMLResponse(MOBILE_HTML)
+    return HTMLResponse(render_mobile_html())
 
 # ===== Simple health =====
 @app.get("/api/health")
@@ -413,7 +558,6 @@ def diag_echo_signed(req: SignedJWS, request: Request):
             return bad("nonce-expired")
         if payload.get("aud") != "diag":
             return bad("bad-aud")
-        nonce = payload.get("nonce")
         exp = NONCES.get(nonce)
         if not exp or exp < now:
             return bad("nonce-expired")
@@ -430,7 +574,6 @@ def diag_echo_signed(req: SignedJWS, request: Request):
 @app.get("/metrics")
 def metrics():
     now = time.time()
-    # Lightweight cache to avoid recomputing on hot scrapes
     if (now - METRICS_CACHE["ts"]) < METRICS_TTL and METRICS_CACHE["body"]:
         return PlainTextResponse(METRICS_CACHE["body"], media_type="text/plain; version=0.0.4")
 
@@ -460,7 +603,9 @@ def metrics():
     h("# TYPE mecloneme_http_status_recent_total gauge")
     for code, count in (summ["statuses"] or {}).items():
         h(f'mecloneme_http_status_recent_total{{code="{code}"}} {count}')
-    body = "\n".join(lines) + "\n"
+    body = "
+".join(lines) + "
+"
     METRICS_CACHE["ts"] = now
     METRICS_CACHE["body"] = body
     return PlainTextResponse(body, media_type="text/plain; version=0.0.4")
@@ -472,19 +617,17 @@ def ar_ping():
 
 @app.get("/ar/stub/avatar.svg", response_class=PlainTextResponse)
 def ar_stub_avatar(mood: str = Query("neutral"), scale: int = Query(64, ge=32, le=256)):
-    """Ultra-lekki SVG awatara (oczy + łuk ust). Zero bibliotek."""
     size = scale
     eye_dx = size*0.22
     eye_y = size*0.38
     mouth_y = size*0.68
-    # Mouth curvature by mood
     k = {"happy": -0.18, "neutral": 0.0, "sad": 0.18}.get(mood, 0.0)
     mouth = f"M {size*0.25} {mouth_y} Q {size*0.5} {mouth_y + size*k} {size*0.75} {mouth_y}"
     svg = f"""
-<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}" viewBox="0 0 {size} {size}">
-  <circle cx="{size/2 - eye_dx}" cy="{eye_y}" r="{size*0.06}" fill="#111"/>
-  <circle cx="{size/2 + eye_dx}" cy="{eye_y}" r="{size*0.06}" fill="#111"/>
-  <path d="{mouth}" stroke="#111" stroke-width="{size*0.04}" fill="none" stroke-linecap="round"/>
+<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{size}\" height=\"{size}\" viewBox=\"0 0 {size} {size}\">
+  <circle cx=\"{size/2 - eye_dx}\" cy=\"{eye_y}\" r=\"{size*0.06}\" fill=\"#111\"/>
+  <circle cx=\"{size/2 + eye_dx}\" cy=\"{eye_y}\" r=\"{size*0.06}\" fill=\"#111\"/>
+  <path d=\"{mouth}\" stroke=\"#111\" stroke-width=\"{size*0.04}\" fill=\"none\" stroke-linecap=\"round\"/>
 </svg>"""
     return PlainTextResponse(svg, media_type="image/svg+xml")
 
@@ -493,10 +636,6 @@ def ar_stub_state():
     return {"ok": True, "mood": "neutral", "ts": int(time.time())}
 
 # ===== Export / Telemetry =====
-class ExportWebhook(BaseModel):
-    url: str
-    payload: Optional[Dict[str, Any]] = None
-    headers: Optional[Dict[str, str]] = None
 
 def _http_post_json(url: str, payload: Dict[str, Any], headers: Optional[Dict[str, str]] = None, timeout_s: int = 3) -> Dict[str, Any]:
     import urllib.request, json as _json
@@ -513,7 +652,6 @@ def _http_post_json(url: str, payload: Dict[str, Any], headers: Optional[Dict[st
 @app.post("/export/webhook")
 
 def export_webhook(inp: ExportWebhook):
-    """Forward JSON payload to an external webhook with tiny retry logic."""
     payload = inp.payload or {"ok": True, "src": "mecloneme"}
     tries = [0.0, 0.5, 1.0]
     last = {"status": 0, "body": ""}
@@ -527,17 +665,9 @@ def export_webhook(inp: ExportWebhook):
         time.sleep(backoff)
     return {"ok": 200 <= (last.get("status") or 0) < 300, "last": last}
 
-class ExportS3Like(BaseModel):
-    url: str
-    content_b64: Optional[str] = None
-    text: Optional[str] = None
-    content_type: Optional[str] = "application/octet-stream"
-    method: Optional[str] = "PUT"
-
 @app.post("/export/s3")
 
 def export_s3_like(inp: ExportS3Like):
-    """Upload to a pre-signed URL (S3-compatible). No external deps."""
     import urllib.request
     if not (inp.content_b64 or inp.text):
         return JSONResponse({"ok": False, "err": "no-content"}, status_code=400)
@@ -551,114 +681,34 @@ def export_s3_like(inp: ExportS3Like):
     except Exception as e:
         return JSONResponse({"ok": False, "err": str(e)}, status_code=502)
 
-# ===== Ingest (przywrócony, lekki) =====
-class IngestPayload(BaseModel):
-    tag: Optional[str] = "default"
-    data: Dict[str, Any]
+# ===== Progress API =====
+@app.get("/progress")
 
-@app.post("/ingest")
+def get_progress():
+    mods = _load_progress()
+    return {"ok": True, "overall": _progress_overall(mods), "modules": mods}
 
-def ingest(inp: IngestPayload):
-    write_shadow(kind="ingest", tag=inp.tag, data=inp.data)
-    write_event("ingest", tag=inp.tag)
-    return {"ok": True}
+@app.post("/admin/progress")
 
-# ===== HTML (panel + mobile) =====
-PANEL_HTML = """<!doctype html>
-<meta charset="utf-8"><title>Guardian — mini panel</title>
-<style>
-  :root{ --ok:#2e7d32; --warn:#e09100; --crit:#c62828; --btn:#f3f3f3; --bd:#e5e5e5; }
-  body{font-family: system-ui,-apple-system,Segoe UI,Roboto;margin:16px}
-  .card{border:1px solid var(--bd);border-radius:8px;padding:12px}
-  .btn{padding:6px 10px;border:1px solid var(--bd);border-radius:8px;background:var(--btn);cursor:pointer}
-  .btn[disabled]{opacity:.5}
-  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-  .kv{font:12px/1.1 monospace}
-  .meter{height:6px;background:#eee;border-radius:8px;position:relative}
-  .meter>i{position:absolute;left:0;top:0;bottom:0;background:var(--ok);border-radius:8px}
-  .ok{color:var(--ok)} .warn{color:var(--warn)} .crit{color:var(--crit)}
-  #heatmap,#heatmapS{display:grid;grid-template-columns: repeat(10, 1fr);gap:4px}
-  .cell{height:22px;background:#eee;border-radius:3px;text-align:center;font:11px/22px system-ui}
-</style>
-<div class=card>
-  <div class=row>
-    <button id=ping class=btn>Ping API</button>
-    <button id=getDiag class=btn>Diag challenge</button>
-    <button id=echoSigned class=btn>Echo (signed)</button>
-    <button id=logout class=btn>Logout</button>
-  </div>
-  <pre id=out class=kv></pre>
-</div>
-<div class=card>
-  <div class=row>
-    <button id=metrics class=btn>Metrics</button>
-    <button id=health class=btn>Health</button>
-    <button id=spark class=btn>Series</button>
-  </div>
-  <pre id=metOut class=kv></pre>
-  <canvas id=sparkCanvas width=360 height=80 style="width:360px;height:80px;border:1px solid #eee;border-radius:6px"></canvas>
-  <div id=heatmap style="margin-top:8px"></div>
-</div>
-<div class=card>
-  <div class=row>
-    <input id=kid placeholder="kid" value="dev-key-1" class=btn>
-    <button id=arPing class=btn>AR /ping</button>
-    <a href="/ar/stub/avatar.svg?mood=happy" class=btn target=_blank>AR avatar (SVG)</a>
-  </div>
-  <pre id=arOut class=kv></pre>
-</div>
-<script>
-const $=id=>document.getElementById(id);
-const enc = new TextEncoder();
-
-$("ping").onclick=async()=>{
-  const r=await fetch("/api/health");
-  $("out").textContent=JSON.stringify(await r.json(),null,2);
-};
-
-$("metrics").onclick=async()=>{
-  const r=await fetch("/metrics");
-  $("metOut").textContent=await r.text();
-};
-
-$("health").onclick=async()=>{
-  const r=await fetch("/api/health");
-  $("metOut").textContent=JSON.stringify(await r.json(),null,2);
-};
-
-$("spark").onclick=async()=>{
-  const r=await fetch("/api/series");
-  const j=await r.json();
-  const cv=$("sparkCanvas"); const ctx=cv.getContext("2d");
-  ctx.clearRect(0,0,cv.width,cv.height);
-  const s=j.series||[]; if(!s.length) return;
-  const pad=6,w=cv.width-pad*2,h=cv.height-pad*2;
-  const maxC=Math.max(...s.map(x=>x.count));
-  ctx.beginPath();
-  s.forEach((x,i)=>{const y=h*(1-(x.count/(maxC||1)));const X=pad+i*(w/(s.length-1)); if(i)ctx.lineTo(X,y); else ctx.moveTo(X,y);});
-  ctx.lineWidth=2; ctx.strokeStyle="#2e7d32"; ctx.stroke();
-};
-
-$("arPing").onclick=async()=>{
-  const r=await fetch("/ar/ping");
-  $("arOut").textContent=JSON.stringify(await r.json(),null,2);
-};
-</script>
-"""
-
-MOBILE_HTML = """<!doctype html>
-<meta charset="utf-8"><title>Mobile</title>
-<style>body{font-family:system-ui;margin:16px}</style>
-<h3>Mobile stub</h3>
-<p>TODO</p>
-"""
-
-# ===== Series endpoint =====
-@app.get("/api/series")
-def series(minutes: int = Query(30, ge=1, le=240)):
-    return _compute_series(minutes)
+def set_progress(payload: Dict[str, Any]):
+    mods = _load_progress()
+    if "modules" in payload and isinstance(payload["modules"], dict):
+        for k, v in payload["modules"].items():
+            try:
+                mods[k] = int(v)
+            except Exception:
+                pass
+    if "module" in payload and "percent" in payload:
+        try:
+            mods[payload["module"]] = int(payload["percent"])
+        except Exception:
+            pass
+    _save_progress(mods)
+    return {"ok": True, "overall": _progress_overall(mods), "modules": mods}
 
 # ===== Alerts =====
+LAST_ALERT_TS: Dict[str, int] = {}
+
 async def emit_alert(level: str, msg: str, cooldown_s: int = 5, **extra):
     now = int(time.time())
     key = f"{level}:{msg}"
@@ -672,11 +722,13 @@ async def emit_alert(level: str, msg: str, cooldown_s: int = 5, **extra):
     write_shadow(kind="alert", **entry)
 
 @app.get("/alerts")
+
 def list_alerts():
     return {"ok": True, "alerts": ALERTS[-50:]}
 
-# ===== Snapshots =====
+# ===== Snapshots / Ingest =====
 @app.post("/snapshots")
+
 def save_snapshot(s: Snapshot):
     name = re.sub(r"[^a-zA-Z0-9_-]", "_", s.tag)[:48]
     path = os.path.join(SNAPS_DIR, f"{name}_{int(time.time())}.json")
@@ -684,8 +736,16 @@ def save_snapshot(s: Snapshot):
         json.dump({"ts": int(time.time()), "payload": s.payload}, f)
     return {"ok": True, "path": path}
 
+@app.post("/ingest")
+
+def ingest(inp: IngestPayload):
+    write_shadow(kind="ingest", tag=inp.tag, data=inp.data)
+    write_event("ingest", tag=inp.tag)
+    return {"ok": True}
+
 # ===== Admin =====
 @app.post("/admin/clear")
+
 def admin_clear():
     for p in [EVENTS_JSONL, SHADOW_JSONL]:
         try:
@@ -693,3 +753,6 @@ def admin_clear():
         except Exception:
             pass
     return {"ok": True}
+
+# ===== Startup =====
+load_stores()
