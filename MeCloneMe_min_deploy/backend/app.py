@@ -1,7 +1,7 @@
-import os, time, json, base64, secrets, asyncio
-from typing import Dict, Any, List, Optional
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+import os, time, json, base64, secrets, asyncio, io
+from typing import Dict, Any, List, Optional, Iterable
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Query
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from nacl.signing import VerifyKey
@@ -16,7 +16,7 @@ def b64u_encode(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode().rstrip("=")
 
 # ===== Config (ENV) =====
-API_VERSION = os.getenv("API_VERSION","0.1.0")
+API_VERSION = os.getenv("API_VERSION","0.1.1")
 NONCE_TTL   = int(os.getenv("NONCE_TTL", "300"))   # s
 SESSION_TTL = int(os.getenv("SESSION_TTL", "900")) # s
 RATE_MAX    = int(os.getenv("RATE_MAX", "30"))     # max calls / window
@@ -30,9 +30,16 @@ RATE: Dict[str, List[int]] = {}             # ip -> [timestamps]
 
 # ===== Simple persistence (best-effort) =====
 DATA_DIR = "data"
+LOG_DIR  = "logs"
 os.makedirs(DATA_DIR, exist_ok=True)
-PUBKEYS_PATH  = os.path.join(DATA_DIR, "pubkeys.json")
-SESSIONS_PATH = os.path.join(DATA_DIR, "sessions.json")
+os.makedirs(LOG_DIR,  exist_ok=True)
+PUBKEYS_PATH   = os.path.join(DATA_DIR, "pubkeys.json")
+SESSIONS_PATH  = os.path.join(DATA_DIR, "sessions.json")
+EVENTS_JSONL   = os.path.join(LOG_DIR,  "events.jsonl")  # audit/admin
+SHADOW_JSONL   = os.path.join(LOG_DIR,  "shadow.jsonl")  # live frames
+
+BOOT_TS = int(time.time())
+REQ_COUNT = 0
 
 def _load_json(path: str, default):
     try:
@@ -60,6 +67,27 @@ def save_pubkeys():
 
 def save_sessions():
     _save_json(SESSIONS_PATH, SESSIONS)
+
+# ===== Events (JSONL) =====
+def write_event(kind: str, **data) -> None:
+    rec = {"ts": int(time.time()), "kind": kind, **data}
+    try:
+        with open(EVENTS_JSONL, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+def tail_jsonl(path: str, n: int) -> List[Dict[str, Any]]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()[-n:]
+        out = []
+        for ln in lines:
+            try: out.append(json.loads(ln))
+            except Exception: pass
+        return out
+    except FileNotFoundError:
+        return []
 
 # ===== Rate limiting (prosty sliding window) =====
 def rate_check(ip: str) -> bool:
@@ -106,6 +134,24 @@ app.add_middleware(CORSMiddleware,
     allow_methods=['*'], allow_headers=['*']
 )
 load_stores()
+
+# ===== HTTP middleware: audit + metrics =====
+@app.middleware("http")
+async def audit_mw(request: Request, call_next):
+    global REQ_COUNT
+    t0 = time.perf_counter()
+    ip = request.client.host if request.client else "?"
+    ua = (request.headers.get("user-agent") or "")[:160]
+    path = request.url.path
+    method = request.method
+    try:
+        response = await call_next(request)
+        status = getattr(response, "status_code", 200)
+        return response
+    finally:
+        ms = int((time.perf_counter() - t0) * 1000)
+        REQ_COUNT += 1
+        write_event("http", ip=ip, ua=ua, method=method, path=path, status=status, ms=ms)
 
 # ===== Mini panel (admin podgląd + progress lokalnie) =====
 PANEL_HTML = """<!doctype html>
@@ -178,37 +224,26 @@ function renderBars(state){
   });
 }
 
-function loadState(){
-  try{ return JSON.parse(localStorage.getItem(LS_KEY)||"{}"); }catch{ return {}; }
-}
-function saveState(state){
-  localStorage.setItem(LS_KEY, JSON.stringify(state));
-}
-
 (async function init(){
-  // challenge preview
   try{
     const r = await fetch('/auth/challenge');
     const j = await r.json();
     $("challenge").textContent = JSON.stringify(j,null,2);
   }catch(e){ $("challenge").textContent = "API offline"; }
 
-  // WS live log
   const wsUrl = (location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/shadow/ws";
   try{
     const ws = new WebSocket(wsUrl);
     ws.onmessage = (ev)=>{
-      try{
-        const j = JSON.parse(ev.data);
-        log(JSON.stringify(j));
-      }catch(e){ log(ev.data); }
+      try{ log(JSON.stringify(JSON.parse(ev.data))); }
+      catch(e){ log(ev.data); }
     };
-  }catch(e){ $("ws").textContent="WS: error";$("ws").style.color="#b71c1c"; }
+  }catch(e){ const el=document.querySelector("#ws"); el.textContent="WS: error"; el.style.color="#b71c1c"; }
 
-  // Progress bars
-  const state = loadState(); renderBars(state);
-  $("save").onclick = ()=>saveState(state);
-  $("reset").onclick = ()=>{ localStorage.removeItem(LS_KEY); location.reload(); };
+  const state = JSON.parse(localStorage.getItem(LS_KEY)||"{}");
+  renderBars(state);
+  document.getElementById("save").onclick = ()=>localStorage.setItem(LS_KEY, JSON.stringify(state));
+  document.getElementById("reset").onclick = ()=>{ localStorage.removeItem(LS_KEY); location.reload(); };
 })();
 </script>
 </body>
@@ -289,7 +324,7 @@ function getKeypair(){
   if(!seedB64u) throw new Error("Brak PRIV");
   const seed = fromB64u(seedB64u);
   if(seed.length!==32) throw new Error("PRIV (seed) musi być 32 bajty!");
-  return nacl.sign.keyPair.fromSeed(seed); // {publicKey(32B), secretKey(64B)}
+  return nacl.sign.keyPair.fromSeed(seed);
 }
 
 $("register").onclick = async ()=>{
@@ -307,10 +342,7 @@ $("register").onclick = async ()=>{
 };
 
 let last = null, session = null, exp=0, ticker=null;
-function tick(){
-  const eta = Math.max(0, exp - Math.floor(Date.now()/1000));
-  $("eta").textContent = eta+"s";
-}
+function tick(){ const eta = Math.max(0, exp - Math.floor(Date.now()/1000)); $("eta").textContent = eta+"s"; }
 
 $("getCh").onclick = async ()=>{
   const r = await fetch("/auth/challenge");
@@ -397,7 +429,7 @@ async def emit(kind: str, **vec):
     frame = {"ts": int(time.time()), "vec": {kind: vec}}
     await ws_manager.broadcast(frame)
 
-# ===== Routes =====
+# ===== Routes: UI roots =====
 @app.get("/", response_class=HTMLResponse)
 def root():
     return HTMLResponse(PANEL_HTML)
@@ -406,6 +438,7 @@ def root():
 def mobile_page():
     return HTMLResponse(MOBILE_HTML)
 
+# ===== Health / Version / Metrics =====
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "ts": int(time.time())}
@@ -416,13 +449,31 @@ def api_health():
         "ok": True,
         "version": API_VERSION,
         "ts": int(time.time()),
+        "uptime": int(time.time()) - BOOT_TS,
         "counts": {
+            "requests": REQ_COUNT,
             "nonces": len(NONCES),
             "pubkeys": len(PUBKEYS),
             "sessions": len(SESSIONS)
         }
     }
 
+@app.get("/api/version")
+def api_version():
+    # Render i inne PaaS publikują SHA w zmiennych środowiskowych
+    git = os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_SHA") or ""
+    svc = os.getenv("RENDER_SERVICE_NAME") or ""
+    return {"ok": True, "version": API_VERSION, "boot_ts": BOOT_TS, "git": git[:12], "service": svc}
+
+@app.get("/api/metrics")
+def api_metrics():
+    return {
+        "ok": True,
+        "rate": {"window_s": RATE_WINDOW, "max": RATE_MAX},
+        "counts": {"ip_slots": len(RATE)},
+    }
+
+# ===== WS + Shadow ingest =====
 @app.websocket("/shadow/ws")
 async def ws_shadow(ws: WebSocket):
     await ws_manager.connect(ws)
@@ -436,19 +487,21 @@ async def ws_shadow(ws: WebSocket):
 async def shadow_ingest(frame: ShadowFrame):
     # zapis do pliku (best-effort)
     try:
-        os.makedirs("logs", exist_ok=True)
-        with open("logs/shadow.jsonl","a",encoding="utf-8") as f:
+        with open(SHADOW_JSONL,"a",encoding="utf-8") as f:
             f.write(json.dumps(frame.dict())+"\n")
     except Exception:
         pass
     await ws_manager.broadcast(frame.dict())
+    write_event("shadow", **frame.dict())
     return ok()
 
+# ===== Auth flow =====
 @app.get("/auth/challenge")
 async def challenge(request: Request, aud: str = "mobile"):
     ip = request.client.host if request.client else "?"
     if not rate_check(ip):
         await emit("rate", ip=ip, status="limit")
+        write_event("rate_limit", ip=ip, path="/auth/challenge")
         return bad("rate-limit")
     now = int(time.time())
     nonce = secrets.token_hex(16)
@@ -458,6 +511,7 @@ async def challenge(request: Request, aud: str = "mobile"):
         if exp < now:
             NONCES.pop(n, None)
     await emit("challenge", aud=aud, nonce=nonce)
+    write_event("auth.challenge", ip=ip, aud=aud, nonce=nonce)
     return ok(aud=aud, nonce=nonce, ttl=NONCE_TTL)
 
 @app.post("/guardian/register_pubkey")
@@ -465,6 +519,7 @@ async def register_pubkey(req: PubKeyReq, request: Request):
     ip = request.client.host if request.client else "?"
     if not rate_check(ip):
         await emit("rate", ip=ip, status="limit")
+        write_event("rate_limit", ip=ip, path="/guardian/register_pubkey")
         return bad("rate-limit")
     try:
         if len(b64u_decode(req.pub)) != 32:
@@ -474,6 +529,7 @@ async def register_pubkey(req: PubKeyReq, request: Request):
     PUBKEYS[req.kid] = req.pub
     save_pubkeys()
     await emit("admin", action="register_pubkey", kid=req.kid)
+    write_event("auth.register_pubkey", kid=req.kid)
     return ok(registered=list(PUBKEYS.keys()))
 
 @app.post("/guardian/verify")
@@ -481,6 +537,7 @@ async def guardian_verify(request: Request, req: VerifyReq):
     ip = request.client.host if request.client else "?"
     if not rate_check(ip):
         await emit("rate", ip=ip, status="limit")
+        write_event("rate_limit", ip=ip, path="/guardian/verify")
         return bad("rate-limit")
 
     # compact JWS: h.p.s (base64url)
@@ -531,6 +588,7 @@ async def guardian_verify(request: Request, req: VerifyReq):
     save_sessions()
 
     await emit("auth", status="ok", aud=aud, kid=kid)
+    write_event("auth.verify_ok", kid=kid, aud=aud, sid=sid)
     return ok(payload=payload, session=sid, exp=sess_exp)
 
 @app.get("/protected/hello")
@@ -538,14 +596,17 @@ async def protected_hello(request: Request):
     ip = request.client.host if request.client else "?"
     if not rate_check(ip):
         await emit("rate", ip=ip, status="limit")
+        write_event("rate_limit", ip=ip, path="/protected/hello")
         return bad("rate-limit")
     auth = request.headers.get("authorization") or ""
     token = auth.split(" ",1)[1] if auth.lower().startswith("bearer ") else ""
     sess = require_session(token)
     if not sess:
         await emit("unauth", path="/protected/hello", ip=ip)
+        write_event("auth.unauthorized", ip=ip, path="/protected/hello")
         return bad("unauthorized")
     await emit("hello", kid=sess["kid"])
+    write_event("hello", kid=sess["kid"])
     return ok(msg="hello dev-user", kid=sess["kid"], exp=sess["exp"])
 
 @app.post("/guardian/refresh")
@@ -559,6 +620,7 @@ async def refresh(request: Request):
     sess["exp"] = int(time.time()) + SESSION_TTL
     save_sessions()
     await emit("session", action="refresh", kid=sess["kid"], exp=sess["exp"])
+    write_event("auth.refresh", kid=sess["kid"], exp=sess["exp"])
     return ok(exp=sess["exp"])
 
 @app.post("/guardian/logout")
@@ -569,7 +631,55 @@ async def logout(request: Request):
     save_sessions()
     if s:
         await emit("session", action="logout", kid=s["kid"])
+        write_event("auth.logout", kid=s["kid"])
     return ok()
+
+# ===== Admin: events tail + CSV export (wymaga Bearer sesji) =====
+def _auth_token(request: Request) -> str:
+    auth = request.headers.get("authorization") or ""
+    return auth.split(" ",1)[1] if auth.lower().startswith("bearer ") else ""
+
+@app.get("/admin/events/tail")
+def admin_tail(request: Request, n: int = Query(200, ge=1, le=2000)):
+    token = _auth_token(request)
+    if not require_session(token): return bad("unauthorized")
+    return {"ok": True, "items": tail_jsonl(EVENTS_JSONL, n)}
+
+def _flatten(d: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
+    out = {}
+    for k,v in d.items():
+        kk = f"{prefix}.{k}" if prefix else k
+        if isinstance(v, dict): out.update(_flatten(v, kk))
+        else: out[kk] = v
+    return out
+
+@app.get("/admin/events/export.csv")
+def admin_csv(request: Request, n: int = Query(500, ge=1, le=5000)):
+    token = _auth_token(request)
+    if not require_session(token): return bad("unauthorized")
+    rows = tail_jsonl(EVENTS_JSONL, n)
+    # zbuduj uniwersalny nagłówek
+    headers: List[str] = []
+    flat_rows: List[Dict[str, Any]] = []
+    for r in rows:
+        fr = _flatten(r)
+        flat_rows.append(fr)
+        for k in fr.keys():
+            if k not in headers: headers.append(k)
+    # CSV
+    buf = io.StringIO()
+    buf.write(",".join(headers) + "\n")
+    for fr in flat_rows:
+        vals = []
+        for h in headers:
+            v = fr.get(h, "")
+            if isinstance(v, (dict, list)): v = json.dumps(v, ensure_ascii=False)
+            s = str(v).replace('"','""')
+            # wrap only if needed
+            if any(c in s for c in [",", "\n", '"']): s = f'"{s}"'
+            vals.append(s)
+        buf.write(",".join(vals) + "\n")
+    return PlainTextResponse(buf.getvalue(), media_type="text/csv")
 
 # ===== AR engine (stub / R&D) =====
 @app.get("/ar/ping")
