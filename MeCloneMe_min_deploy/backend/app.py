@@ -1,5 +1,5 @@
-import os, time, json, base64, secrets, asyncio, io
-from typing import Dict, Any, List, Optional, Iterable
+import os, time, json, base64, secrets, asyncio, io, statistics
+from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Query
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,7 +16,7 @@ def b64u_encode(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode().rstrip("=")
 
 # ===== Config (ENV) =====
-API_VERSION = os.getenv("API_VERSION","0.1.1")
+API_VERSION = os.getenv("API_VERSION","0.1.2")
 NONCE_TTL   = int(os.getenv("NONCE_TTL", "300"))   # s
 SESSION_TTL = int(os.getenv("SESSION_TTL", "900")) # s
 RATE_MAX    = int(os.getenv("RATE_MAX", "30"))     # max calls / window
@@ -153,7 +153,7 @@ async def audit_mw(request: Request, call_next):
         REQ_COUNT += 1
         write_event("http", ip=ip, ua=ua, method=method, path=path, status=status, ms=ms)
 
-# ===== Mini panel (admin podgląd + progress lokalnie) =====
+# ===== Mini panel (admin + progress + quick tests) =====
 PANEL_HTML = """<!doctype html>
 <meta charset="utf-8"><title>Guardian — mini panel</title>
 <body style="font-family: system-ui, -apple-system, Segoe UI, Roboto; margin:16px">
@@ -176,6 +176,21 @@ PANEL_HTML = """<!doctype html>
     <button id="save">💾 Zapisz</button>
     <button id="reset">↩︎ Reset</button>
   </div>
+</div>
+
+<div style="border:1px solid #eee;border-radius:8px;padding:12px;margin-top:16px">
+  <h2>Admin — szybkie testy</h2>
+  <div style="margin:6px 0">Token (Bearer) z <code>/mobile</code> po <i>verify</i>:
+    <input id="admTok" placeholder="sess_xxx" style="width:320px">
+  </div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin:6px 0">
+    <button id="btnTail">📜 Tail (50)</button>
+    <button id="btnCSV">⬇️ CSV (200)</button>
+    <button id="btnSummary">📊 Summary (500)</button>
+    <button id="btnHealth">🩺 Health detail</button>
+    <button id="btnPurge" style="color:#b71c1c;border-color:#b71c1c">🧹 Purge log</button>
+  </div>
+  <pre id="admOut" style="background:#f7f7f7;border:1px solid #eee;border-radius:8px;min-height:120px;padding:12px"></pre>
 </div>
 
 <script>
@@ -244,6 +259,35 @@ function renderBars(state){
   renderBars(state);
   document.getElementById("save").onclick = ()=>localStorage.setItem(LS_KEY, JSON.stringify(state));
   document.getElementById("reset").onclick = ()=>{ localStorage.removeItem(LS_KEY); location.reload(); };
+
+  // Admin quick tests
+  function tok(){ return $("admTok").value.trim(); }
+  $("btnTail").onclick = async ()=>{
+    const r = await fetch('/admin/events/tail?n=50',{headers:{Authorization:'Bearer '+tok()}});
+    $("admOut").textContent = await r.text();
+  };
+  $("btnCSV").onclick = async ()=>{
+    const r = await fetch('/admin/events/export.csv?n=200',{headers:{Authorization:'Bearer '+tok()}});
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'events.csv'; a.click();
+    URL.revokeObjectURL(url);
+    $("admOut").textContent = "Pobrano events.csv";
+  };
+  $("btnSummary").onclick = async ()=>{
+    const r = await fetch('/api/logs/summary?n=500');
+    $("admOut").textContent = JSON.stringify(await r.json(),null,2);
+  };
+  $("btnHealth").onclick = async ()=>{
+    const r = await fetch('/api/health/detail?n=200');
+    $("admOut").textContent = JSON.stringify(await r.json(),null,2);
+  };
+  $("btnPurge").onclick = async ()=>{
+    if(!confirm('Na pewno usunąć zawartość events.jsonl?')) return;
+    const r = await fetch('/admin/events/purge',{method:'POST', headers:{Authorization:'Bearer '+tok()}});
+    $("admOut").textContent = await r.text();
+  };
 })();
 </script>
 </body>
@@ -429,6 +473,10 @@ async def emit(kind: str, **vec):
     frame = {"ts": int(time.time()), "vec": {kind: vec}}
     await ws_manager.broadcast(frame)
 
+def _auth_token(request: Request) -> str:
+    auth = request.headers.get("authorization") or ""
+    return auth.split(" ",1)[1] if auth.lower().startswith("bearer ") else ""
+
 # ===== Routes: UI roots =====
 @app.get("/", response_class=HTMLResponse)
 def root():
@@ -460,18 +508,13 @@ def api_health():
 
 @app.get("/api/version")
 def api_version():
-    # Render i inne PaaS publikują SHA w zmiennych środowiskowych
     git = os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_SHA") or ""
     svc = os.getenv("RENDER_SERVICE_NAME") or ""
     return {"ok": True, "version": API_VERSION, "boot_ts": BOOT_TS, "git": git[:12], "service": svc}
 
 @app.get("/api/metrics")
 def api_metrics():
-    return {
-        "ok": True,
-        "rate": {"window_s": RATE_WINDOW, "max": RATE_MAX},
-        "counts": {"ip_slots": len(RATE)},
-    }
+    return {"ok": True, "rate": {"window_s": RATE_WINDOW, "max": RATE_MAX}, "counts": {"ip_slots": len(RATE)}}
 
 # ===== WS + Shadow ingest =====
 @app.websocket("/shadow/ws")
@@ -485,7 +528,6 @@ async def ws_shadow(ws: WebSocket):
 
 @app.post("/shadow/ingest")
 async def shadow_ingest(frame: ShadowFrame):
-    # zapis do pliku (best-effort)
     try:
         with open(SHADOW_JSONL,"a",encoding="utf-8") as f:
             f.write(json.dumps(frame.dict())+"\n")
@@ -506,7 +548,6 @@ async def challenge(request: Request, aud: str = "mobile"):
     now = int(time.time())
     nonce = secrets.token_hex(16)
     NONCES[nonce] = now + NONCE_TTL
-    # cleanup
     for n, exp in list(NONCES.items()):
         if exp < now:
             NONCES.pop(n, None)
@@ -540,7 +581,6 @@ async def guardian_verify(request: Request, req: VerifyReq):
         write_event("rate_limit", ip=ip, path="/guardian/verify")
         return bad("rate-limit")
 
-    # compact JWS: h.p.s (base64url)
     try:
         parts = req.jws.split(".")
         if len(parts) != 3:
@@ -552,20 +592,17 @@ async def guardian_verify(request: Request, req: VerifyReq):
     except Exception:
         return bad("bad-jws")
 
-    # verify header
     kid = header.get("kid")
     alg = header.get("alg")
     if alg != "EdDSA" or not kid or kid not in PUBKEYS:
         return bad("bad-header")
 
-    # verify signature
     try:
         vk = VerifyKey(b64u_decode(PUBKEYS[kid]))
         vk.verify((h_b+"."+p_b).encode(), sig)
     except BadSignatureError:
         return bad("bad-signature")
 
-    # app checks
     now = int(time.time())
     try:
         if abs(now - int(payload["ts"])) > NONCE_TTL:
@@ -577,11 +614,10 @@ async def guardian_verify(request: Request, req: VerifyReq):
         exp = NONCES.get(nonce)
         if not exp or exp < now:
             return bad("nonce-expired")
-        NONCES.pop(nonce, None)  # consume
+        NONCES.pop(nonce, None)
     except Exception:
         return bad("bad-payload")
 
-    # create session
     sid = "sess_" + secrets.token_hex(16)
     sess_exp = now + SESSION_TTL
     SESSIONS[sid] = {"kid": kid, "exp": sess_exp}
@@ -598,8 +634,7 @@ async def protected_hello(request: Request):
         await emit("rate", ip=ip, status="limit")
         write_event("rate_limit", ip=ip, path="/protected/hello")
         return bad("rate-limit")
-    auth = request.headers.get("authorization") or ""
-    token = auth.split(" ",1)[1] if auth.lower().startswith("bearer ") else ""
+    token = _auth_token(request)
     sess = require_session(token)
     if not sess:
         await emit("unauth", path="/protected/hello", ip=ip)
@@ -611,8 +646,7 @@ async def protected_hello(request: Request):
 
 @app.post("/guardian/refresh")
 async def refresh(request: Request):
-    auth = request.headers.get("authorization") or ""
-    token = auth.split(" ",1)[1] if auth.lower().startswith("bearer ") else ""
+    token = _auth_token(request)
     sess = require_session(token)
     if not sess:
         await emit("unauth", path="/guardian/refresh")
@@ -625,8 +659,7 @@ async def refresh(request: Request):
 
 @app.post("/guardian/logout")
 async def logout(request: Request):
-    auth = request.headers.get("authorization") or ""
-    token = auth.split(" ",1)[1] if auth.lower().startswith("bearer ") else ""
+    token = _auth_token(request)
     s = SESSIONS.pop(token, None)
     save_sessions()
     if s:
@@ -634,11 +667,7 @@ async def logout(request: Request):
         write_event("auth.logout", kid=s["kid"])
     return ok()
 
-# ===== Admin: events tail + CSV export (wymaga Bearer sesji) =====
-def _auth_token(request: Request) -> str:
-    auth = request.headers.get("authorization") or ""
-    return auth.split(" ",1)[1] if auth.lower().startswith("bearer ") else ""
-
+# ===== Admin: events tail + CSV export + purge =====
 @app.get("/admin/events/tail")
 def admin_tail(request: Request, n: int = Query(200, ge=1, le=2000)):
     token = _auth_token(request)
@@ -658,7 +687,6 @@ def admin_csv(request: Request, n: int = Query(500, ge=1, le=5000)):
     token = _auth_token(request)
     if not require_session(token): return bad("unauthorized")
     rows = tail_jsonl(EVENTS_JSONL, n)
-    # zbuduj uniwersalny nagłówek
     headers: List[str] = []
     flat_rows: List[Dict[str, Any]] = []
     for r in rows:
@@ -666,7 +694,6 @@ def admin_csv(request: Request, n: int = Query(500, ge=1, le=5000)):
         flat_rows.append(fr)
         for k in fr.keys():
             if k not in headers: headers.append(k)
-    # CSV
     buf = io.StringIO()
     buf.write(",".join(headers) + "\n")
     for fr in flat_rows:
@@ -675,14 +702,83 @@ def admin_csv(request: Request, n: int = Query(500, ge=1, le=5000)):
             v = fr.get(h, "")
             if isinstance(v, (dict, list)): v = json.dumps(v, ensure_ascii=False)
             s = str(v).replace('"','""')
-            # wrap only if needed
             if any(c in s for c in [",", "\n", '"']): s = f'"{s}"'
             vals.append(s)
         buf.write(",".join(vals) + "\n")
     return PlainTextResponse(buf.getvalue(), media_type="text/csv")
 
+@app.post("/admin/events/purge")
+def admin_purge(request: Request):
+    token = _auth_token(request)
+    if not require_session(token): return bad("unauthorized")
+    # backup & truncate
+    try:
+        if os.path.exists(EVENTS_JSONL):
+            ts = int(time.time())
+            os.replace(EVENTS_JSONL, f"{EVENTS_JSONL}.{ts}.bak")
+        open(EVENTS_JSONL, "w", encoding="utf-8").close()
+        write_event("admin.purge")  # zapisze już do nowego, pustego pliku
+        return ok(msg="purged")
+    except Exception as e:
+        return bad("purge-failed", error=str(e))
+
+# ===== Logs summary & health detail =====
+def _quantiles(vals: List[int]) -> Dict[str, int]:
+    if not vals: return {"p50":0,"p95":0,"avg":0,"max":0}
+    p50 = int(statistics.quantiles(vals, n=100)[49]) if len(vals) >= 2 else vals[0]
+    p95_idx = max(0, int(len(vals)*0.95) - 1)
+    p95 = sorted(vals)[p95_idx]
+    avg = int(sum(vals)/len(vals))
+    return {"p50":p50, "p95":p95, "avg":avg, "max":max(vals)}
+
+@app.get("/api/logs/summary")
+def logs_summary(n: int = Query(1000, ge=10, le=10000)):
+    rows = [r for r in tail_jsonl(EVENTS_JSONL, n) if r.get("kind")=="http"]
+    total = len(rows)
+    by_path: Dict[str,int] = {}
+    by_method: Dict[str,int] = {}
+    by_status: Dict[str,int] = {}
+    lat: List[int] = []
+    for r in rows:
+        by_path[r.get("path","?")] = by_path.get(r.get("path","?"),0)+1
+        by_method[r.get("method","?")] = by_method.get(r.get("method","?"),0)+1
+        by_status[str(r.get("status","?"))] = by_status.get(str(r.get("status","?")),0)+1
+        if isinstance(r.get("ms"), int): lat.append(r["ms"])
+    top_paths = sorted(by_path.items(), key=lambda x: x[1], reverse=True)[:5]
+    lat_q = _quantiles(lat)
+    err4 = sum(v for k,v in by_status.items() if k.startswith("4"))
+    err5 = sum(v for k,v in by_status.items() if k.startswith("5"))
+    return {
+        "ok": True,
+        "total": total,
+        "paths_top5": top_paths,
+        "methods": by_method,
+        "statuses": by_status,
+        "latency_ms": lat_q,
+        "errors": {"4xx": err4, "5xx": err5}
+    }
+
+@app.get("/api/health/detail")
+def health_detail(n: int = Query(200, ge=20, le=5000)):
+    rows = [r for r in tail_jsonl(EVENTS_JSONL, n) if r.get("kind")=="http"]
+    lat = [r["ms"] for r in rows if isinstance(r.get("ms"), int)]
+    lat_q = _quantiles(lat)
+    codes: Dict[str,int] = {}
+    for r in rows:
+        k = str(r.get("status","?")); codes[k] = codes.get(k,0)+1
+    return {
+        "ok": True,
+        "ts": int(time.time()),
+        "version": API_VERSION,
+        "uptime_s": int(time.time()) - BOOT_TS,
+        "req_count": REQ_COUNT,
+        "rate_window_s": RATE_WINDOW,
+        "latency_ms": lat_q,
+        "codes": codes,
+        "sample_size": len(rows)
+    }
+
 # ===== AR engine (stub / R&D) =====
 @app.get("/ar/ping")
 def ar_ping():
     return {"ok": True, "engine":"stub", "ts": int(time.time())}
-
