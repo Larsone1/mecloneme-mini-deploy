@@ -8,21 +8,94 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from nacl.signing import VerifyKey
 
-# ===== Helpers: base64url =====
+# ===== Config loader with anti-duplicate aliases =====
+def _parse_mc_config() -> Dict[str, Any]:
+    raw = os.getenv("MC_CONFIG", "").strip()
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        # awaryjnie: prosty "key=value;key2=value2"
+        cfg: Dict[str, Any] = {}
+        for item in raw.split(";"):
+            if "=" in item:
+                k, v = item.split("=", 1)
+                cfg[k.strip()] = v.strip()
+        return cfg
+
+_MC = _parse_mc_config()
+
+def _pick_str(json_key: str, env_aliases: List[str], default: str) -> str:
+    if json_key in _MC:
+        return str(_MC[json_key])
+    for k in env_aliases:
+        v = os.getenv(k)
+        if v is not None and v != "":
+            return str(v)
+    return default
+
+def _pick_int(json_key: str, env_aliases: List[str], default: int) -> int:
+    if json_key in _MC:
+        try:
+            return int(_MC[json_key])
+        except Exception:
+            pass
+    for k in env_aliases:
+        v = os.getenv(k)
+        if v is not None and v != "":
+            try:
+                return int(v)
+            except Exception:
+                continue
+    return default
+
+def _pick_float(json_key: str, env_aliases: List[str], default: float) -> float:
+    if json_key in _MC:
+        try:
+            return float(_MC[json_key])
+        except Exception:
+            pass
+    for k in env_aliases:
+        v = os.getenv(k)
+        if v is not None and v != "":
+            try:
+                return float(v)
+            except Exception:
+                continue
+    return default
+
+def _pick_csv(json_key: str, env_aliases: List[str], default: str) -> str:
+    if json_key in _MC:
+        return str(_MC[json_key])
+    for k in env_aliases:
+        v = os.getenv(k)
+        if v is not None and v != "":
+            return str(v)
+    return default
+
+# ===== Helpers =====
 def b64u_decode(s: str) -> bytes:
     s = s or ""
     s += "=" * (-len(s) % 4)
     return base64.urlsafe_b64decode(s.encode())
 
-# ===== Config (ENV) =====
-API_VERSION = os.getenv("API_VERSION", "0.3.5")
-NONCE_TTL   = int(os.getenv("NONCE_TTL", "300"))
-SESSION_TTL = int(os.getenv("SESSION_TTL", "3600"))
-P95_WARN    = int(os.getenv("P95_WARN", "300"))
-P95_CRIT    = int(os.getenv("P95_CRIT", "800"))
-RATE_WINDOW = int(os.getenv("RATE_WINDOW", "60"))
-RATE_MAX    = int(os.getenv("RATE_MAX", "120"))
-THEME       = os.getenv("THEME", "dark")  # dark | light
+# ===== Config (ENV+aliases) =====
+API_VERSION = _pick_str("api_version", ["MC_API_VERSION","API_VERSION"], "0.3.6")
+THEME       = _pick_str("theme",       ["MC_THEME","THEME"], "dark")  # dark | light
+
+NONCE_TTL   = _pick_int("nonce_ttl",   ["MC_NONCE_TTL","NONCE_TTL"], 300)
+SESSION_TTL = _pick_int("session_ttl", ["MC_SESSION_TTL","SESSION_TTL"], 3600)
+
+RATE_WINDOW = _pick_int("rate_window", ["MC_RATE_WINDOW","RATE_WINDOW"], 60)
+RATE_MAX    = _pick_int("rate_max",    ["MC_RATE_MAX","RATE_MAX"], 120)
+
+P95_WARN    = _pick_int("p95_warn",    ["MC_P95_WARN","P95_WARN"], 300)
+P95_CRIT    = _pick_int("p95_crit",    ["MC_P95_CRIT","P95_CRIT"], 800)
+
+METRICS_TTL = _pick_float("metrics_ttl", ["MC_METRICS_TTL","METRICS_TTL"], 2.0)
+AUDIT_SAMPLE_N = _pick_int("audit_sample_n", ["MC_AUDIT_SAMPLE_N","AUDIT_SAMPLE_N"], 1)
+SKIP_AUDIT_PATHS = set(_pick_csv("skip_audit_paths", ["MC_SKIP_AUDIT_PATHS","SKIP_AUDIT_PATHS"], "/metrics,/health,/ar/ping").split(","))
 
 # ===== Models =====
 class PubKey(BaseModel):
@@ -101,9 +174,6 @@ PROGRESS_PATH = os.path.join(DATA_DIR, "progress.json")
 BOOT_TS = int(time.time())
 REQ_COUNT = 0
 
-METRICS_TTL = float(os.getenv("METRICS_TTL", "2"))            # seconds to cache /metrics
-AUDIT_SAMPLE_N = int(os.getenv("AUDIT_SAMPLE_N", "1"))        # 1 = every request; 10 ≈ 10%
-SKIP_AUDIT_PATHS = set((os.getenv("SKIP_AUDIT_PATHS", "/metrics,/health,/ar/ping").split(",")))
 METRICS_CACHE = {"ts": 0.0, "body": ""}
 
 # ===== Utils =====
@@ -201,7 +271,6 @@ def new_session(kid: str) -> SessionInfo:
     _save_json(SESSIONS_PATH, SESSIONS)
     return SessionInfo(kid=kid, sid=sid, exp=exp)
 
-# ===== Rate helper =====
 def rate_is_hot(ip: str) -> Optional[int]:
     cnt = len(RATE.get(ip, []))
     return cnt if cnt >= int(RATE_MAX * 0.8) else None
@@ -350,7 +419,7 @@ def _theme_vars(theme: str) -> Dict[str, str]:
         "ok": "#4ade80", "warn": "#fbbf24", "crit": "#f87171", "btn": "#0f1720"
     }
 
-# ===== UI renderers (safe tokens, no .format in HTML) =====
+# ===== UI renderers (no .format in HTML) =====
 def render_panel_html() -> str:
     v = _theme_vars(THEME)
     css = (
@@ -416,7 +485,7 @@ $("refreshProgress").onclick=loadProgress; loadProgress();
 $("refreshGantt").onclick=()=>{ const img=$("gantt"); img.src='/progress/gantt.svg?ts='+Date.now(); };
 </script>
 '''
-    return tpl.replace("__CSS__", css).replace("__API_VERSION__", API_VERSION).replace("__THEME__", THEME)
+    return tpl.replace("__API_VERSION__", API_VERSION).replace("__THEME__", THEME).replace("__CSS__", css)
 
 def render_mobile_html() -> str:
     v = _theme_vars(THEME)
@@ -447,6 +516,12 @@ def render_mobile_html() -> str:
     return tpl.replace("__CSS__", css)
 
 # ===== UI endpoints =====
+app = FastAPI(title="MeCloneMe Mini API", version=API_VERSION)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
+)
+
 @app.get("/", response_class=HTMLResponse)
 def root():
     return HTMLResponse(render_panel_html())
@@ -461,6 +536,10 @@ def health():
     return {"ok": True, "version": API_VERSION, "ts": int(time.time())}
 
 # ===== Keys =====
+class PubKey(BaseModel):
+    kid: str
+    key: str
+
 @app.get("/auth/keys")
 def list_keys():
     return {"ok": True, "keys": [{"kid": k, "key": v} for k, v in PUBKEYS.items()]}
@@ -479,7 +558,7 @@ def del_key(kid: str):
     write_event("keys", action="del", kid=kid)
     return {"ok": True}
 
-# ===== Auth (JWS diag) =====
+# ===== Auth diag =====
 @app.get("/auth/challenge")
 def get_challenge(aud: str = Query("diag")):
     ch = new_nonce(aud)
@@ -500,34 +579,24 @@ def diag_echo_signed(req: SignedJWS, request: Request):
         return JSONResponse({"ok": False, "err": code}, status_code=400)
     try:
         parts = (req.jws or "").split(".")
-        if len(parts) != 3:
-            return bad("bad-jws")
+        if len(parts) != 3: return bad("bad-jws")
         h, p, s = parts
-        hdr = json.loads(b64u_decode(h))
-        kid = hdr.get("kid")
-        if not kid or kid not in PUBKEYS:
-            return bad("unknown-kid")
+        hdr = json.loads(b64u_decode(h)); kid = hdr.get("kid")
+        if not kid or kid not in PUBKEYS: return bad("unknown-kid")
         sig = base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
         msg = (h + "." + p).encode()
         pk = base64.urlsafe_b64decode(PUBKEYS[kid] + "=" * (-len(PUBKEYS[kid]) % 4))
         VerifyKey(pk).verify(msg, sig)
         payload = json.loads(b64u_decode(p))
-        now = int(time.time())
-        nonce = payload.get("nonce")
-        if not nonce or nonce not in NONCES:
-            return bad("nonce-expired")
-        if payload.get("aud") != "diag":
-            return bad("bad-aud")
+        now = int(time.time()); nonce = payload.get("nonce")
+        if not nonce or nonce not in NONCES: return bad("nonce-expired")
+        if payload.get("aud") != "diag":   return bad("bad-aud")
         exp = NONCES.get(nonce)
-        if not exp or exp < now:
-            return bad("nonce-expired")
+        if not exp or exp < now:           return bad("nonce-expired")
         NONCES.pop(nonce, None)
     except Exception:
         return bad("bad-payload")
-    base = diag_echo(request)
-    base["verified"] = True
-    base["kid"] = kid
-    base["payload"] = payload
+    base = diag_echo(request); base["verified"] = True; base["kid"] = kid; base["payload"] = payload
     return base
 
 # ===== Metrics =====
@@ -564,7 +633,7 @@ def metrics():
     METRICS_CACHE["body"] = body
     return PlainTextResponse(body, media_type="text/plain; version=0.0.4")
 
-# ===== Series endpoint =====
+# ===== Series =====
 @app.get("/api/series")
 def series(minutes: int = Query(30, ge=1, le=240)):
     return _compute_series(minutes)
@@ -638,7 +707,7 @@ def export_s3_like(inp: ExportS3Like):
     except Exception as e:
         return JSONResponse({"ok": False, "err": str(e)}, status_code=502)
 
-# ===== Progress API + Gantt =====
+# ===== Progress + Gantt =====
 GANTT_PLAN = [
     ("N01 — SSOT / Router-README", 0, 3),
     ("N27 — Docs & OpenAPI",       0, 12),
@@ -707,15 +776,11 @@ def set_progress(payload: Dict[str, Any]):
     mods = _load_progress()
     if "modules" in payload and isinstance(payload["modules"], dict):
         for k, v in payload["modules"].items():
-            try:
-                mods[k] = int(v)
-            except Exception:
-                pass
+            try: mods[k] = int(v)
+            except Exception: pass
     if "module" in payload and "percent" in payload:
-        try:
-            mods[payload["module"]] = int(payload["percent"])
-        except Exception:
-            pass
+        try: mods[payload["module"]] = int(payload["percent"])
+        except Exception: pass
     _save_progress(mods)
     return {"ok": True, "overall": _progress_overall(mods), "modules": mods}
 
@@ -726,7 +791,6 @@ async def emit_alert(level: str, msg: str, cooldown_s: int = 5, **extra):
     last = LAST_ALERT_TS.get(key, 0)
     if now - last < cooldown_s:
         return
-    LAST_ALERTTS = now
     LAST_ALERT_TS[key] = now
     entry = Alert(level=level, msg=msg, ts=now, extra=extra).dict()
     ALERTS.append(entry)
@@ -738,6 +802,10 @@ def list_alerts():
     return {"ok": True, "alerts": ALERTS[-50:]}
 
 # ===== Snapshots / Ingest =====
+class Snapshot(BaseModel):
+    tag: str
+    payload: Dict[str, Any]
+
 @app.post("/snapshots")
 def save_snapshot(s: Snapshot):
     name = re.sub(r"[^a-zA-Z0-9_-]", "_", s.tag)[:48]
@@ -745,6 +813,10 @@ def save_snapshot(s: Snapshot):
     with open(path, "w", encoding="utf-8") as f:
         json.dump({"ts": int(time.time()), "payload": s.payload}, f)
     return {"ok": True, "path": path}
+
+class IngestPayload(BaseModel):
+    tag: Optional[str] = "default"
+    data: Dict[str, Any]
 
 @app.post("/ingest")
 def ingest(inp: IngestPayload):
@@ -754,4 +826,3 @@ def ingest(inp: IngestPayload):
 
 # ===== Startup =====
 load_stores()
-
