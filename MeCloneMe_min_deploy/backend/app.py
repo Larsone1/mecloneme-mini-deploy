@@ -80,7 +80,7 @@ def b64u_decode(s: str) -> bytes:
     return base64.urlsafe_b64decode(s.encode())
 
 # ===== Config =====
-API_VERSION = _pick_str("api_version", ["MC_API_VERSION","API_VERSION"], "0.3.9")
+API_VERSION = _pick_str("api_version", ["MC_API_VERSION","API_VERSION"], "0.3.10")
 THEME       = _pick_str("theme",       ["MC_THEME","THEME"], "dark")  # dark | light
 
 NONCE_TTL   = _pick_int("nonce_ttl",   ["MC_NONCE_TTL","NONCE_TTL"], 300)
@@ -172,7 +172,7 @@ def load_stores():
     PUBKEYS = _load_json(PUBKEYS_PATH, {})
     SESSIONS = _load_json(SESSIONS_PATH, {})
 
-# ===== Percentyle i metryki =====
+# ===== Percentyle/metryki =====
 def _percentile(values: List[int], p: float) -> int:
     if not values:
         return 0
@@ -276,7 +276,7 @@ def _theme_vars(theme: str) -> Dict[str, str]:
         "ok":"#4ade80","warn":"#fbbf24","crit":"#f87171","btn":"#0f1720"
     }
 
-# ===== UI (bez listy %; Gantt inline) =====
+# ===== UI (paski postępu; bez listy i bez Gantta) =====
 def render_panel_html() -> str:
     v = _theme_vars(THEME)
     css = (":root{"
@@ -305,7 +305,7 @@ def render_panel_html() -> str:
       <button id="diag" class="btn">Diag challenge</button>
       <a href="/ar/stub/avatar.svg?mood=happy" class="btn" target="_blank">AR avatar (SVG)</a>
       <button id="refreshProgress" class="btn">Odśwież postęp</button>
-      <button id="refreshGantt" class="btn">Odśwież Gantta</button>
+      <button id="refreshBars" class="btn">Odśwież paski</button>
     </div>
     <small>v__API_VERSION__ • motyw: __THEME__</small>
   </div>
@@ -320,8 +320,8 @@ def render_panel_html() -> str:
     <div class="card">
       <h3 style="margin:6px 0">Postęp MeCloneMe</h3>
       <div class="meter"><i id="overall" style="width:0%"></i></div>
-      <div class="legend" style="margin-top:6px">Zielony = zrealizowane, szary = zakres planu (30 dni)</div>
-      <div id="ganttBox" style="margin-top:10px;border:1px solid var(--bd);border-radius:8px;overflow:hidden"></div>
+      <div class="legend" style="margin-top:6px">Zielony = zrealizowane, jaśniejszy szary = pozostały zakres</div>
+      <div id="barsBox" style="margin-top:10px;border:1px solid var(--bd);border-radius:8px;overflow:hidden"></div>
     </div>
   </div>
 
@@ -335,11 +335,11 @@ $("health").onclick=async()=>{ const r=await fetch("/api/health"); $("metOut").t
 $("spark").onclick=async()=>{ const r=await fetch("/api/series"); const j=await r.json(); const cv=$("sparkCanvas"),ctx=cv.getContext("2d"); ctx.clearRect(0,0,cv.width,cv.height); const s=j.series||[]; if(!s.length) return; const pad=6,w=cv.width-pad*2,h=cv.height-pad*2; const maxC=Math.max(...s.map(x=>x.count)); ctx.beginPath(); s.forEach((x,i)=>{const y=h*(1-(x.count/(maxC||1))); const X=pad+i*(w/(s.length-1)); if(i)ctx.lineTo(X,y); else ctx.moveTo(X,y);}); ctx.lineWidth=2; ctx.strokeStyle=getComputedStyle(document.documentElement).getPropertyValue('--ok'); ctx.stroke(); };
 
 async function loadProgress(){ const r=await fetch('/progress'); const j=await r.json(); $("overall").style.width=(j.overall||0)+"%"; }
-async function loadGantt(){ try{ const r=await fetch('/progress/gantt.svg?ts='+Date.now()); const svg=await r.text(); $("ganttBox").innerHTML = svg; } catch(e) { $("ganttBox").innerHTML='<div style="padding:8px">Nie udało się załadować Gantta.</div>'; } }
+async function loadBars(){ try{ const r=await fetch('/progress/bars.svg?ts='+Date.now()); const svg=await r.text(); $("barsBox").innerHTML = svg; } catch(e) { $("barsBox").innerHTML='<div style="padding:8px">Nie udało się załadować pasków.</div>'; } }
 
 $("refreshProgress").onclick=loadProgress;
-$("refreshGantt").onclick=loadGantt;
-loadProgress(); loadGantt();
+$("refreshBars").onclick=loadBars;
+loadProgress(); loadBars();
 </script>
 '''
     return tpl.replace("__API_VERSION__", API_VERSION).replace("__THEME__", THEME).replace("__CSS__", css)
@@ -362,14 +362,14 @@ def render_mobile_html() -> str:
 <div class="card">
   <div>Postęp MeCloneMe</div>
   <div class="meter"><i id="ov" style="width:0%"></i></div>
-  <div class="legend" style="margin-top:6px">Zielony = zrealizowane, szary = plan</div>
-  <div id="ganttM" style="width:100%;margin-top:8px;border:1px solid var(--bd);border-radius:8px;overflow:hidden"></div>
+  <div class="legend" style="margin-top:6px">Zielony = zrealizowane, jaśniejszy szary = pozostały zakres</div>
+  <div id="barsM" style="width:100%;margin-top:8px;border:1px solid var(--bd);border-radius:8px;overflow:hidden"></div>
 </div>
 <script>
 (async()=>{ 
   const r=await fetch('/progress'); const j=await r.json(); 
   document.getElementById('ov').style.width=(j.overall||0)+'%'; 
-  try{ const svg=await (await fetch('/progress/gantt.svg?ts='+Date.now())).text(); document.getElementById('ganttM').innerHTML=svg; }catch(e){ document.getElementById('ganttM').innerHTML='(brak Gantta)'; }
+  try{ const svg=await (await fetch('/progress/bars.svg?ts='+Date.now())).text(); document.getElementById('barsM').innerHTML=svg; }catch(e){ document.getElementById('barsM').innerHTML='(brak pasków)'; }
 })();
 </script>
 '''
@@ -474,19 +474,17 @@ def ar_stub_state(): return {"ok": True, "mood": "neutral", "ts": int(time.time(
 # ===== Export / Telemetria =====
 class ExportWebhook(BaseModel):
     url: str; payload: Optional[Dict[str, Any]] = None; headers: Optional[Dict[str, str]] = None
+
 def _http_post_json(url: str, payload: Dict[str, Any], headers: Optional[Dict[str, str]] = None, timeout_s: int = 3) -> Dict[str, Any]:
     import urllib.request, json as _json
-    data=_json.dumps(payload).encode(); req=_urllib_request(url,data,headers,timeout_s)
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-        body=resp.read().decode("utf-8","ignore"); return {"status": resp.status, "body": body}
-
-def _urllib_request(url: str, data: bytes, headers: Optional[Dict[str,str]], timeout_s: int):
-    import urllib.request
+    data=_json.dumps(payload).encode()
     req=urllib.request.Request(url, data=data, method="POST")
     req.add_header("Content-Type","application/json")
-    if headers: 
+    if headers:
         for k,v in headers.items(): req.add_header(k,v)
-    return req
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        body=resp.read().decode("utf-8","ignore")
+        return {"status": resp.status, "body": body}
 
 @app.post("/export/webhook")
 def export_webhook(inp: ExportWebhook):
@@ -512,7 +510,7 @@ def export_s3_like(inp: ExportS3Like):
         with urllib.request.urlopen(req, timeout=5) as resp: return {"ok": 200 <= resp.status < 400, "status": resp.status}
     except Exception as e: return JSONResponse({"ok": False, "err": str(e)}, status_code=502)
 
-# ===== Progress + Gantt =====
+# ===== Progress (paski) =====
 PROGRESS_DEFAULT: Dict[str, int] = {
     "N01 — SSOT / Router-README": 55,
     "N18 — Panel CEO": 35,
@@ -534,77 +532,54 @@ def _progress_overall(mods: Dict[str, int]) -> int:
     vals=[max(0, min(100, int(v))) for v in mods.values()]
     return int(sum(vals)/len(vals))
 
-GANTT_PLAN = [
-    ("N01 — SSOT / Router-README", 0, 3),
-    ("N27 — Docs & OpenAPI",       0, 12),
-    ("N18 — Panel CEO",            0, 7),
-    ("N22 — Testy & QA",           2, 5),
-    ("N30 — Core (Live+AR+Guardian)", 0, 12),
-    ("N04 — Mobile (Camera/Mic)",  3, 10),
-    ("N05 — Desktop (Bridge)",     6, 8),
-    ("N09 — Guardian",             8, 12),
-    ("N21 — SDK / API Clients",    10, 6),
-]
-
 @app.get("/progress")
 def get_progress():
     mods=_load_progress(); return {"ok": True, "overall": _progress_overall(mods), "modules": mods}
 
-@app.get("/progress/gantt.json")
-def gantt_json():
-    today=datetime.utcnow().date(); items=[]
-    for name,off,dur in GANTT_PLAN:
-        start=today+timedelta(days=off); end=start+timedelta(days=dur)
-        items.append({"module":name,"start":start.isoformat(),"end":end.isoformat(),"duration":dur})
-    return {"ok": True, "today": today.isoformat(), "items": items}
-
-@app.get("/progress/gantt.svg", response_class=PlainTextResponse)
-def gantt_svg():
-    """Gantt: szary plan (pełny odcinek), zielone wypełnienie (procent zrealizowany) + etykieta XX%."""
-    days_total=30; row_h=26; pad_x,pad_y=80,24; width=900; height=pad_y*2 + row_h*len(GANTT_PLAN)
-    day_w=(width - pad_x - 20)/days_total
-    v=_theme_vars(THEME); grid=v['bd']; done=v['ok']; text=v['tx']
+@app.get("/progress/bars.svg", response_class=PlainTextResponse)
+def bars_svg():
+    """
+    Proste paski postępu:
+      • stała kolumna tytułów po lewej (wyściełana tak, by nie nachodziły napisy)
+      • jasnoszary pełny pasek planu
+      • zielone wypełnienie = % realizacji
+      • etykieta XX% przy prawej krawędzi zielonego, czarnym kolorem
+    """
     mods=_load_progress()
+    # układ
+    width=900
+    title_col=270  # odsunięcie pasków w prawo (dopasowane do najdłuższego "N01 — ...")
+    row_h=28
+    pad_y=16
+    inner_pad_x=10
+    avail = width - title_col - 20
+    height = pad_y*2 + row_h*len(mods)
+
+    v=_theme_vars(THEME)
+    text=v['tx']
+    plan="#9aa3af"   # jaśniejszy, dobrze widoczny szary (na dark tle)
+    done=v['ok']
+    label="#000000"  # czarna etykieta %
 
     parts=[f"<svg xmlns='http://www.w3.org/2000/svg' width='{width}' height='{height}' viewBox='0 0 {width} {height}'>",
            f"<rect x='0' y='0' width='{width}' height='{height}' fill='transparent'/>",
-           f"<g stroke='{grid}' stroke-width='1'>"]
-    # siatka dzienna
-    for d in range(days_total+1):
-        x=pad_x + d*day_w
-        parts.append(f"<line x1='{x:.1f}' y1='{pad_y-8}' x2='{x:.1f}' y2='{height-pad_y}' opacity='0.35' />")
-    parts.append("</g>")
-    # etykiety 0d/5d...
-    parts.append(f"<g fill='{text}' font-size='11'>")
-    for d in range(0, days_total+1, 5):
-        x=pad_x + d*day_w
-        parts.append(f"<text x='{x:.1f}' y='{pad_y-12}' text-anchor='middle'>{d}d</text>")
-    parts.append("</g>")
-
-    # paski
+           f"<g fill='{text}' font-size='13'>"]
     y=pad_y
-    parts.append(f"<g fill='{text}' font-size='13'>")
-    for name,off,dur in GANTT_PLAN:
-        # podpis po lewej
-        parts.append(f"<text x='10' y='{y+row_h-8}'>{name}</text>")
-        x=pad_x + off*day_w; w=max(2.0, dur*day_w)
-        # tło planu (szary)
-        parts.append(f"<rect x='{x:.1f}' y='{y+5}' rx='6' ry='6' width='{w:.1f}' height='{row_h-10}' fill='{grid}' opacity='0.55' />")
-        # wypełnienie (zielone) wg % z pliku progress
-        p=max(0, min(100, int(mods.get(name, 0))))
-        fill_w=max(0.0, w * (p/100.0))
-        if fill_w > 0.0:
-            parts.append(f"<rect x='{x:.1f}' y='{y+5}' rx='6' ry='6' width='{fill_w:.1f}' height='{row_h-10}' fill='{done}' opacity='0.95' />")
-            # etykieta % przy prawej krawędzi zielonego odcinka
-            # jeśli za wąsko, to etykieta tuż za zielonym, inaczej - wewnątrz i wyrównana do prawej
-            if fill_w < 28:
-                tx = x + fill_w + 14
-                anchor = "start"
-            else:
-                tx = x + fill_w - 6
-                anchor = "end"
-            parts.append(f"<text x='{tx:.1f}' y='{y+row_h-8}' text-anchor='{anchor}' font-size='12' fill='{text}'>{p}%</text>")
-        y+=row_h
+    for name, percent in mods.items():
+        # tytuł po lewej
+        parts.append(f"<text x='10' y='{y+row_h-10}'>{name}</text>")
+        # tło planu (jasnoszary)
+        parts.append(f"<rect x='{title_col:.1f}' y='{y+6}' rx='7' ry='7' width='{avail:.1f}' height='{row_h-12}' fill='{plan}' opacity='0.85' />")
+        # wypełnienie (zielone)
+        p=max(0, min(100, int(percent)))
+        fill_w = max(0.0, avail * (p/100.0))
+        if fill_w > 0:
+            parts.append(f"<rect x='{title_col:.1f}' y='{y+6}' rx='7' ry='7' width='{fill_w:.1f}' height='{row_h-12}' fill='{done}' opacity='0.98' />")
+            # etykieta % (czarna)
+            tx = title_col + fill_w - 6 if fill_w >= 30 else title_col + fill_w + 10
+            anchor = "end" if fill_w >= 30 else "start"
+            parts.append(f"<text x='{tx:.1f}' y='{y+row_h-10}' text-anchor='{anchor}' font-size='12' fill='{label}'>{p}%</text>")
+        y += row_h
     parts.append("</g></svg>")
     return PlainTextResponse("".join(parts), media_type="image/svg+xml")
 
