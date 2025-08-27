@@ -80,7 +80,7 @@ def b64u_decode(s: str) -> bytes:
     return base64.urlsafe_b64decode(s.encode())
 
 # ===== Config =====
-API_VERSION = _pick_str("api_version", ["MC_API_VERSION","API_VERSION"], "0.3.8")
+API_VERSION = _pick_str("api_version", ["MC_API_VERSION","API_VERSION"], "0.3.9")
 THEME       = _pick_str("theme",       ["MC_THEME","THEME"], "dark")  # dark | light
 
 NONCE_TTL   = _pick_int("nonce_ttl",   ["MC_NONCE_TTL","NONCE_TTL"], 300)
@@ -110,6 +110,8 @@ os.makedirs(DATA_DIR, exist_ok=True); os.makedirs(LOG_DIR, exist_ok=True); os.ma
 PUBKEYS: Dict[str, str] = {}
 SESSIONS: Dict[str, Dict[str, Any]] = {}
 RATE: Dict[str, List[int]] = {}
+ALERTS: List[Dict[str, Any]] = []
+LAST_ALERT_TS: Dict[str, int] = {}
 
 PUBKEYS_PATH = os.path.join(DATA_DIR, "pubkeys.json")
 SESSIONS_PATH = os.path.join(DATA_DIR, "sessions.json")
@@ -170,117 +172,7 @@ def load_stores():
     PUBKEYS = _load_json(PUBKEYS_PATH, {})
     SESSIONS = _load_json(SESSIONS_PATH, {})
 
-# ===== Alerts =====
-class Alert(BaseModel):
-    level: str
-    msg: str
-    ts: int
-    extra: Optional[Dict[str, Any]] = None
-
-ALERTS: List[Dict[str, Any]] = []
-LAST_ALERT_TS: Dict[str, int] = {}
-
-async def emit_alert(level: str, msg: str, cooldown_s: int = 5, **extra):
-    now = int(time.time())
-    key = f"{level}:{msg}"
-    last = LAST_ALERT_TS.get(key, 0)
-    if now - last < cooldown_s:
-        return
-    LAST_ALERT_TS[key] = now
-    entry = Alert(level=level, msg=msg, ts=now, extra=extra).dict()
-    ALERTS.append(entry)
-    ALERTS[:] = ALERTS[-200:]
-    write_shadow(kind="alert", **entry)
-
-# ===== Progress =====
-PROGRESS_DEFAULT: Dict[str, int] = {
-    "N01 — SSOT / Router-README": 55,
-    "N18 — Panel CEO": 35,
-    "N22 — Testy & QA": 25,
-    "N04 — Mobile (Camera/Mic)": 20,
-    "N05 — Desktop (Bridge)": 20,
-    "N09 — Guardian": 30,
-    "N21 — SDK / API Clients": 15,
-    "N27 — Docs & OpenAPI": 30,
-    "N30 — Core (Live+AR+Guardian)": 40,
-}
-
-def _load_progress() -> Dict[str, int]:
-    obj = _load_json(PROGRESS_PATH, {})
-    if not obj:
-        obj = PROGRESS_DEFAULT.copy()
-        _save_json(PROGRESS_PATH, obj)
-    return obj
-
-def _save_progress(obj: Dict[str, int]):
-    _save_json(PROGRESS_PATH, obj)
-
-def _progress_overall(mods: Dict[str, int]) -> int:
-    if not mods:
-        return 0
-    vals = [max(0, min(100, int(v))) for v in mods.values()]
-    return int(sum(vals) / len(vals))
-
-# ===== Nonces & Sessions =====
-NONCES: Dict[str, int] = {}
-
-def new_nonce(aud: str):
-    nonce = base64.urlsafe_b64encode(secrets.token_bytes(24)).decode().rstrip("=")
-    ts = int(time.time())
-    NONCES[nonce] = ts + NONCE_TTL
-    return {"aud": aud, "nonce": nonce, "ts": ts}
-
-def new_session(kid: str):
-    sid = base64.urlsafe_b64encode(secrets.token_bytes(18)).decode().rstrip("=")
-    exp = int(time.time()) + SESSION_TTL
-    SESSIONS[sid] = {"kid": kid, "exp": exp}
-    _save_json(SESSIONS_PATH, SESSIONS)
-    return {"kid": kid, "sid": sid, "exp": exp}
-
-def rate_is_hot(ip: str) -> Optional[int]:
-    cnt = len(RATE.get(ip, []))
-    return cnt if cnt >= int(RATE_MAX * 0.8) else None
-
-# ===== WebSocket echo =====
-@app.websocket("/ws/echo")
-async def ws_echo(ws: WebSocket):
-    await ws.accept()
-    try:
-        while True:
-            msg = await ws.receive_text()
-            await ws.send_text(msg)
-    except WebSocketDisconnect:
-        pass
-
-# ===== Middleware: audit & metrics =====
-@app.middleware("http")
-async def audit_mw(request: Request, call_next):
-    global REQ_COUNT
-    t0 = time.perf_counter()
-    ip = request.client.host if request.client else "?"
-    path = request.url.path
-    method = request.method
-    status = 500
-    try:
-        response = await call_next(request)
-        status = getattr(response, "status_code", 200)
-        return response
-    finally:
-        ms = int((time.perf_counter() - t0) * 1000)
-        REQ_COUNT += 1
-        reqno = REQ_COUNT
-        if path in SKIP_AUDIT_PATHS:
-            return
-        if AUDIT_SAMPLE_N > 1 and (reqno % AUDIT_SAMPLE_N) != 0:
-            return
-        write_event("http", ip=ip, method=method, path=path, status=status, ms=ms)
-        if status >= 500:
-            await emit_alert("crit", "HTTP 5xx", cooldown_s=10, path=path, code=status)
-        hot = rate_is_hot(ip)
-        if hot is not None:
-            await emit_alert("warn", "Rate hot", cooldown_s=15, ip=ip, count=hot, limit=RATE_MAX)
-
-# ===== Percentiles =====
+# ===== Percentyle i metryki =====
 def _percentile(values: List[int], p: float) -> int:
     if not values:
         return 0
@@ -306,7 +198,6 @@ def _lat_stats(vals: List[int]) -> Dict[str, int]:
         "max": max(vals),
     }
 
-# ===== Metrics builders =====
 def _compute_summary(n: int) -> Dict[str, Any]:
     rows = [r for r in tail_jsonl(EVENTS_JSONL, n) if r.get("kind") == "http"]
     by_status: Dict[str, int] = {}
@@ -373,7 +264,7 @@ def _compute_health(n: int) -> Dict[str, Any]:
         "thresholds": {"warn": P95_WARN, "crit": P95_CRIT},
     }
 
-# ===== Theming & UI renderers (inline Gantt + editor) =====
+# ===== Theming =====
 def _theme_vars(theme: str) -> Dict[str, str]:
     if theme == "light":
         return {
@@ -385,6 +276,7 @@ def _theme_vars(theme: str) -> Dict[str, str]:
         "ok":"#4ade80","warn":"#fbbf24","crit":"#f87171","btn":"#0f1720"
     }
 
+# ===== UI (bez listy %; Gantt inline) =====
 def render_panel_html() -> str:
     v = _theme_vars(THEME)
     css = (":root{"
@@ -398,15 +290,13 @@ def render_panel_html() -> str:
   .wrap { padding:16px; max-width:980px; margin:0 auto; }
   .card { border:1px solid var(--bd); border-radius:10px; padding:12px; background:var(--card); margin:10px 0; }
   .btn { padding:8px 12px; border:1px solid var(--bd); border-radius:8px; background:var(--btn); color:var(--tx); cursor:pointer; }
-  .btn[disabled] { opacity:.5; cursor:default; }
   .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
   .kv { font:12px/1.2 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas; }
   .meter { height:10px; background:var(--bd); border-radius:999px; position:relative; overflow:hidden; }
   .meter>i { position:absolute; left:0; top:0; bottom:0; background:linear-gradient(90deg,var(--ok),#22d3ee); border-radius:999px; }
-  .grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
-  .rowm { display:grid; grid-template-columns: 1fr auto 64px; gap:8px; align-items:center; }
-  input[type=number]{ width:64px; padding:6px; border-radius:8px; border:1px solid var(--bd); background:#0a0f14; color:var(--tx); }
-  @media (max-width:720px) { .grid { grid-template-columns:1fr; } .rowm{ grid-template-columns: 1fr auto 64px; } }
+  .grid { display:grid; grid-template-columns:260px 1fr; gap:10px; }
+  @media (max-width:820px) { .grid { grid-template-columns:1fr; } }
+  .legend { font-size:12px; opacity:.8; }
 </style>
 <div class="wrap">
   <div class="card">
@@ -416,8 +306,6 @@ def render_panel_html() -> str:
       <a href="/ar/stub/avatar.svg?mood=happy" class="btn" target="_blank">AR avatar (SVG)</a>
       <button id="refreshProgress" class="btn">Odśwież postęp</button>
       <button id="refreshGantt" class="btn">Odśwież Gantta</button>
-      <button id="toggleEdit" class="btn">Edytuj</button>
-      <button id="saveAll" class="btn" style="display:none">Zapisz</button>
     </div>
     <small>v__API_VERSION__ • motyw: __THEME__</small>
   </div>
@@ -432,7 +320,7 @@ def render_panel_html() -> str:
     <div class="card">
       <h3 style="margin:6px 0">Postęp MeCloneMe</h3>
       <div class="meter"><i id="overall" style="width:0%"></i></div>
-      <div id="list" style="margin-top:8px"></div>
+      <div class="legend" style="margin-top:6px">Zielony = zrealizowane, szary = zakres planu (30 dni)</div>
       <div id="ganttBox" style="margin-top:10px;border:1px solid var(--bd);border-radius:8px;overflow:hidden"></div>
     </div>
   </div>
@@ -446,14 +334,8 @@ $("metrics").onclick=async()=>{ const r=await fetch("/metrics"); $("metOut").tex
 $("health").onclick=async()=>{ const r=await fetch("/api/health"); $("metOut").textContent=JSON.stringify(await r.json(),null,2); };
 $("spark").onclick=async()=>{ const r=await fetch("/api/series"); const j=await r.json(); const cv=$("sparkCanvas"),ctx=cv.getContext("2d"); ctx.clearRect(0,0,cv.width,cv.height); const s=j.series||[]; if(!s.length) return; const pad=6,w=cv.width-pad*2,h=cv.height-pad*2; const maxC=Math.max(...s.map(x=>x.count)); ctx.beginPath(); s.forEach((x,i)=>{const y=h*(1-(x.count/(maxC||1))); const X=pad+i*(w/(s.length-1)); if(i)ctx.lineTo(X,y); else ctx.moveTo(X,y);}); ctx.lineWidth=2; ctx.strokeStyle=getComputedStyle(document.documentElement).getPropertyValue('--ok'); ctx.stroke(); };
 
-let EDIT=false;
-$("toggleEdit").onclick=()=>{ EDIT=!EDIT; $("toggleEdit").textContent=EDIT?"Anuluj":"Edytuj"; $("saveAll").style.display=EDIT?"inline-block":"none"; renderList(window.__mods||{}); };
-$("saveAll").onclick=async()=>{ const fields=[...document.querySelectorAll('[data-k]')]; const mods={}; fields.forEach(el=>mods[el.dataset.k]=parseInt(el.value||"0",10)); const r=await fetch('/admin/progress',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({modules:mods})}); const j=await r.json(); await loadProgress(); await loadGantt(); };
-
-async function loadProgress(){ const r=await fetch('/progress'); const j=await r.json(); window.__mods=j.modules||{}; $("overall").style.width=(j.overall||0)+"%"; renderList(window.__mods); }
-function renderList(mods){ const box=$("list"); box.innerHTML=''; Object.entries(mods).forEach(([k,v])=>{ const row=document.createElement('div'); row.className='rowm'; row.style.margin='8px 0'; const title=document.createElement('div'); title.innerHTML=`<b>${k}</b>`; const bar=document.createElement('div'); bar.innerHTML=`<div class="meter"><i style="width:${v}%"></i></div>`; const edit=document.createElement('div'); edit.innerHTML=EDIT?`<input type="number" min="0" max="100" value="${v}" data-k="${k}">`:`<span>${v}%</span>`; row.appendChild(title); row.appendChild(bar); row.appendChild(edit); box.appendChild(row); }); }
-
-async function loadGantt(){ try{ const r=await fetch('/progress/gantt.svg?ts='+Date.now()); const svg=await r.text(); $("ganttBox").innerHTML = svg; } catch (e) { $("ganttBox").innerHTML='<div style="padding:8px">Nie udało się załadować Gantta.</div>'; } }
+async function loadProgress(){ const r=await fetch('/progress'); const j=await r.json(); $("overall").style.width=(j.overall||0)+"%"; }
+async function loadGantt(){ try{ const r=await fetch('/progress/gantt.svg?ts='+Date.now()); const svg=await r.text(); $("ganttBox").innerHTML = svg; } catch(e) { $("ganttBox").innerHTML='<div style="padding:8px">Nie udało się załadować Gantta.</div>'; } }
 
 $("refreshProgress").onclick=loadProgress;
 $("refreshGantt").onclick=loadGantt;
@@ -474,19 +356,19 @@ def render_mobile_html() -> str:
   .card { border:1px solid var(--bd); border-radius:12px; padding:12px; background:rgba(255,255,255,.02); }
   .meter { height:10px; background:var(--bd); border-radius:999px; position:relative; overflow:hidden; }
   .meter>i { position:absolute; left:0; top:0; bottom:0; background:linear-gradient(90deg,var(--ok),#22d3ee); border-radius:999px; }
+  .legend { font-size:12px; opacity:.8; }
 </style>
 <h2>Mobile (dark)</h2>
 <div class="card">
   <div>Postęp MeCloneMe</div>
   <div class="meter"><i id="ov" style="width:0%"></i></div>
+  <div class="legend" style="margin-top:6px">Zielony = zrealizowane, szary = plan</div>
   <div id="ganttM" style="width:100%;margin-top:8px;border:1px solid var(--bd);border-radius:8px;overflow:hidden"></div>
-  <pre id="mods" style="font:12px/1.2 ui-monospace"></pre>
 </div>
 <script>
 (async()=>{ 
   const r=await fetch('/progress'); const j=await r.json(); 
   document.getElementById('ov').style.width=(j.overall||0)+'%'; 
-  document.getElementById('mods').textContent=JSON.stringify(j.modules||{},null,2); 
   try{ const svg=await (await fetch('/progress/gantt.svg?ts='+Date.now())).text(); document.getElementById('ganttM').innerHTML=svg; }catch(e){ document.getElementById('ganttM').innerHTML='(brak Gantta)'; }
 })();
 </script>
@@ -495,215 +377,163 @@ def render_mobile_html() -> str:
 
 # ===== UI endpoints =====
 @app.get("/", response_class=HTMLResponse)
-def root():
-    return HTMLResponse(render_panel_html())
+def root(): return HTMLResponse(render_panel_html())
 
 @app.get("/mobile", response_class=HTMLResponse)
-def mobile_page():
-    return HTMLResponse(render_mobile_html())
+def mobile_page(): return HTMLResponse(render_mobile_html())
 
 # ===== Health =====
 @app.get("/api/health")
-def health():
-    return {"ok": True, "version": API_VERSION, "ts": int(time.time())}
+def health(): return {"ok": True, "version": API_VERSION, "ts": int(time.time())}
 
-# ===== Keys & Auth diag =====
-class PubKey(BaseModel):
-    kid: str
-    key: str
-
+# ===== Keys & auth diag =====
+class PubKey(BaseModel): kid: str; key: str
 @app.get("/auth/keys")
-def list_keys():
-    return {"ok": True, "keys": [{"kid": k, "key": v} for k, v in PUBKEYS.items()]}
+def list_keys(): return {"ok": True, "keys": [{"kid": k, "key": v} for k, v in PUBKEYS.items()]}
 
 @app.post("/auth/keys")
 def add_key(k: PubKey):
-    PUBKEYS[k.kid]=k.key
-    _save_json(PUBKEYS_PATH, PUBKEYS)
-    write_event("keys", action="add", kid=k.kid)
-    return {"ok": True}
+    PUBKEYS[k.kid]=k.key; _save_json(PUBKEYS_PATH, PUBKEYS); write_event("keys", action="add", kid=k.kid); return {"ok": True}
 
 @app.delete("/auth/keys/{kid}")
 def del_key(kid: str):
-    PUBKEYS.pop(kid, None)
-    _save_json(PUBKEYS_PATH, PUBKEYS)
-    write_event("keys", action="del", kid=kid)
-    return {"ok": True}
+    PUBKEYS.pop(kid, None); _save_json(PUBKEYS_PATH, PUBKEYS); write_event("keys", action="del", kid=kid); return {"ok": True}
 
 @app.get("/auth/challenge")
-def get_challenge(aud: str = Query("diag")):
-    return new_nonce(aud)
+def get_challenge(aud: str = Query("diag")): return new_nonce(aud)
 
-class SignedJWS(BaseModel):
-    jws: str
-
+class SignedJWS(BaseModel): jws: str
 @app.post("/api/diag/echo")
 def diag_echo(request: Request):
-    return {
-        "ok": True,
-        "ip": request.client.host if request.client else "?",
-        "headers": {"user-agent": (request.headers.get("user-agent") or "")[:120]},
-        "ts": int(time.time()),
-    }
+    return {"ok": True, "ip": request.client.host if request.client else "?",
+            "headers": {"user-agent": (request.headers.get("user-agent") or "")[:120]},
+            "ts": int(time.time())}
 
 @app.post("/api/diag/echo_signed")
 def diag_echo_signed(req: SignedJWS, request: Request):
-    def bad(code: str):
-        return JSONResponse({"ok": False, "err": code}, status_code=400)
+    def bad(code: str): return JSONResponse({"ok": False, "err": code}, status_code=400)
     try:
-        parts = (req.jws or "").split(".")
-        if len(parts) != 3:
-            return bad("bad-jws")
-        h, p, s = parts
-        hdr = json.loads(b64u_decode(h))
-        kid = hdr.get("kid")
-        if not kid or kid not in PUBKEYS:
-            return bad("unknown-kid")
-        sig = base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
-        msg = (h + "." + p).encode()
-        pk = base64.urlsafe_b64decode(PUBKEYS[kid] + "=" * (-len(PUBKEYS[kid]) % 4))
-        VerifyKey(pk).verify(msg, sig)
-
-        payload = json.loads(b64u_decode(p))
-        now = int(time.time())
-        nonce = payload.get("nonce")
-        if not nonce or nonce not in NONCES:
-            return bad("nonce-expired")
-        if payload.get("aud") != "diag":
-            return bad("bad-aud")
+        parts=(req.jws or "").split("."); 
+        if len(parts)!=3: return bad("bad-jws")
+        h,p,s=parts; hdr=json.loads(b64u_decode(h)); kid=hdr.get("kid")
+        if not kid or kid not in PUBKEYS: return bad("unknown-kid")
+        sig=base64.urlsafe_b64decode(s+"="*(-len(s)%4)); msg=(h+"."+p).encode()
+        pk=base64.urlsafe_b64decode(PUBKEYS[kid]+"="*(-len(PUBKEYS[kid])%4)); VerifyKey(pk).verify(msg,sig)
+        payload=json.loads(b64u_decode(p)); now=int(time.time()); nonce=payload.get("nonce")
+        if not nonce or nonce not in NONCES: return bad("nonce-expired")
+        if payload.get("aud")!="diag": return bad("bad-aud")
         exp = NONCES.get(nonce)
-        if (not exp) or (exp < now):
-            return bad("nonce-expired")
-        NONCES.pop(nonce, None)
+        if (not exp) or (exp < now): return bad("nonce-expired")
+        NONCES.pop(nonce,None)
     except Exception:
         return bad("bad-payload")
-    base = diag_echo(request)
-    base["verified"] = True
-    base["kid"] = kid
-    base["payload"] = payload
-    return base
+    base = diag_echo(request); base.update({"verified": True, "kid": kid, "payload": payload}); return base
 
 # ===== Metrics =====
 @app.get("/metrics")
 def metrics():
-    now = time.time()
+    now=time.time()
     if (now - METRICS_CACHE["ts"]) < METRICS_TTL and METRICS_CACHE["body"]:
         return PlainTextResponse(METRICS_CACHE["body"], media_type="text/plain; version=0.0.4")
-    summ = _compute_summary(1000)
-    health = _compute_health(300)
-    lines: List[str] = []
-    def h(x: str): lines.append(x)
-    h("# HELP mecloneme_uptime_seconds Service uptime in seconds")
-    h("# TYPE mecloneme_uptime_seconds gauge")
-    h(f"mecloneme_uptime_seconds {int(time.time())-BOOT_TS}")
-    h("# HELP mecloneme_requests_total Total observed HTTP requests (process lifetime)")
-    h("# TYPE mecloneme_requests_total counter")
-    h(f"mecloneme_requests_total {REQ_COUNT}")
-    h("# HELP mecloneme_sessions Current active sessions")
-    h("# TYPE mecloneme_sessions gauge")
-    h(f"mecloneme_sessions {len(SESSIONS)}")
-    h("# HELP mecloneme_pubkeys Registered public keys")
-    h("# TYPE mecloneme_pubkeys gauge")
-    h(f"mecloneme_pubkeys {len(PUBKEYS)}")
-    h("# HELP mecloneme_latency_p95_ms Recent p95 latency (ms)")
-    h("# TYPE mecloneme_latency_p95_ms gauge")
-    h(f"mecloneme_latency_p95_ms {health['latency_ms']['p95']}")
-    h("# HELP mecloneme_http_status_recent_total Recent sample status distribution")
-    h("# TYPE mecloneme_http_status_recent_total gauge")
-    for code, count in (summ.get("statuses") or {}).items():
-        h(f'mecloneme_http_status_recent_total{{code="{code}"}} {count}')
-    body = "\n".join(lines) + "\n"
-    METRICS_CACHE["ts"] = now
-    METRICS_CACHE["body"] = body
+    summ=_compute_summary(1000); health=_compute_health(300)
+    L: List[str]=[]
+    def h(x:str): L.append(x)
+    h("# HELP mecloneme_uptime_seconds Service uptime in seconds"); h("# TYPE mecloneme_uptime_seconds gauge"); h(f"mecloneme_uptime_seconds {int(time.time())-BOOT_TS}")
+    h("# HELP mecloneme_requests_total Total observed HTTP requests (process lifetime)"); h("# TYPE mecloneme_requests_total counter"); h(f"mecloneme_requests_total {REQ_COUNT}")
+    h("# HELP mecloneme_sessions Current active sessions"); h("# TYPE mecloneme_sessions gauge"); h(f"mecloneme_sessions {len(SESSIONS)}")
+    h("# HELP mecloneme_pubkeys Registered public keys"); h("# TYPE mecloneme_pubkeys gauge"); h(f"mecloneme_pubkeys {len(PUBKEYS)}")
+    h("# HELP mecloneme_latency_p95_ms Recent p95 latency (ms)"); h("# TYPE mecloneme_latency_p95_ms gauge"); h(f"mecloneme_latency_p95_ms {health['latency_ms']['p95']}")
+    h("# HELP mecloneme_http_status_recent_total Recent sample status distribution"); h("# TYPE mecloneme_http_status_recent_total gauge")
+    for code,count in (summ.get("statuses") or {}).items(): h(f'mecloneme_http_status_recent_total{{code="{code}"}} {count}')
+    body="\n".join(L)+"\n"; METRICS_CACHE.update(ts=now, body=body)
     return PlainTextResponse(body, media_type="text/plain; version=0.0.4")
 
 # ===== Series =====
 @app.get("/api/series")
-def series(minutes: int = Query(30, ge=1, le=240)):
-    return _compute_series(minutes)
+def series(minutes: int = Query(30, ge=1, le=240)): return _compute_series(minutes)
 
 # ===== AR stub =====
 @app.get("/ar/ping")
-def ar_ping():
-    return {"ok": True, "engine": "stub", "ts": int(time.time())}
+def ar_ping(): return {"ok": True, "engine": "stub", "ts": int(time.time())}
 
 @app.get("/ar/stub/avatar.svg", response_class=PlainTextResponse)
 def ar_stub_avatar(mood: str = Query("neutral"), scale: int = Query(64, ge=32, le=256)):
-    size = scale
-    eye_dx = size*0.22
-    eye_y = size*0.38
-    mouth_y = size*0.68
-    k = {"happy": -0.18, "neutral": 0.0, "sad": 0.18}.get(mood, 0.0)
-    mouth = f"M {size*0.25} {mouth_y} Q {size*0.5} {mouth_y + size*k} {size*0.75} {mouth_y}"
-    svg = f"""
+    size=scale; eye_dx=size*0.22; eye_y=size*0.38; mouth_y=size*0.68
+    k={"happy":-0.18,"neutral":0.0,"sad":0.18}.get(mood,0.0); mouth=f"M {size*0.25} {mouth_y} Q {size*0.5} {mouth_y + size*k} {size*0.75} {mouth_y}"
+    svg=f"""
 <svg xmlns='http://www.w3.org/2000/svg' width='{size}' height='{size}' viewBox='0 0 {size} {size}'>
   <circle cx='{size/2 - eye_dx}' cy='{eye_y}' r='{size*0.06}' fill='#111'/>
   <circle cx='{size/2 + eye_dx}' cy='{eye_y}' r='{size*0.06}' fill='#111'/>
   <path d='{mouth}' stroke='#111' stroke-width='{size*0.04}' fill='none' stroke-linecap='round'/>
-</svg>
-"""
+</svg>"""
     return PlainTextResponse(svg, media_type="image/svg+xml")
 
 @app.get("/ar/stub/state")
-def ar_stub_state():
-    return {"ok": True, "mood": "neutral", "ts": int(time.time())}
+def ar_stub_state(): return {"ok": True, "mood": "neutral", "ts": int(time.time())}
 
-# ===== Export / Telemetry =====
+# ===== Export / Telemetria =====
 class ExportWebhook(BaseModel):
-    url: str
-    payload: Optional[Dict[str, Any]] = None
-    headers: Optional[Dict[str, str]] = None
-
+    url: str; payload: Optional[Dict[str, Any]] = None; headers: Optional[Dict[str, str]] = None
 def _http_post_json(url: str, payload: Dict[str, Any], headers: Optional[Dict[str, str]] = None, timeout_s: int = 3) -> Dict[str, Any]:
     import urllib.request, json as _json
-    data = _json.dumps(payload).encode()
-    req = urllib.request.Request(url, data=data, method="POST")
-    req.add_header("Content-Type", "application/json")
-    if headers:
-        for k, v in headers.items():
-            req.add_header(k, v)
+    data=_json.dumps(payload).encode(); req=_urllib_request(url,data,headers,timeout_s)
     with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-        body = resp.read().decode("utf-8", "ignore")
-        return {"status": resp.status, "body": body}
+        body=resp.read().decode("utf-8","ignore"); return {"status": resp.status, "body": body}
+
+def _urllib_request(url: str, data: bytes, headers: Optional[Dict[str,str]], timeout_s: int):
+    import urllib.request
+    req=urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type","application/json")
+    if headers: 
+        for k,v in headers.items(): req.add_header(k,v)
+    return req
 
 @app.post("/export/webhook")
 def export_webhook(inp: ExportWebhook):
-    payload = inp.payload or {"ok": True, "src": "mecloneme"}
-    tries = [0.0, 0.5, 1.0]
-    last = {"status": 0, "body": ""}
+    payload=inp.payload or {"ok": True, "src":"mecloneme"}; tries=[0.0,0.5,1.0]; last={"status":0,"body":""}
     for backoff in tries:
         try:
-            last = _http_post_json(inp.url, payload, headers=inp.headers)
-            if 200 <= last["status"] < 300:
-                break
-        except Exception as e:
-            last = {"status": 0, "body": f"err: {e}"}
+            last=_http_post_json(inp.url, payload, headers=inp.headers)
+            if 200 <= last["status"] < 300: break
+        except Exception as e: last={"status":0,"body":f"err: {e}"}
         time.sleep(backoff)
     return {"ok": 200 <= (last.get("status") or 0) < 300, "last": last}
 
 class ExportS3Like(BaseModel):
-    url: str
-    content_b64: Optional[str] = None
-    text: Optional[str] = None
-    content_type: Optional[str] = "application/octet-stream"
-    method: Optional[str] = "PUT"
-
+    url: str; content_b64: Optional[str]=None; text: Optional[str]=None; content_type: Optional[str]="application/octet-stream"; method: Optional[str]="PUT"
 @app.post("/export/s3")
 def export_s3_like(inp: ExportS3Like):
     import urllib.request
-    if not (inp.content_b64 or inp.text):
-        return JSONResponse({"ok": False, "err": "no-content"}, status_code=400)
-    data = base64.b64decode(inp.content_b64) if inp.content_b64 else inp.text.encode()
-    req = urllib.request.Request(inp.url, data=data, method=inp.method or "PUT")
-    if inp.content_type:
-        req.add_header("Content-Type", inp.content_type)
+    if not (inp.content_b64 or inp.text): return JSONResponse({"ok": False, "err":"no-content"}, status_code=400)
+    data=base64.b64decode(inp.content_b64) if inp.content_b64 else inp.text.encode()
+    req=urllib.request.Request(inp.url, data=data, method=inp.method or "PUT")
+    if inp.content_type: req.add_header("Content-Type", inp.content_type)
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return {"ok": 200 <= resp.status < 400, "status": resp.status}
-    except Exception as e:
-        return JSONResponse({"ok": False, "err": str(e)}, status_code=502)
+        with urllib.request.urlopen(req, timeout=5) as resp: return {"ok": 200 <= resp.status < 400, "status": resp.status}
+    except Exception as e: return JSONResponse({"ok": False, "err": str(e)}, status_code=502)
 
 # ===== Progress + Gantt =====
+PROGRESS_DEFAULT: Dict[str, int] = {
+    "N01 — SSOT / Router-README": 55,
+    "N18 — Panel CEO": 35,
+    "N22 — Testy & QA": 25,
+    "N04 — Mobile (Camera/Mic)": 20,
+    "N05 — Desktop (Bridge)": 20,
+    "N09 — Guardian": 30,
+    "N21 — SDK / API Clients": 15,
+    "N27 — Docs & OpenAPI": 30,
+    "N30 — Core (Live+AR+Guardian)": 40,
+}
+def _load_progress() -> Dict[str, int]:
+    obj=_load_json(PROGRESS_PATH, {})
+    if not obj: obj=PROGRESS_DEFAULT.copy(); _save_json(PROGRESS_PATH, obj)
+    return obj
+def _save_progress(obj: Dict[str, int]): _save_json(PROGRESS_PATH, obj)
+def _progress_overall(mods: Dict[str, int]) -> int:
+    if not mods: return 0
+    vals=[max(0, min(100, int(v))) for v in mods.values()]
+    return int(sum(vals)/len(vals))
+
 GANTT_PLAN = [
     ("N01 — SSOT / Router-README", 0, 3),
     ("N27 — Docs & OpenAPI",       0, 12),
@@ -718,76 +548,128 @@ GANTT_PLAN = [
 
 @app.get("/progress")
 def get_progress():
-    mods = _load_progress()
-    return {"ok": True, "overall": _progress_overall(mods), "modules": mods}
+    mods=_load_progress(); return {"ok": True, "overall": _progress_overall(mods), "modules": mods}
 
 @app.get("/progress/gantt.json")
 def gantt_json():
-    today = datetime.utcnow().date()
-    items = []
-    for name, off, dur in GANTT_PLAN:
-        start = today + timedelta(days=off)
-        end = start + timedelta(days=dur)
-        items.append({"module": name, "start": start.isoformat(), "end": end.isoformat(), "duration": dur})
+    today=datetime.utcnow().date(); items=[]
+    for name,off,dur in GANTT_PLAN:
+        start=today+timedelta(days=off); end=start+timedelta(days=dur)
+        items.append({"module":name,"start":start.isoformat(),"end":end.isoformat(),"duration":dur})
     return {"ok": True, "today": today.isoformat(), "items": items}
 
 @app.get("/progress/gantt.svg", response_class=PlainTextResponse)
 def gantt_svg():
-    days_total = 30
-    row_h = 22
-    pad_x, pad_y = 60, 20
-    width = 900
-    height = pad_y*2 + row_h*len(GANTT_PLAN)
-    day_w = (width - pad_x - 20) / days_total
-    v = _theme_vars(THEME)
-    grid = v['bd']; bar = v['ok']; text = v['tx']
+    """Gantt: szary plan (pełny odcinek), zielone wypełnienie (procent zrealizowany) + etykieta XX%."""
+    days_total=30; row_h=26; pad_x,pad_y=80,24; width=900; height=pad_y*2 + row_h*len(GANTT_PLAN)
+    day_w=(width - pad_x - 20)/days_total
+    v=_theme_vars(THEME); grid=v['bd']; done=v['ok']; text=v['tx']
+    mods=_load_progress()
 
-    parts = [f"<svg xmlns='http://www.w3.org/2000/svg' width='{width}' height='{height}' viewBox='0 0 {width} {height}'>",
-             f"<rect x='0' y='0' width='{width}' height='{height}' fill='transparent'/>",
-             f"<g stroke='{grid}' stroke-width='1'>"]
+    parts=[f"<svg xmlns='http://www.w3.org/2000/svg' width='{width}' height='{height}' viewBox='0 0 {width} {height}'>",
+           f"<rect x='0' y='0' width='{width}' height='{height}' fill='transparent'/>",
+           f"<g stroke='{grid}' stroke-width='1'>"]
+    # siatka dzienna
     for d in range(days_total+1):
-        x = pad_x + d*day_w
-        parts.append(f"<line x1='{x:.1f}' y1='{pad_y-6}' x2='{x:.1f}' y2='{height-pad_y}' opacity='0.5' />")
+        x=pad_x + d*day_w
+        parts.append(f"<line x1='{x:.1f}' y1='{pad_y-8}' x2='{x:.1f}' y2='{height-pad_y}' opacity='0.35' />")
     parts.append("</g>")
-
+    # etykiety 0d/5d...
     parts.append(f"<g fill='{text}' font-size='11'>")
     for d in range(0, days_total+1, 5):
-        x = pad_x + d*day_w
-        parts.append(f"<text x='{x:.1f}' y='{pad_y-8}' text-anchor='middle'>{d}d</text>")
+        x=pad_x + d*day_w
+        parts.append(f"<text x='{x:.1f}' y='{pad_y-12}' text-anchor='middle'>{d}d</text>")
     parts.append("</g>")
 
-    y = pad_y
-    parts.append(f"<g fill='{text}' font-size='12'>")
-    for name, off, dur in GANTT_PLAN:
-        parts.append(f"<text x='6' y='{y+row_h-6}'>{name}</text>")
-        x = pad_x + off*day_w
-        w = max(1.5, dur*day_w)
-        parts.append(f"<rect x='{x:.1f}' y='{y+4}' rx='5' ry='5' width='{w:.1f}' height='{row_h-8}' fill='{bar}' opacity='0.9' />")
-        y += row_h
+    # paski
+    y=pad_y
+    parts.append(f"<g fill='{text}' font-size='13'>")
+    for name,off,dur in GANTT_PLAN:
+        # podpis po lewej
+        parts.append(f"<text x='10' y='{y+row_h-8}'>{name}</text>")
+        x=pad_x + off*day_w; w=max(2.0, dur*day_w)
+        # tło planu (szary)
+        parts.append(f"<rect x='{x:.1f}' y='{y+5}' rx='6' ry='6' width='{w:.1f}' height='{row_h-10}' fill='{grid}' opacity='0.55' />")
+        # wypełnienie (zielone) wg % z pliku progress
+        p=max(0, min(100, int(mods.get(name, 0))))
+        fill_w=max(0.0, w * (p/100.0))
+        if fill_w > 0.0:
+            parts.append(f"<rect x='{x:.1f}' y='{y+5}' rx='6' ry='6' width='{fill_w:.1f}' height='{row_h-10}' fill='{done}' opacity='0.95' />")
+            # etykieta % przy prawej krawędzi zielonego odcinka
+            # jeśli za wąsko, to etykieta tuż za zielonym, inaczej - wewnątrz i wyrównana do prawej
+            if fill_w < 28:
+                tx = x + fill_w + 14
+                anchor = "start"
+            else:
+                tx = x + fill_w - 6
+                anchor = "end"
+            parts.append(f"<text x='{tx:.1f}' y='{y+row_h-8}' text-anchor='{anchor}' font-size='12' fill='{text}'>{p}%</text>")
+        y+=row_h
     parts.append("</g></svg>")
     return PlainTextResponse("".join(parts), media_type="image/svg+xml")
 
 @app.post("/admin/progress")
 def set_progress(payload: Dict[str, Any]):
-    mods = _load_progress()
+    mods=_load_progress()
     if "modules" in payload and isinstance(payload["modules"], dict):
-        for k, v in payload["modules"].items():
-            try:
-                mods[k] = int(v)
-            except Exception:
-                pass
+        for k,v in payload["modules"].items():
+            try: mods[k]=int(v)
+            except Exception: pass
     if "module" in payload and "percent" in payload:
-        try:
-            mods[payload["module"]] = int(payload["percent"])
-        except Exception:
-            pass
-    _save_progress(mods)
-    return {"ok": True, "overall": _progress_overall(mods), "modules": mods}
+        try: mods[payload["module"]]=int(payload["percent"])
+        except Exception: pass
+    _save_progress(mods); return {"ok": True, "overall": _progress_overall(mods), "modules": mods}
 
-# ===== Alerts API =====
+# ===== Alerts (opcjonalnie podgląd) =====
+class Alert(BaseModel): level: str; msg: str; ts: int; extra: Optional[Dict[str, Any]] = None
 @app.get("/alerts")
-def list_alerts():
-    return {"ok": True, "alerts": ALERTS[-50:]}
+def list_alerts(): 
+    try: return {"ok": True, "alerts": tail_jsonl(SHADOW_JSONL, 200)}
+    except Exception: return {"ok": True, "alerts": []}
+
+# ===== Nonces & Sessions / WS =====
+NONCES: Dict[str, int] = {}
+def new_nonce(aud: str):
+    nonce = base64.urlsafe_b64encode(secrets.token_bytes(24)).decode().rstrip("=")
+    ts = int(time.time()); NONCES[nonce] = ts + NONCE_TTL
+    return {"aud": aud, "nonce": nonce, "ts": ts}
+def new_session(kid: str):
+    sid = base64.urlsafe_b64encode(secrets.token_bytes(18)).decode().rstrip("=")
+    exp = int(time.time()) + SESSION_TTL
+    SESSIONS[sid] = {"kid": kid, "exp": exp}
+    _save_json(SESSIONS_PATH, SESSIONS)
+    return {"kid": kid, "sid": sid, "exp": exp}
+def rate_is_hot(ip: str) -> Optional[int]:
+    cnt = len(RATE.get(ip, [])); return cnt if cnt >= int(RATE_MAX * 0.8) else None
+
+@app.websocket("/ws/echo")
+async def ws_echo(ws: WebSocket):
+    await ws.accept()
+    try:
+        while True:
+            msg = await ws.receive_text()
+            await ws.send_text(msg)
+    except WebSocketDisconnect:
+        pass
+
+# ===== Middleware audit =====
+@app.middleware("http")
+async def audit_mw(request: Request, call_next):
+    global REQ_COUNT
+    t0=time.perf_counter()
+    ip=request.client.host if request.client else "?"
+    path=request.url.path; method=request.method
+    status=500
+    try:
+        response=await call_next(request)
+        status=getattr(response,"status_code",200)
+        return response
+    finally:
+        ms=int((time.perf_counter()-t0)*1000)
+        REQ_COUNT+=1; reqno=REQ_COUNT
+        if path in SKIP_AUDIT_PATHS: return
+        if AUDIT_SAMPLE_N>1 and (reqno % AUDIT_SAMPLE_N)!=0: return
+        write_event("http", ip=ip, method=method, path=path, status=status, ms=ms)
 
 # ===== Startup =====
 load_stores()
