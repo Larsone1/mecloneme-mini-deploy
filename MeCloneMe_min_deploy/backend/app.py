@@ -3,8 +3,12 @@ from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 try:
     from backend.n09_coalescer import router as alerts_router
-except Exception as e:
+except Exception:
     alerts_router = None
+try:
+    from backend.n27_progress import router as progress_router
+except Exception:
+    progress_router = None
 
 app = FastAPI(title="MeCloneMe API")
 
@@ -25,7 +29,9 @@ def _alerts_health():
 
 @app.get("/", response_class=HTMLResponse)
 def _root():
-    return "<html><body style='font-family:Inter,sans-serif;padding:24px;color:#e5e7eb;background:#0b0f14'><h2>MeCloneMe — API</h2><p>✔ Live</p><p><a href='/alerts/ui'>/alerts/ui</a> • <a href='/alerts'>/alerts</a> • <a href='/alerts/health'>/alerts/health</a> • <a href='/docs'>/docs</a></p></body></html>"
+    return "<html><body style='font-family:Inter,sans-serif;padding:24px;color:#e5e7eb;background:#0b0f14'><h2>MeCloneMe — API</h2><p>✔ Live</p><p><a href='/alerts/ui'>/alerts/ui</a> • <a href='/progress/ui'>/progress/ui</a> • <a href='/alerts'>/alerts</a> • <a href='/progress'>/progress</a> • <a href='/docs'>/docs</a></p></body></html>"
 
 if alerts_router is not None:
     app.include_router(alerts_router)
+if progress_router is not None:
+    app.include_router(progress_router)
