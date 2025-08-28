@@ -1,0 +1,15 @@
+
+{% extends "base.html" %}{% block content %}
+<h1>Alerts</h1>
+<div id="alerts" class="card"><div class="hint">Wczytywanie…</div></div>
+<script>
+async function load(){
+  const r = await fetch('/alerts'); const data = await r.json();
+  const box = document.getElementById('alerts');
+  box.innerHTML = `<table class="table"><thead><tr><th>Title</th><th>Score</th><th>Source</th><th>Tags</th><th>Updated</th></tr></thead><tbody>${
+    data.items.map(i=>`<tr><td>${i.title}</td><td>${i.score}</td><td>${i.source}</td><td>${i.tags.map(t=>`<span class='badge'>${t}</span>`).join(' ')}</td><td>${i.updated}</td></tr>`).join('')
+  }</tbody></table>`;
+}
+load();
+</script>
+{% endblock %}

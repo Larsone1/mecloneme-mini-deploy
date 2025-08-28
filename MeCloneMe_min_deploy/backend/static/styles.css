@@ -1,0 +1,24 @@
+
+:root{--bg:#0b1320;--card:#0f1b2e;--fg:#cfe7ff;--muted:#8aa4c0;--accent:#ff2bd0;--ok:#38d996}
+*{box-sizing:border-box} html,body{margin:0;padding:0;background:#000;color:var(--fg);font:16px/1.5 ui-sans-serif,system-ui,Segoe UI,Roboto,Helvetica,Arial}
+a{color:#8ad3ff;text-decoration:none}
+.nav{position:sticky;top:0;background:rgba(8,15,28,.9);backdrop-filter:blur(6px);display:flex;gap:8px;padding:10px 12px;border-bottom:1px solid #18253b}
+.nav a{padding:8px 12px;border-radius:10px;background:#101a2c;border:1px solid #1a2740}
+.nav a.primary{background:linear-gradient(90deg,#ff47d6,#7a5cff);color:white;border:none}
+.wrap{max-width:980px;margin:26px auto;padding:0 16px}
+.card{background:var(--card);border:1px solid #1a2740;border-radius:14px;padding:18px;margin:12px 0}
+.hint{color:var(--muted);font-size:14px}
+h1,h2{font-weight:700;margin:8px 0 10px}
+.progress{height:12px;background:#0c1729;border-radius:999px;overflow:hidden;border:1px solid #1a2740}
+.progress > i{display:block;height:100%;background:linear-gradient(90deg,#38d996,#7de3bd)}
+.badge{font-size:12px;padding:2px 8px;border-radius:999px;background:#0c1729;border:1px solid #1a2740;color:#9bc0ff}
+.grid{display:grid;grid-template-columns:1fr;gap:12px}
+@media(min-width:720px){.grid{grid-template-columns:1fr 1fr}}
+.table{width:100%;border-collapse:collapse}
+.table th,.table td{padding:8px 10px;border-bottom:1px solid #1a2740}
+.kpi{display:flex;justify-content:space-between;align-items:center}
+.kpi strong{font-size:20px}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border-radius:10px;border:1px solid #2b3f63;background:#0f1b2e;color:#cfe7ff}
+.btn.ok{background:#132b22;border-color:#1f6a50}
+.footer{margin-top:28px;color:#8aa4c0;font-size:13px}
+.logo{font-weight:800;color:#fff}.logo i{color:#ff2bd0}

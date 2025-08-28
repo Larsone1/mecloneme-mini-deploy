@@ -1,69 +1,69 @@
 
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from fastapi.middleware.cors import CORSMiddleware
-from .n27_progress import progress_html
+from fastapi import FastAPI, Request, Form
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from typing import Dict, Any
+from datetime import datetime
 
-app = FastAPI(title="MeCloneMe — API")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app = FastAPI(title="MeCloneMe API", version="0.3.10")
 
-@app.get("/", include_in_schema=False)
-def root():
-    return RedirectResponse("/start")
+app.mount("/static", StaticFiles(directory=str(__file__).replace("app.py","static")), name="static")
+templates = Jinja2Templates(directory=str(__file__).replace("app.py","templates"))
 
-@app.get("/start", include_in_schema=False)
-def start():
-    html = """
-    <!doctype html><html><head><meta charset="utf-8"/>
-    <title>MeCloneMe — API</title>
-    <style>body{background:#0b1220;color:#e6f0ff;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:0;padding:40px} a{color:#7dc9ff}</style>
-    </head><body>
-    <h1>MeCloneMe — API</h1>
-    <p>✓ Live</p>
-    <ul>
-      <li><a href="/alerts/ui">/alerts/ui</a></li>
-      <li><a href="/alerts/health">/alerts/health</a></li>
-      <li><a href="/progress">/progress</a></li>
-      <li><a href="/docs">/docs</a></li>
-    </ul>
-    </body></html>
-    """
-    return HTMLResponse(html)
+@app.get("/", response_class=HTMLResponse)
+@app.get("/start", response_class=HTMLResponse)
+async def start(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request, "title":"MeCloneMe — API"})
 
-@app.get("/auth/challenge", include_in_schema=False)
-def challenge():
-    return JSONResponse({"ok": True})
+BARS=[
+    {"code":"N01","title":"SSOT / Router-README","pct":55},
+    {"code":"N04","title":"Mobile (Camera/Mic)","pct":20},
+    {"code":"N05","title":"Desktop (Bridge)","pct":20},
+    {"code":"N09","title":"Guardian","pct":30},
+    {"code":"N18","title":"Panel CEO","pct":35},
+    {"code":"N21","title":"SDK / API Clients","pct":15},
+    {"code":"N22","title":"Testy & QA","pct":25},
+    {"code":"N27","title":"Docs & OpenAPI","pct":30},
+    {"code":"N30","title":"Core (Live+AR+Guardian)","pct":40},
+]
+@app.get("/progress", response_class=HTMLResponse)
+async def progress_page(request: Request):
+    return templates.TemplateResponse("progress.html", {"request": request, "bars": BARS, "title":"Postęp — MeCloneMe"})
 
-@app.get("/alerts/health", include_in_schema=False)
-def health():
-    return JSONResponse({"ok": True})
+@app.get("/alerts/health")
+async def alerts_health(): return {"ok": True}
 
-@app.get("/alerts/ui", response_class=HTMLResponse, include_in_schema=False)
-def alerts_ui():
-    rows = "".join([
-        '<tr><td>High error rate</td><td>backend</td><td>88</td></tr>',
-        '<tr><td>New signups drop</td><td>analytics</td><td>72</td></tr>',
-        '<tr><td>Abandoned carts</td><td>checkout</td><td>61</td></tr>',
-    ])
-    html = f"""
-    <!doctype html><html><head><meta charset="utf-8"/>
-    <title>Alerts — MeCloneMe</title>
-    <style>
-    body{{background:#0b1220;color:#e6f0ff;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;margin:0;padding:32px}}
-    table{{border-collapse:collapse;width:100%;max-width:980px}}
-    th,td{{padding:10px 12px;border-bottom:1px solid #11223a;text-align:left}}
-    th{{opacity:.7}}
-    .nav{{margin:18px 0 28px}}
-    a{{color:#7dc9ff;text-decoration:none;margin-right:12px}}
-    a:hover{{text-decoration:underline}}
-    </style></head><body>
-    <div class="nav"><a href="/start">Start</a> · <a href="/progress">Progress</a> · <a href="/docs">Docs</a></div>
-    <h2>Alerts</h2>
-    <table><thead><tr><th>Title</th><th>Source</th><th>Score</th></tr></thead><tbody>{rows}</tbody></table>
-    </body></html>
-    """
-    return HTMLResponse(html)
+@app.get("/alerts")
+async def alerts_feed()->Dict[str,Any]:
+    now=datetime.utcnow().isoformat()+"Z"
+    items=[
+        {"title":"High error rate","score":88,"source":"backend","tags":["api","errors"],"updated":now},
+        {"title":"New signups drop","score":72,"source":"analytics","tags":["funnel"],"updated":now},
+        {"title":"Abandoned carts","score":61,"source":"checkout","tags":["shop"],"updated":now},
+    ]
+    return {"items":items}
 
-@app.get("/progress", include_in_schema=False)
-def progress():
-    return HTMLResponse(progress_html())
+@app.get("/alerts/ui", response_class=HTMLResponse)
+async def alerts_ui(request: Request):
+    return templates.TemplateResponse("alerts_ui.html", {"request": request, "title":"Alerts — MeCloneMe"})
+
+@app.get("/comm/mobile", response_class=HTMLResponse)
+async def comm_mobile(request: Request):
+    return templates.TemplateResponse("comm_mobile.html", {"request": request, "title":"Mobile (dark)"})
+
+LISTEN_STATE={"active":False,"since":None}
+@app.post("/ingest/listen")
+async def ingest_listen(payload: Dict[str,Any]):
+    active=bool(payload.get("listening"))
+    LISTEN_STATE["active"]=active; LISTEN_STATE["since"]=datetime.utcnow().isoformat()+"Z" if active else None
+    return {"listening":LISTEN_STATE["active"],"since":LISTEN_STATE["since"]}
+
+@app.post("/ingest/consent")
+async def ingest_consent(agree_audio: bool = Form(...), agree_processing: bool = Form(...)):
+    return {"ok": True, "agree_audio": agree_audio, "agree_processing": agree_processing}
+
+@app.get("/start/*", include_in_schema=False)
+@app.get("/ui/*", include_in_schema=False)
+async def fallback_to_start(request: Request):
+    return RedirectResponse(url="/start")
