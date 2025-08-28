@@ -1,4 +1,3 @@
-# === N09-FIXID-20250828T125631Z ===
 import os, time, json, base64, secrets, re
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
@@ -8,7 +7,6 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from nacl.signing import VerifyKey
-from backend.n09_coalescer import router as alerts_router
 
 # ===== Config loader (MC_CONFIG / MC_* / legacy) =====
 def _parse_mc_config() -> Dict[str, Any]:
@@ -100,6 +98,16 @@ SKIP_AUDIT_PATHS = set(_pick_csv("skip_audit_paths", ["MC_SKIP_AUDIT_PATHS","SKI
 
 # ===== App =====
 app = FastAPI(title="MeCloneMe Mini API", version=API_VERSION)
+@app.get("/", response_class=__import__("fastapi").responses.HTMLResponse)
+def _root():
+    return "<html><body style='font-family:Inter,sans-serif;padding:24px;color:#e5e7eb;background:#0b0f14'><h2>MeCloneMe — API</h2><p>✔ Live</p><p><a href='/alerts'>/alerts</a> • <a href='/alerts/health'>/alerts/health</a> • <a href='/docs'>/docs</a></p></body></html>"
+
+
+@app.get("/alerts/health")
+def _alerts_health():
+    return {"ok": True}
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
