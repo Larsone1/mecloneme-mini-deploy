@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 import json, os, threading
 from typing import Dict, Any
@@ -42,8 +41,8 @@ def ui():
     data = _load()
     roles = {}
     for v in data.values():
-        roles.setdefault(v["role"], 0)
-        roles[v["role"]] += 1
+      roles.setdefault(v["role"], 0)
+      roles[v["role"]] += 1
     html = f"""
 <!doctype html><html><head>
   <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
@@ -56,12 +55,13 @@ def ui():
     .card{{background:#0f172a;border:1px solid #1f2937;border-radius:16px;padding:14px}}
     .dot{{display:inline-block;width:8px;height:8px;border-radius:999px;margin-right:6px}}
     .on{{background:#22c55e}} .off{{background:#ef4444}}
+    button{{background:#111827;color:#e5e7eb;border:1px solid #374151;border-radius:10px;padding:6px 10px;cursor:pointer}}
   </style>
 </head><body>
   <div class="wrap">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
       <h1 style="margin:0">AI Roster</h1>
-      <a href="/" style="text-decoration:none"><button style="background:#111827;color:#e5e7eb;border:1px solid #374151;border-radius:10px;padding:6px 10px">START</button></a>
+      <a href="/" style="text-decoration:none"><button>START</button></a>
     </div>
     <p style="opacity:.8">Zespoły: {" • ".join([f"{k} ({v})" for k,v in roles.items()])}</p>
     <div class="grid">

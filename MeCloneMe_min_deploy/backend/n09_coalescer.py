@@ -1,9 +1,8 @@
-
 from __future__ import annotations
-import json, os, threading, time, uuid
+import json, os, threading, time, uuid, csv, io
 from typing import List, Dict, Any
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from datetime import datetime
 
@@ -89,6 +88,21 @@ def mute(id: str, minutes: int = 15):
     data[id]["muted_until"]=time.time()+minutes*60; data[id]["updated_at"]=_now(); _save(data)
     return Alert(**data[id])
 
+@router.post("/seed")
+def seed():
+    data=_seed(); _save(data); return {"ok": True, "count": len(data)}
+
+@router.get("/export")
+def export_csv():
+    data=_load()
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["id","title","source","score","status","tags","updated_at"])
+    for _,v in sorted(data.items()):
+        w.writerow([v["id"], v["title"], v["source"], v["score"], v["status"], "|".join(v.get("tags",[])), v["updated_at"]])
+    buf.seek(0)
+    return StreamingResponse(iter([buf.read()]), media_type="text/csv", headers={"Content-Disposition":"attachment; filename=alerts.csv"})
+
 @router.get("/ui", response_class=HTMLResponse)
 def ui():
     html = """
@@ -108,7 +122,13 @@ def ui():
   </style>
 </head><body>
   <div class="wrap">
-    <div class="heading"><h1 style="margin:0">Alerts</h1><a href="/" style="text-decoration:none"><button>START</button></a></div>
+    <div class="heading">
+      <h1 style="margin:0">Alerts</h1>
+      <div>
+        <a href="/alerts/export" style="margin-right:8px;text-decoration:none"><button>Pobierz CSV</button></a>
+        <a href="/" style="text-decoration:none"><button>START</button></a>
+      </div>
+    </div>
     <table>
       <thead><tr><th>Title</th><th>Score</th><th>Source</th><th>Tags</th><th>Actions</th></tr></thead>
       <tbody id="tbody"></tbody>

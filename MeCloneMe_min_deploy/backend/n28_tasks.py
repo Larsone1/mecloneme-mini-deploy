@@ -1,10 +1,9 @@
-
 from __future__ import annotations
-import json, os, threading, uuid
+import json, os, threading, uuid, csv, io
 from datetime import datetime, timedelta, date
 from typing import List, Dict, Any
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
@@ -26,6 +25,7 @@ def _now() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 def _today(n=0) -> str:
+    from datetime import date, timedelta
     return (date.today() + timedelta(days=n)).isoformat()
 
 def _seed() -> Dict[str, Any]:
@@ -92,6 +92,17 @@ def set_progress(id: str, value: int) -> Task:
     data[id]["progress"]=int(value); data[id]["updated_at"]=_now(); _save(data)
     return Task(**data[id])
 
+@router.get("/export")
+def export_csv():
+    data=_load()
+    buf = io.StringIO()
+    wr = csv.writer(buf)
+    wr.writerow(["id","title","owner","assignee","status","due","progress","updated_at"])
+    for _,v in sorted(data.items()):
+        wr.writerow([v["id"],v["title"],v["owner"],v["assignee"],v["status"],v["due"],v["progress"],v["updated_at"]])
+    buf.seek(0)
+    return StreamingResponse(iter([buf.read()]), media_type="text/csv", headers={"Content-Disposition":"attachment; filename=tasks.csv"})
+
 @router.get("/ui", response_class=HTMLResponse)
 def ui():
     html = """
@@ -113,7 +124,13 @@ def ui():
   </style>
 </head><body>
   <div class="wrap">
-    <div class="heading"><h1 style="margin:0">Zadania</h1><a href="/" style="text-decoration:none"><button>START</button></a></div>
+    <div class="heading">
+      <h1 style="margin:0">Zadania</h1>
+      <div>
+        <a href="/tasks/export" style="margin-right:8px;text-decoration:none"><button>Pobierz CSV</button></a>
+        <a href="/" style="text-decoration:none"><button>START</button></a>
+      </div>
+    </div>
     <table>
       <thead><tr><th>Tytuł</th><th>Owner</th><th>Assignee</th><th>Status</th><th>Due</th><th>Postęp</th><th>Akcje</th></tr></thead>
       <tbody id="tb"></tbody>

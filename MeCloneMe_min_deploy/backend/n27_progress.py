@@ -1,10 +1,9 @@
-
 from __future__ import annotations
-import json, os, threading
+import json, os, threading, csv, io
 from datetime import datetime
 from typing import List, Dict, Any
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 router = APIRouter(prefix="/progress", tags=["progress"])
@@ -86,6 +85,17 @@ def set_one(code: str, percent: int) -> Item:
     _save(data)
     return Item(**data[code])
 
+@router.get("/export")
+def export_csv():
+    data = _load()
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["code","name","percent","updated_at"])
+    for k,v in sorted(data.items()):
+        w.writerow([v["code"], v["name"], v["percent"], v["updated_at"]])
+    buf.seek(0)
+    return StreamingResponse(iter([buf.read()]), media_type="text/csv", headers={"Content-Disposition":"attachment; filename=progress.csv"})
+
 @router.get("/ui", response_class=HTMLResponse)
 def ui():
     html = """
@@ -115,7 +125,10 @@ def ui():
   <div class="top">
     <div style='display:flex;justify-content:space-between;align-items:center'>
       <h1>Postęp MeCloneMe</h1>
-      <a href='/' style='text-decoration:none'><button>START</button></a>
+      <div>
+        <a href='/progress/export' style='margin-right:8px;text-decoration:none'><button>Pobierz CSV</button></a>
+        <a href='/' style='text-decoration:none'><button>START</button></a>
+      </div>
     </div>
     <div style="margin:8px 0 16px">
       <button onclick="toggleAdmin()">✏️ Tryb edycji</button>
