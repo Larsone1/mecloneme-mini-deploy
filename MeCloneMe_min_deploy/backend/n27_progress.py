@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 import json, os, threading
 from datetime import datetime
@@ -58,8 +59,7 @@ def _save(data: Dict[str, Any]) -> None:
 @router.get("", response_model=List[Item])
 def list_items() -> List[Item]:
     data = _load()
-    out = [Item(**v) for k,v in sorted(data.items(), key=lambda kv: kv[0])]
-    return out
+    return [Item(**v) for k,v in sorted(data.items())]
 
 class BulkIn(BaseModel):
     code: str
@@ -74,7 +74,7 @@ def bulk_update(items: List[BulkIn]) -> List[Item]:
         data[it.code]["percent"] = int(it.percent)
         data[it.code]["updated_at"] = _now()
     _save(data)
-    return [Item(**v) for k,v in sorted(data.items(), key=lambda kv: kv[0])]
+    return [Item(**v) for k,v in sorted(data.items())]
 
 @router.post("/set/{code}", response_model=Item)
 def set_one(code: str, percent: int) -> Item:
@@ -89,69 +89,72 @@ def set_one(code: str, percent: int) -> Item:
 @router.get("/ui", response_class=HTMLResponse)
 def ui():
     html = """
-    <!doctype html>
-    <html><head>
-      <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-      <title>Postęp — MeCloneMe</title>
-      <style>
-        body{background:#0b0f14;color:#e5e7eb;font-family:Inter,system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;padding:24px}
-        h1{font-size:22px;margin:0 0 18px}
-        .card{background:#0f172a;border-radius:16px;padding:18px;margin:12px 0;box-shadow:0 1px 0 #0b1220}
-        .head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
-        .code{opacity:.7;font-weight:600;margin-right:6px}
-        .name{font-weight:600}
-        .bar{height:14px;background:#1f2937;border-radius:999px;overflow:hidden}
-        .fill{height:100%;background:#22c55e;border-radius:999px;transition:width .35s ease}
-        .row{display:grid;grid-template-columns:1fr 120px;gap:16px;align-items:center}
-        .pct{font-weight:700;text-align:right}
-        .top{max-width:860px;margin:auto}
-        a{color:#93c5fd}
-        input{width:100%;background:#111827;color:#e5e7eb;border:1px solid #374151;border-radius:10px;padding:8px 10px}
-        button{background:#111827;color:#e5e7eb;border:1px solid #374151;border-radius:10px;padding:8px 10px;cursor:pointer}
-        .admin{display:none;gap:8px}
-      </style>
-    </head>
-    <body>
-      <div class="top">
-        <h1>Postęp MeCloneMe <small style="opacity:.6;font-weight:400">/progress/ui</small></h1>
-        <div style="margin:8px 0 16px">
-          <button onclick="toggleAdmin()">✏️ Tryb edycji</button>
-        </div>
-        <div id="wrap"></div>
-        <p style="opacity:.7;margin-top:16px">Szybkie linki: <a href="/alerts/ui">/alerts/ui</a> • <a href="/docs">/docs</a></p>
-      </div>
-      <script>
-        let edit = false;
-        function toggleAdmin(){ edit = !edit; document.querySelectorAll('.admin').forEach(x => x.style.display = edit ? 'grid' : 'none'); }
-        async function load(){
-          const res = await fetch('/progress');
-          const data = await res.json();
-          const wrap = document.getElementById('wrap');
-          wrap.innerHTML = '';
-          for (const it of data){
-            const card = document.createElement('div'); card.className='card';
-            card.innerHTML = `
-              <div class="row">
-                <div>
-                  <div class="head"><div><span class="code">${it.code}</span><span class="name">${it.name}</span></div><div class="pct" id="pct-${it.code}">${it.percent}%</div></div>
-                  <div class="bar"><div class="fill" id="fill-${it.code}" style="width:${it.percent}%"></div></div>
-                </div>
-                <div class="admin">
-                  <input id="inp-${it.code}" type="number" min="0" max="100" value="${it.percent}" />
-                  <button onclick="saveOne('${it.code}')">Zapisz</button>
-                </div>
-              </div>`;
-            wrap.appendChild(card);
-          }
-        }
-        async function saveOne(code){
-          const v = Number(document.getElementById('inp-'+code).value||0);
-          await fetch('/progress/set/'+code+'?percent='+v, {method:'POST'});
-          document.getElementById('pct-'+code).textContent = v + '%';
-          document.getElementById('fill-'+code).style.width = v + '%';
-        }
-        load();
-      </script>
-    </body></html>
-    """
+<!doctype html>
+<html><head>
+  <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Postęp — MeCloneMe</title>
+  <style>
+    body{background:#0b0f14;color:#e5e7eb;font-family:Inter,system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;padding:24px}
+    h1{font-size:22px;margin:0 0 18px}
+    .card{background:#0f172a;border-radius:16px;padding:18px;margin:12px 0;box-shadow:0 1px 0 #0b1220}
+    .head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+    .code{opacity:.7;font-weight:600;margin-right:6px}
+    .name{font-weight:600}
+    .bar{height:14px;background:#1f2937;border-radius:999px;overflow:hidden}
+    .fill{height:100%;background:#22c55e;border-radius:999px;transition:width .35s ease}
+    .row{display:grid;grid-template-columns:1fr 120px;gap:16px;align-items:center}
+    .pct{font-weight:700;text-align:right}
+    .top{max-width:860px;margin:auto}
+    a{color:#93c5fd}
+    input{width:100%;background:#111827;color:#e5e7eb;border:1px solid #374151;border-radius:10px;padding:8px 10px}
+    button{background:#111827;color:#e5e7eb;border:1px solid #374151;border-radius:10px;padding:8px 10px;cursor:pointer}
+    .admin{display:none;gap:8px}
+  </style>
+</head>
+<body>
+  <div class="top">
+    <div style='display:flex;justify-content:space-between;align-items:center'>
+      <h1>Postęp MeCloneMe</h1>
+      <a href='/' style='text-decoration:none'><button>START</button></a>
+    </div>
+    <div style="margin:8px 0 16px">
+      <button onclick="toggleAdmin()">✏️ Tryb edycji</button>
+    </div>
+    <div id="wrap"></div>
+    <p style="opacity:.7;margin-top:16px">Szybkie linki: <a href="/alerts/ui">/alerts/ui</a> • <a href="/docs">/docs</a></p>
+  </div>
+  <script>
+    let edit = false;
+    function toggleAdmin(){ edit = !edit; document.querySelectorAll('.admin').forEach(x => x.style.display = edit ? 'grid' : 'none'); }
+    async function load(){
+      const res = await fetch('/progress');
+      const data = await res.json();
+      const wrap = document.getElementById('wrap');
+      wrap.innerHTML = '';
+      for (const it of data){
+        const card = document.createElement('div'); card.className='card';
+        card.innerHTML = `
+          <div class="row">
+            <div>
+              <div class="head"><div><span class="code">${it.code}</span><span class="name">${it.name}</span></div><div class="pct" id="pct-${it.code}">${it.percent}%</div></div>
+              <div class="bar"><div class="fill" id="fill-${it.code}" style="width:${it.percent}%"></div></div>
+            </div>
+            <div class="admin">
+              <input id="inp-${it.code}" type="number" min="0" max="100" value="${it.percent}" />
+              <button onclick="saveOne('${it.code}')">Zapisz</button>
+            </div>
+          </div>`;
+        wrap.appendChild(card);
+      }
+    }
+    async function saveOne(code){
+      const v = Number(document.getElementById('inp-'+code).value||0);
+      await fetch('/progress/set/'+code+'?percent='+v, {method:'POST'});
+      document.getElementById('pct-'+code).textContent = v + '%';
+      document.getElementById('fill-'+code).style.width = v + '%';
+    }
+    load();
+  </script>
+</body></html>
+"""
     return HTMLResponse(html)
