@@ -1,7 +1,7 @@
 from __future__ import annotations
 import json, os, threading
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -21,7 +21,6 @@ def _now() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 def _default_items() -> Dict[str, Any]:
-    # Seed zgodny z Twoimi paskami
     return {
         "N01": {"code":"N01","name":"SSOT / Router-README","percent":55,"updated_at":_now()},
         "N18": {"code":"N18","name":"Panel CEO","percent":35,"updated_at":_now()},
@@ -103,19 +102,27 @@ def ui():
         .name{font-weight:600}
         .bar{height:14px;background:#1f2937;border-radius:999px;overflow:hidden}
         .fill{height:100%;background:#22c55e;border-radius:999px;transition:width .35s ease}
-        .row{display:grid;grid-template-columns:1fr 100px;gap:16px;align-items:center}
+        .row{display:grid;grid-template-columns:1fr 120px;gap:16px;align-items:center}
         .pct{font-weight:700;text-align:right}
         .top{max-width:860px;margin:auto}
         a{color:#93c5fd}
+        input{width:100%;background:#111827;color:#e5e7eb;border:1px solid #374151;border-radius:10px;padding:8px 10px}
+        button{background:#111827;color:#e5e7eb;border:1px solid #374151;border-radius:10px;padding:8px 10px;cursor:pointer}
+        .admin{display:none;gap:8px}
       </style>
     </head>
     <body>
       <div class="top">
-        <h1>Postęp MeCloneMe</h1>
+        <h1>Postęp MeCloneMe <small style="opacity:.6;font-weight:400">/progress/ui</small></h1>
+        <div style="margin:8px 0 16px">
+          <button onclick="toggleAdmin()">✏️ Tryb edycji</button>
+        </div>
         <div id="wrap"></div>
         <p style="opacity:.7;margin-top:16px">Szybkie linki: <a href="/alerts/ui">/alerts/ui</a> • <a href="/docs">/docs</a></p>
       </div>
       <script>
+        let edit = false;
+        function toggleAdmin(){ edit = !edit; document.querySelectorAll('.admin').forEach(x => x.style.display = edit ? 'grid' : 'none'); }
         async function load(){
           const res = await fetch('/progress');
           const data = await res.json();
@@ -126,13 +133,22 @@ def ui():
             card.innerHTML = `
               <div class="row">
                 <div>
-                  <div class="head"><div><span class="code">${it.code}</span><span class="name">${it.name}</span></div><div class="pct">${it.percent}%</div></div>
-                  <div class="bar"><div class="fill" style="width:${it.percent}%"></div></div>
+                  <div class="head"><div><span class="code">${it.code}</span><span class="name">${it.name}</span></div><div class="pct" id="pct-${it.code}">${it.percent}%</div></div>
+                  <div class="bar"><div class="fill" id="fill-${it.code}" style="width:${it.percent}%"></div></div>
                 </div>
-                <div></div>
+                <div class="admin">
+                  <input id="inp-${it.code}" type="number" min="0" max="100" value="${it.percent}" />
+                  <button onclick="saveOne('${it.code}')">Zapisz</button>
+                </div>
               </div>`;
             wrap.appendChild(card);
           }
+        }
+        async function saveOne(code){
+          const v = Number(document.getElementById('inp-'+code).value||0);
+          await fetch('/progress/set/'+code+'?percent='+v, {method:'POST'});
+          document.getElementById('pct-'+code).textContent = v + '%';
+          document.getElementById('fill-'+code).style.width = v + '%';
         }
         load();
       </script>
