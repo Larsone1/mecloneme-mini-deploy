@@ -1,0 +1,8 @@
+/* PWA-only cosmetics: hide page header in standalone (simulated "clean app" look). */
+html, body { height: 100%; }
+body.pwa-standalone .header { display: none !important; }
+body.pwa-standalone .content { padding-top: 0 !important; }
+/* Optional safe area for iOS notch */
+@supports (padding: max(0px)) {
+  body.pwa-standalone .content { padding-bottom: max(16px, env(safe-area-inset-bottom)); }
+}
