@@ -1,0 +1,23 @@
+
+{% extends "base.html" %}
+{% block title %}Komunikator — MeCloneMe{% endblock %}
+{% block content %}
+<div class="container">
+  <div class="phone">
+    <div class="bar">
+      <div class="flex" style="gap:10px">
+        <img src="/static/img/logo_mecloneme.png" class="logo" style="height:24px">
+        <span class="badge">Julana</span>
+      </div>
+      <a class="badge" href="/">Start</a>
+    </div>
+    <div class="avatar">
+      <img src="/static/img/logo_mecloneme.png" alt="avatar" style="width:100%;opacity:.2">
+    </div>
+    <div class="mic-wrap glow-min" style="margin:20px auto 24px">
+      <div class="mic"><div class="dot"></div></div>
+    </div>
+    <div class="footer"><div class="ico">🏠</div><div class="ico">🔍</div><div class="ico">🎥</div><div class="ico">💬</div><div class="ico">👤</div></div>
+  </div>
+</div>
+{% endblock %}

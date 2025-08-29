@@ -1,118 +1,25 @@
-{% extends "base.html" %}{% block content %}
-<h2>FINANSE — KPI</h2>
-<div class="grid">
-  <div class="card">
-    <h3>Dane wejściowe</h3>
-    <form id="f-form">
-      <div class="row">
-        <div><div class="label">Przychody (period)</div><input name="revenue" type="number" step="0.01" value="{{ data.get('revenue', 120000) }}"></div>
-        <div><div class="label">Koszty operacyjne</div><input name="opex" type="number" step="0.01" value="{{ data.get('opex', 70000) }}"></div>
-        <div><div class="label">Koszt własny sprzedaży (COGS)</div><input name="cogs" type="number" step="0.01" value="{{ data.get('cogs', 45000) }}"></div>
-        <div><div class="label">EBITDA</div><input name="ebitda" type="number" step="0.01" value="{{ data.get('ebitda', 25000) }}"></div>
-        <div><div class="label">Gotówka z operacji (OCF)</div><input name="ocf" type="number" step="0.01" value="{{ data.get('ocf', 18000) }}"></div>
-        <div><div class="label">Wolne przepływy (FCF)</div><input name="fcf" type="number" step="0.01" value="{{ data.get('fcf', 9000) }}"></div>
-        <div><div class="label">Śr. należności (DSO, dni)</div><input name="dso" type="number" value="{{ data.get('dso', 32) }}"></div>
-        <div><div class="label">Śr. zapasy (DIO, dni)</div><input name="dio" type="number" value="{{ data.get('dio', 28) }}"></div>
-        <div><div class="label">Śr. zobowiązania (DPO, dni)</div><input name="dpo" type="number" value="{{ data.get('dpo', 40) }}"></div>
-        <div><div class="label">Aktywa bieżące</div><input name="current_assets" type="number" step="0.01" value="{{ data.get('current_assets', 80000) }}"></div>
-        <div><div class="label">Zobow. bieżące</div><input name="current_liab" type="number" step="0.01" value="{{ data.get('current_liab', 50000) }}"></div>
-        <div><div class="label">Zobow. ogółem (dług)</div><input name="total_debt" type="number" step="0.01" value="{{ data.get('total_debt', 60000) }}"></div>
-        <div><div class="label">Kapitał własny</div><input name="equity" type="number" step="0.01" value="{{ data.get('equity', 90000) }}"></div>
-        <div><div class="label">Odsetki (roczne)</div><input name="interest" type="number" step="0.01" value="{{ data.get('interest', 4000) }}"></div>
-        <div><div class="label">Wydatki marketingowe</div><input name="mkt_spend" type="number" step="0.01" value="{{ data.get('mkt_spend', 12000) }}"></div>
-        <div><div class="label">Nowi klienci (period)</div><input name="new_customers" type="number" value="{{ data.get('new_customers', 600) }}"></div>
-        <div><div class="label">MRR/ARR (period)</div><input name="arr" type="number" step="0.01" value="{{ data.get('arr', 30000) }}"></div>
-        <div><div class="label">Churn % (mies.)</div><input name="churn" type="number" step="0.01" value="{{ data.get('churn', 3.2) }}"></div>
-        <div><div class="label">Śr. marża brutto %</div><input name="gross_margin_pct" type="number" step="0.01" value="{{ data.get('gross_margin_pct', 62) }}"></div>
-      </div>
-      <div style="margin-top:10px;display:flex;gap:10px">
-        <button type="button" onclick="calc()">Przelicz</button>
-        <button type="button" class="ghost" onclick="save()">Zapisz</button>
-      </div>
-    </form>
-  </div>
-  <div class="card">
-    <h3>Wyniki (20+ KPI)</h3>
-    <div class="kpi-list" id="kpi-list"></div>
-    <canvas id="chart1" height="120" style="margin-top:12px"></canvas>
-  </div>
-</div>
-<script>
-function readForm(){
-  const fd=new FormData(document.getElementById('f-form')); const o={}; fd.forEach((v,k)=>o[k]=parseFloat(v)); return o;
-}
-function pct(a,b){return b? (a/b*100):0}
-function days_to_cash(dso,dio,dpo){return dso+dio-dpo}
-function calc(){
-  const d=readForm();
-  const grossProfit = (d.revenue||0)-(d.cogs||0);
-  const grossMargin = pct(grossProfit,(d.revenue||0));
-  const opIncome = (d.revenue||0)-(d.opex||0)-(d.cogs||0);
-  const netProfit = opIncome - (d.interest||0);
-  const netMargin = pct(netProfit,(d.revenue||0));
-  const ccc = days_to_cash(d.dso||0,d.dio||0,d.dpo||0);
-  const currentRatio = (d.current_assets||0)/(d.current_liab||1);
-  const quickRatio = ((d.current_assets||0)-(0.5*(d.current_assets||0)))/((d.current_liab||1)); // uproszczone
-  const dte = (d.total_debt||0)/(d.equity||1);
-  const icr = opIncome/(d.interest||1);
-  const romi = ( (d.revenue||0) - (d.mkt_spend||0) ) / ((d.mkt_spend||1));
-  const cac = (d.mkt_spend||0)/((d.new_customers||1));
-  const ltv = ( (d.gross_margin_pct||0)/100.0 ) * ( (d.arr||0) / Math.max((d.new_customers||1),1) ) * 12; // szkic
-  const clv_cac = ltv / Math.max(cac,1e-6);
-  const payback = cac / Math.max((d.arr||0)/Math.max((d.new_customers||1),1),1e-6);
-  const arr_growth = pct((d.arr||0)-(d.prev_arr||0||0),(d.prev_arr||0||1));
-  const churn = d.churn||0;
-  const ebitda_margin = pct((d.ebitda||0),(d.revenue||0));
-  const ocf_margin = pct((d.ocf||0),(d.revenue||0));
-  const fcf_margin = pct((d.fcf||0),(d.revenue||0));
 
-  const KPIs = [
-    ['Revenue', d.revenue, 'PLN'],
-    ['Gross Profit', grossProfit, 'PLN'],
-    ['Gross Margin %', grossMargin, '%'],
-    ['Operating Income', opIncome, 'PLN'],
-    ['Net Profit', netProfit, 'PLN'],
-    ['Net Margin %', netMargin, '%'],
-    ['EBITDA', d.ebitda, 'PLN'],
-    ['EBITDA Margin %', ebitda_margin, '%'],
-    ['OCF', d.ocf, 'PLN'],
-    ['OCF Margin %', ocf_margin, '%'],
-    ['FCF', d.fcf, 'PLN'],
-    ['FCF Margin %', fcf_margin, '%'],
-    ['CCC (dni)', ccc, 'dni'],
-    ['Current Ratio', currentRatio, 'x'],
-    ['Quick Ratio (approx)', quickRatio, 'x'],
-    ['Debt-to-Equity', dte, 'x'],
-    ['Interest Coverage', icr, 'x'],
-    ['ROMI', romi, 'x'],
-    ['CAC', cac, 'PLN/klient'],
-    ['LTV', ltv, 'PLN/klient'],
-    ['CLV:CAC', clv_cac, 'x'],
-    ['Payback (mies.)', payback, 'm'],
-    ['ARR', d.arr, 'PLN/m'],
-    ['ARR Growth %', arr_growth, '%'],
-    ['Churn %', churn, '%']
-  ];
-  const list=document.getElementById('kpi-list'); list.innerHTML='';
-  KPIs.forEach(([n,v,u])=>{
-    const row=document.createElement('div'); row.className='kpi';
-    const val=(typeof v==='number')? (Math.round(v*100)/100) : v;
-    row.innerHTML=`<span>${n}</span><span><b>${val}</b> <span class="small">${u||''}</span></span>`;
-    list.appendChild(row);
-  });
-  // simple chart: key margins
-  const ctx=document.getElementById('chart1'); const data={
-    labels:['Gross %','EBITDA %','OCF %','FCF %','Net %'],
-    datasets:[{label:'Marże', data:[grossMargin, ebitda_margin, ocf_margin, fcf_margin, netMargin]}]
-  };
-  if(window._c1) window._c1.destroy();
-  window._c1=new Chart(ctx,{type:'line',data,options:{responsive:true,plugins:{legend:{display:false}}}});
-}
-async function save(){
-  const d=readForm();
-  await fetch('/api/finanse',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});
-  calc();
-}
-window.addEventListener('load',calc);
-</script>
+{% extends "base.html" %}
+{% block title %}Finanse — MeCloneMe{% endblock %}
+{% block content %}
+<div class="container">
+  <h1>Finanse</h1>
+  <p class="muted">Wprowadź dane wejściowe, a kalkulatory obliczą KPI i narysują wykresy. Dane trzymamy lokalnie (MVP).</p>
+  <form id="finance-form" class="card">
+    <div class="row">
+      <div><label class="label">Przychody (Revenue)</label><input name="revenue" type="number" step="0.01" class="input" placeholder="120000"></div>
+      <div><label class="label">COGS</label><input name="cogs" type="number" step="0.01" class="input" placeholder="45000"></div>
+      <div><label class="label">Operating Income</label><input name="operating_income" type="number" step="0.01" class="input"></div>
+      <div><label class="label">Net Income</label><input name="net_income" type="number" step="0.01" class="input"></div>
+      <div><label class="label">AR</label><input name="accounts_receivable" type="number" step="0.01" class="input"></div>
+      <div><label class="label">AP</label><input name="accounts_payable" type="number" step="0.01" class="input"></div>
+      <div><label class="label">Inventory</label><input name="inventory" type="number" step="0.01" class="input"></div>
+    </div>
+    <div class="flex" style="margin-top:12px;">
+      <button class="btn btn-primary" type="submit">Przelicz i narysuj</button>
+      <a class="btn right" href="/">Start</a>
+    </div>
+  </form>
+  <div id="finance-out"></div>
+</div>
 {% endblock %}

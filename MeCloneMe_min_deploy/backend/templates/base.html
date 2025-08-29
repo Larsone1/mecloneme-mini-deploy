@@ -1,30 +1,11 @@
-<!doctype html>
-<html lang="pl">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>{{ title or 'MeCloneMe' }}</title>
-<link rel="stylesheet" href="/static/css/styles.css"/>
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-</head>
-<body>
-  <div class="header">
-    <div class="logo"><img src="/static/img/logo_mecloneme.png" alt="MeCloneMe"/></div>
-    <div class="nav">
-      <a href="/start">Start</a>
-      <a href="/finanse">Finanse</a>
-      <a href="/marketing">Marketing</a>
-      <a href="/progress">Projekty</a>
-      <a href="/alerts/ui">Alerty</a>
-      <a href="/comm/mobile">Komunikator</a>
-      <a href="/docs">Docs</a>
-    </div>
-  </div>
-  <div class="container">
-  {% block content %}{% endblock %}
-  </div>
-  <footer>
-    <div class="small">MeCloneMe — The New Age Communication • v0.3.15</div>
-  </footer>
-</body>
-</html>
+
+<!doctype html><html lang="pl"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{% block title %}MeCloneMe{% endblock %}</title>
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+<link rel="stylesheet" href="/static/css/mc_next.css">
+</head><body>
+<div class="header"><a href="/"><img src="/static/img/logo_mecloneme.png" class="logo" alt="MeCloneMe"></a><a class="start" href="/">Start</a></div>
+{% block content %}{% endblock %}
+<script src="/static/js/mc_next.js"></script>
+</body></html>
