@@ -1,0 +1,84 @@
+{% extends "base.html" %}{% block content %}
+<h2>MARKETING — KPI</h2>
+<div class="grid">
+  <div class="card">
+    <h3>Dane wejściowe</h3>
+    <form id="m-form">
+      <div class="row">
+        <div><div class="label">Wydatki marketingowe</div><input name="m_spend" type="number" step="0.01" value="{{ data.get('m_spend', 15000) }}"></div>
+        <div><div class="label">Przychód atrybuowany</div><input name="m_revenue" type="number" step="0.01" value="{{ data.get('m_revenue', 42000) }}"></div>
+        <div><div class="label">Wyświetlenia</div><input name="impressions" type="number" value="{{ data.get('impressions', 200000) }}"></div>
+        <div><div class="label">Kliknięcia</div><input name="clicks" type="number" value="{{ data.get('clicks', 12000) }}"></div>
+        <div><div class="label">Sesje / wizyty</div><input name="sessions" type="number" value="{{ data.get('sessions', 38000) }}"></div>
+        <div><div class="label">Lead’y</div><input name="leads" type="number" value="{{ data.get('leads', 2400) }}"></div>
+        <div><div class="label">Zakupy (konwersje)</div><input name="conversions" type="number" value="{{ data.get('conversions', 950) }}"></div>
+        <div><div class="label">Śr. wartość zamówienia</div><input name="aov" type="number" step="0.01" value="{{ data.get('aov', 180) }}"></div>
+        <div><div class="label">Nowi klienci</div><input name="new_customers" type="number" value="{{ data.get('new_customers', 650) }}"></div>
+        <div><div class="label">Liczba klientów ogółem</div><input name="customers" type="number" value="{{ data.get('customers', 5200) }}"></div>
+        <div><div class="label">Rezygnacje (churn, mies.)</div><input name="churn" type="number" step="0.01" value="{{ data.get('churn', 2.6) }}"></div>
+        <div><div class="label">Subskrypcje MRR</div><input name="mrr" type="number" step="0.01" value="{{ data.get('mrr', 35000) }}"></div>
+      </div>
+      <div style="margin-top:10px;display:flex;gap:10px">
+        <button type="button" onclick="calcM()">Przelicz</button>
+        <button type="button" class="ghost" onclick="saveM()">Zapisz</button>
+      </div>
+    </form>
+  </div>
+  <div class="card">
+    <h3>Wyniki (Marketing KPI)</h3>
+    <div class="kpi-list" id="mkpi"></div>
+    <canvas id="mchart" height="120" style="margin-top:12px"></canvas>
+  </div>
+</div>
+<script>
+function readM(){const fd=new FormData(document.getElementById('m-form')); const o={}; fd.forEach((v,k)=>o[k]=parseFloat(v)); return o;}
+function calcM(){
+  const d=readM();
+  const ctr = (d.clicks||0) / Math.max(d.impressions||1,1) * 100;
+  const cvr = (d.conversions||0) / Math.max(d.sessions||1,1) * 100;
+  const cpl = (d.m_spend||0) / Math.max(d.leads||1,1);
+  const cpa = (d.m_spend||0) / Math.max(d.conversions||1,1);
+  const romi = ((d.m_revenue||0) - (d.m_spend||0)) / Math.max(d.m_spend||1,1);
+  const roas = (d.m_revenue||0) / Math.max(d.m_spend||1,1);
+  const cac = (d.m_spend||0) / Math.max(d.new_customers||1,1);
+  const ltv = ( (d.aov||0) * 3 ); // placeholder w oparciu o częstotliwość 3 zakupy
+  const clv_cac = ltv / Math.max(cac,1e-6);
+  const nrr = ((d.mrr||0) - (d.churn||0)/100.0 * (d.mrr||0)) / Math.max(d.mrr||1,1) * 100;
+  const aov = d.aov||0;
+  const rev_per_visit = (d.m_revenue||0) / Math.max(d.sessions||1,1);
+
+  const KPIs=[
+    ['ROMI', romi, 'x'],
+    ['ROAS', roas, 'x'],
+    ['CTR %', ctr, '%'],
+    ['CVR %', cvr, '%'],
+    ['CPL', cpl, 'PLN'],
+    ['CPA', cpa, 'PLN'],
+    ['CAC', cac, 'PLN'],
+    ['LTV (szac.)', ltv, 'PLN'],
+    ['CLV:CAC', clv_cac, 'x'],
+    ['NRR %', nrr, '%'],
+    ['AOV', aov, 'PLN'],
+    ['Rev/Visit', rev_per_visit, 'PLN']
+  ];
+  const box=document.getElementById('mkpi'); box.innerHTML='';
+  KPIs.forEach(([n,v,u])=>{
+    const row=document.createElement('div'); row.className='kpi';
+    const val=(typeof v==='number')? (Math.round(v*100)/100) : v;
+    row.innerHTML=`<span>${n}</span><span><b>${val}</b> <span class="small">${u||''}</span></span>`; box.appendChild(row);
+  });
+  const ctx=document.getElementById('mchart'); const data={
+    labels:['CTR%','CVR%','ROMI','ROAS','CPL','CPA'],
+    datasets:[{label:'Marketing',data:[ctr,cvr,romi,roas,cpl,cpa]}]
+  };
+  if(window._mc) window._mc.destroy();
+  window._mc=new Chart(ctx,{type:'bar',data,options:{responsive:true,plugins:{legend:{display:false}}}});
+}
+async function saveM(){
+  const d=readM();
+  await fetch('/api/marketing',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});
+  calcM();
+}
+window.addEventListener('load',calcM);
+</script>
+{% endblock %}

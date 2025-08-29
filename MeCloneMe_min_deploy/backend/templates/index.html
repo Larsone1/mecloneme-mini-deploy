@@ -1,11 +1,4 @@
-
 {% extends "base.html" %}{% block content %}
-<div class="grid">
-  {% for href, label in links %}
-  <div class="card">
-    <div class="row"><div>{{ label }}</div><a class="btn" href="{{ href }}">Otwórz</a></div>
-    <div class="small">{{ href }}</div>
-  </div>
-  {% endfor %}
-</div>
+<h2>Start</h2>
+<p>Przejdź do <a href="/start">/start</a>.</p>
 {% endblock %}

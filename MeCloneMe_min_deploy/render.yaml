@@ -1,7 +1,6 @@
 services:
   - type: web
-    name: mecloneme-mini
+    name: mecloneme-mini-deploy
     env: docker
     plan: free
-    autoDeploy: true
-    healthCheckPath: /auth/challenge
+    autoDeploy: false

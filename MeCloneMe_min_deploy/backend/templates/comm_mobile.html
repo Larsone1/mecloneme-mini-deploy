@@ -1,20 +1,15 @@
-
 {% extends "base.html" %}{% block content %}
-<div class="mic-wrap card">
-  <div class="hint">Naciśnij przycisk i mów do klona. GLOW sygnalizuje nasłuch.</div>
-  <div class="mic" id="mic"><img src="/static/img/mic_button.png" alt="mic"></div>
-  <div><button class="btn" id="btn">Start / Stop</button></div>
-  <div class="small">MVP stub – POST /ingest/listen</div>
+<h2>Komunikator — Klon</h2>
+<div class="card">
+  <div class="mic-wrap">
+    <div class="mic">
+      <div class="pulse"></div>
+      <img src="/static/img/mic_button.png" alt="mic"/>
+    </div>
+  </div>
+  <div style="display:flex;gap:10px;justify-content:center">
+    <form method="post" action="/ingest/listen"><button type="submit">Nagraj 10s i wyślij (stub)</button></form>
+    <a href="/start"><button class="ghost" type="button">START</button></a>
+  </div>
 </div>
-<script>
-  let listening=false;
-  const mic = document.getElementById('mic'), btn = document.getElementById('btn');
-  btn.onclick = () => {
-    listening = !listening;
-    mic.classList.toggle('listening', listening);
-    if(listening){
-      fetch('/ingest/listen', {method:'POST'}).then(()=>{});
-    }
-  };
-</script>
 {% endblock %}
