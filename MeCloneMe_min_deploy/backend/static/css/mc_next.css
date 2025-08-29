@@ -1,18 +1,11 @@
-/* MCM NEXT — mobile welcome gradient (3-point, tilt 13.3° left from vertical) */
-/* Do not modify legacy styles; this layer only adds visuals for selected routes. */
+/* Gradient for mobile/start — 3 points, 13.3° left from vertical */
 :root{
-  --mcm-grad-angle: 346.7deg;    /* 0deg (top) minus 13.3deg = 346.7deg */
-  --mcm-grad-c1: #000000;        /* edges */
-  --mcm-grad-c2: #00296B;        /* middle (H217 S100 L21) */
+  --mcm-grad-angle: 346.7deg;
+  --mcm-grad-c1: #000000;
+  --mcm-grad-c2: #00296B; /* H217 S100 L21 */
 }
-
 body.mcm-gradient-mobile{
   min-height: 100svh;
-  background: linear-gradient(
-    var(--mcm-grad-angle),
-    var(--mcm-grad-c1) 0%,
-    var(--mcm-grad-c2) 51%,
-    var(--mcm-grad-c1) 100%
-  );
+  background: linear-gradient(var(--mcm-grad-angle), var(--mcm-grad-c1) 0%, var(--mcm-grad-c2) 51%, var(--mcm-grad-c1) 100%);
   background-attachment: fixed;
 }

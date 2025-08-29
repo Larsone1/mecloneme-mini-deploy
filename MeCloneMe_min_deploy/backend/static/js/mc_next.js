@@ -1,12 +1,8 @@
-// MCM NEXT — enable mobile welcome gradient without touching templates
-// Routes where gradient is active (edit if needed):
-const MCM_GRAD_ROUTES = new Set(['/mobile', '/start']);
-
+// Turn on the gradient on these routes (edit this list if needed)
+const MCM_GRAD_ROUTES = new Set(['/mobile', '/start', '/comm/mobile']);
 document.addEventListener('DOMContentLoaded', () => {
-  try{
-    const path = window.location.pathname.replace(/\/$/, '');
-    if (MCM_GRAD_ROUTES.has(path) || (path==='' && MCM_GRAD_ROUTES.has('/'))){
-      document.body.classList.add('mcm-gradient-mobile');
-    }
-  }catch(e){ /* no-op */ }
+  const path = window.location.pathname.replace(/\/$/, '');
+  if (MCM_GRAD_ROUTES.has(path) || (path==='' && MCM_GRAD_ROUTES.has('/'))) {
+    document.body.classList.add('mcm-gradient-mobile');
+  }
 });
