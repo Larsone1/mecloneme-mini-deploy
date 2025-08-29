@@ -1,22 +1,12 @@
+// MCM NEXT — enable mobile welcome gradient without touching templates
+// Routes where gradient is active (edit if needed):
+const MCM_GRAD_ROUTES = new Set(['/mobile', '/start']);
 
-(function ensureChartJs(){if(!window.Chart){var s=document.createElement('script');s.src='https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js';s.defer=true;document.head.appendChild(s)}})();
-const $=(sel,root=document)=>root.querySelector(sel);
-function saveForm(form,key){const data=Object.fromEntries(new FormData(form).entries());localStorage.setItem(key,JSON.stringify(data));return data}
-function loadForm(form,key){const raw=localStorage.getItem(key);if(!raw)return{};const data=JSON.parse(raw);Object.keys(data).forEach(k=>{if(form.elements[k])form.elements[k].value=data[k]});return data}
-function calcFinanceKPIs(d){const n=k=>parseFloat(d[k]||0);const revenue=n('revenue'),cogs=n('cogs'),netIncome=n('net_income'),ar=n('accounts_receivable'),ap=n('accounts_payable'),inventory=n('inventory'),spd=revenue/365,cpd=cogs/365;const gm=revenue?((revenue-cogs)/revenue)*100:0,nm=revenue?(netIncome/revenue)*100:0,dso=spd?(ar/spd):0,dpo=cpd?(ap/cpd):0,dih=cpd?(inventory/cpd):0,ccc=dso+dih-dpo;return{grossMargin:gm,netMargin:nm,dso,dpo,dih,ccc}}
-function calcMarketingKPIs(d){const n=k=>parseFloat(d[k]||0);const ms=n('marketing_spend'),mr=n('marketing_revenue'),nc=n('new_customers'),clk=n('clicks'),imp=n('impressions'),act=n('actions'),leads=n('leads'),sess=n('sessions'),conv=n('conversions'),cy=n('csat_yes'),ct=n('csat_total'),prom=n('promoters'),det=n('detractors'),nt=n('nps_total'),ltv=n('ltv'),cpls=n('cpl_spend');const romi=ms?((mr-ms)/ms)*100:0,cac=nc?(ms/nc):0,ctr=imp?(clk/imp)*100:0,cpa=act?(ms/act):0,cpl=leads?(cpls/leads):0,cr=sess?(conv/sess)*100:0,csat=ct?(cy/ct)*100:0,nps=nt?((prom-det)/nt)*100:0;return{romi,cac,ctr,cpa,cpl,convRate:cr,csat,nps,ltv}}
-function renderBar(ctx,labels,values,title){if(!window.Chart){setTimeout(()=>renderBar(ctx,labels,values,title),200);return}if(ctx._chart)ctx._chart.destroy();ctx._chart=new Chart(ctx,{type:'bar',data:{labels,datasets:[{label:title,data:values}]},options:{responsive:true,plugins:{legend:{display:false},title:{display:false}}}})}
-(function initFinance(){const form=document.querySelector('#finance-form');if(!form)return;const key='mc_finance_form_v1';loadForm(form,key);const out=$('#finance-out');function draw(e){if(e)e.preventDefault();const d=saveForm(form,key);const m=calcFinanceKPIs(d);out.innerHTML=`<div class="row">
-<div class="chart-card"><div class="chart-title">Gross Margin %</div><canvas id="c1"></canvas></div>
-<div class="chart-card"><div class="chart-title">Net Margin %</div><canvas id="c2"></canvas></div>
-<div class="chart-card"><div class="chart-title">DSO / DPO / DIH (days)</div><canvas id="c3"></canvas></div>
-<div class="chart-card"><div class="chart-title">Cash Conversion Cycle (days)</div><canvas id="c4"></canvas></div></div>`;renderBar(document.getElementById('c1'),['Gross'],[+m.grossMargin.toFixed(2)],'Gross');renderBar(document.getElementById('c2'),['Net'],[+m.netMargin.toFixed(2)],'Net');renderBar(document.getElementById('c3'),['DSO','DPO','DIH'],[m.dso,m.dpo,m.dih].map(v=>+v.toFixed(1)),'Working Capital');renderBar(document.getElementById('c4'),['CCC'],[+m.ccc.toFixed(1)],'CCC')}form.addEventListener('submit',draw);draw()})();
-(function initMarketing(){const form=document.querySelector('#marketing-form');if(!form)return;const key='mc_marketing_form_v1';loadForm(form,key);const out=document.querySelector('#marketing-out');function draw(e){if(e)e.preventDefault();const d=saveForm(form,key);const m=calcMarketingKPIs(d);out.innerHTML=`<div class="row">
-<div class="chart-card"><div class="chart-title">ROMI %</div><canvas id="m1"></canvas></div>
-<div class="chart-card"><div class="chart-title">CAC</div><canvas id="m2"></canvas></div>
-<div class="chart-card"><div class="chart-title">CTR %</div><canvas id="m3"></canvas></div>
-<div class="chart-card"><div class="chart-title">CPA / CPL</div><canvas id="m4"></canvas></div>
-<div class="chart-card"><div class="chart-title">Conversion Rate %</div><canvas id="m5"></canvas></div>
-<div class="chart-card"><div class="chart-title">CSAT % / NPS</div><canvas id="m6"></canvas></div>
-<div class="chart-card"><div class="chart-title">LTV</div><canvas id="m7"></canvas></div></div>`;renderBar(document.getElementById('m1'),['ROMI'],[+m.romi.toFixed(2)],'ROMI');renderBar(document.getElementById('m2'),['CAC'],[+m.cac.toFixed(2)],'CAC');renderBar(document.getElementById('m3'),['CTR'],[+m.ctr.toFixed(2)],'CTR');renderBar(document.getElementById('m4'),['CPA','CPL'],[+m.cpa.toFixed(2),+m.cpl.toFixed(2)],'CPA/CPL');renderBar(document.getElementById('m5'),['Conv'],[+m.convRate.toFixed(2)],'Conv');renderBar(document.getElementById('m6'),['CSAT','NPS'],[+m.csat.toFixed(2),+m.nps.toFixed(2)],'CSAT/NPS');renderBar(document.getElementById('m7'),['LTV'],[+m.ltv.toFixed(2)],'LTV')}form.addEventListener('submit',draw);draw()})();
-(function micGlow(){const wrap=document.querySelector('.mic-wrap');if(!wrap)return;let level=0;let stream=null;function setGlow(l){wrap.classList.remove('glow-min','glow-mid','glow-max');wrap.classList.add(l===0?'glow-min':l===1?'glow-mid':'glow-max')}setGlow(0);const mic=document.querySelector('.mic');mic.addEventListener('click',async()=>{level=(level+1)%3;setGlow(level);try{if(!stream){stream=await navigator.mediaDevices.getUserMedia({audio:true})}else{stream.getTracks().forEach(t=>t.stop());stream=null}}catch(e){console.warn('Audio not permitted',e)}})})();
+document.addEventListener('DOMContentLoaded', () => {
+  try{
+    const path = window.location.pathname.replace(/\/$/, '');
+    if (MCM_GRAD_ROUTES.has(path) || (path==='' && MCM_GRAD_ROUTES.has('/'))){
+      document.body.classList.add('mcm-gradient-mobile');
+    }
+  }catch(e){ /* no-op */ }
+});
