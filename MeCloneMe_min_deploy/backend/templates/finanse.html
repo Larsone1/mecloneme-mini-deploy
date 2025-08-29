@@ -1,0 +1,110 @@
+
+{% extends "base.html" %}{% block content %}
+<div class="card">
+  <h3>Finanse — KPI (CFO set)</h3>
+  <p class="hint">Uzupełnij pola wejściowe po lewej — wyniki przeliczą się automatycznie. Zapisz zestaw „Zapisz dane”.</p>
+  <form class="kpi" id="form">
+    <div class="kpi"><label>Przychód (Revenue)
+      <input type="number" step="0.01" name="revenue" value="{{ (initial.get('revenue') if initial else '') or '' }}"></label></div>
+    <div class="kpi"><label>Koszty ogółem (Costs)
+      <input type="number" step="0.01" name="costs" value="{{ (initial.get('costs') if initial else '') or '' }}"></label></div>
+    <div class="kpi"><label>Budżet marketing (Mkt Spend)
+      <input type="number" step="0.01" name="mkt" value="{{ (initial.get('mkt') if initial else '') or '' }}"></label></div>
+    <div class="kpi"><label>Nowi klienci (New Customers)
+      <input type="number" step="1" name="new_customers" value="{{ (initial.get('new_customers') if initial else '') or '' }}"></label></div>
+    <div class="kpi"><label>Śr. marża / klient (Gross Margin per customer)
+      <input type="number" step="0.01" name="margin_per_cust" value="{{ (initial.get('margin_per_cust') if initial else '') or '' }}"></label></div>
+    <div class="kpi"><label>Śr. miesięczny przychód / klient (ARPU)
+      <input type="number" step="0.01" name="arpu" value="{{ (initial.get('arpu') if initial else '') or '' }}"></label></div>
+    <div class="kpi"><label>Śr. czas życia (miesiące) (Lifetime months)
+      <input type="number" step="1" name="lifetime_months" value="{{ (initial.get('lifetime_months') if initial else '') or '' }}"></label></div>
+    <div class="kpi"><label>Leady (Leads)
+      <input type="number" step="1" name="leads" value="{{ (initial.get('leads') if initial else '') or '' }}"></label></div>
+    <div class="kpi"><label>Kliknięcia (Clicks)
+      <input type="number" step="1" name="clicks" value="{{ (initial.get('clicks') if initial else '') or '' }}"></label></div>
+    <div class="kpi"><label>Wyświetlenia (Impressions)
+      <input type="number" step="1" name="impressions" value="{{ (initial.get('impressions') if initial else '') or '' }}"></label></div>
+  </form>
+  <div style="margin:10px 0"><button class="btn" onclick="save()">Zapisz dane</button></div>
+</div>
+
+<div class="grid" style="margin-top:16px">
+  <div class="kpi-card"><div class="kpi-title">ROI</div><div id="kpi_roi" class="row"><div class="bar" style="flex:1"><i id="bar_roi" style="width:0%"></i></div><div class="small" id="txt_roi">0%</div></div></div>
+  <div class="kpi-card"><div class="kpi-title">ROMI</div><div id="kpi_romi" class="row"><div class="bar" style="flex:1"><i id="bar_romi" style="width:0%"></i></div><div class="small" id="txt_romi">0%</div></div></div>
+  <div class="kpi-card"><div class="kpi-title">CAC</div><div class="small" id="txt_cac">–</div><svg class="spark" id="spark_cac"></svg></div>
+  <div class="kpi-card"><div class="kpi-title">LTV</div><div class="small" id="txt_ltv">–</div><svg class="spark" id="spark_ltv"></svg></div>
+  <div class="kpi-card"><div class="kpi-title">Konwersja (Leads → Customers)</div><div class="row"><div class="bar" style="flex:1"><i id="bar_conv" style="width:0%"></i></div><div class="small" id="txt_conv">0%</div></div></div>
+  <div class="kpi-card"><div class="kpi-title">CTR</div><div class="row"><div class="bar" style="flex:1"><i id="bar_ctr" style="width:0%"></i></div><div class="small" id="txt_ctr">0%</div></div></div>
+  <div class="kpi-card"><div class="kpi-title">CPL</div><div class="small" id="txt_cpl">–</div></div>
+  <div class="kpi-card"><div class="kpi-title">Payback (mies.)</div><div class="small" id="txt_payback">–</div></div>
+</div>
+
+<script>
+  const $ = sel => document.querySelector(sel);
+  const F = id => document.forms[0].elements[id];
+  const clamp = (v,min,max)=>Math.max(min,Math.min(max,v||0));
+
+  function number(v){ const n = parseFloat(v); return isNaN(n)?0:n; }
+
+  function calc(){
+    const revenue = number(F('revenue').value);
+    const costs   = number(F('costs').value);
+    const mkt     = number(F('mkt').value);
+    const newC    = number(F('new_customers').value);
+    const marginC = number(F('margin_per_cust').value);
+    const arpu    = number(F('arpu').value);
+    const lifeM   = number(F('lifetime_months').value);
+    const leads   = number(F('leads').value);
+    const clicks  = number(F('clicks').value);
+    const imps    = number(F('impressions').value);
+
+    const profit = revenue - costs;
+    const roi = mkt>0 ? (profit / mkt) * 100 : 0;
+    const romi = mkt>0 ? ((revenue - (costs - mkt)) / mkt) * 100 : 0;
+
+    const cac = newC>0 ? (mkt / newC) : 0;
+    const ltv = (arpu * lifeM);
+    const conv = leads>0 ? (newC / leads) * 100 : 0;
+    const ctr = imps>0 ? (clicks / imps) * 100 : 0;
+    const cpl = leads>0 ? (mkt / leads) : 0;
+    const payback = (ltv>0 && cac>0) ? (cac / (arpu||1)) : 0;
+
+    // Bars
+    $('#bar_roi').style.width = clamp(roi,0,200) + '%';
+    $('#txt_roi').textContent = roi.toFixed(1) + '%';
+    $('#bar_romi').style.width = clamp(romi,0,200) + '%';
+    $('#txt_romi').textContent = romi.toFixed(1) + '%';
+    $('#bar_conv').style.width = clamp(conv,0,100) + '%';
+    $('#txt_conv').textContent = conv.toFixed(1) + '%';
+    $('#bar_ctr').style.width = clamp(ctr,0,100) + '%';
+    $('#txt_ctr').textContent = ctr.toFixed(2) + '%';
+
+    $('#txt_cac').textContent = cac.toFixed(2);
+    $('#txt_ltv').textContent = ltv.toFixed(2);
+    $('#txt_cpl').textContent = cpl.toFixed(2);
+    $('#txt_payback').textContent = payback>0 ? payback.toFixed(1) : '–';
+
+    // Tiny sparks (svg inline)
+    const spark = (el, series) => {
+      const w = el.clientWidth || 160, h = el.clientHeight || 44;
+      const max = Math.max(...series, 1);
+      const pts = series.map((v,i)=>[ (i/(series.length-1))*w, h-(v/max)*h ]);
+      const d = pts.map((p,i)=> (i?'L':'M') + p[0].toFixed(1)+','+p[1].toFixed(1)).join(' ');
+      el.innerHTML = `<path d="${d}" stroke="url(#g)" stroke-width="2" fill="none"/>` +
+                     `<defs><linearGradient id="g" x1="0" x2="1" y1="0" y2="0">
+                       <stop offset="0%" stop-color="#35d07f"/><stop offset="100%" stop-color="#14b8a6"/></linearGradient></defs>`;
+    };
+    spark($('#spark_cac'), [cac*0.7, cac*0.9, cac, cac*0.85, cac*0.95]);
+    spark($('#spark_ltv'), [ltv*0.6, ltv*0.8, ltv, ltv*0.9, ltv*1.05]);
+  }
+
+  function save(){
+    const payload = Object.fromEntries(new FormData(document.getElementById('form')).entries());
+    fetch('/api/finanse', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)})
+      .then(r=>r.json()).then(()=>calc());
+  }
+
+  document.getElementById('form').addEventListener('input', calc);
+  window.addEventListener('load', calc);
+</script>
+{% endblock %}

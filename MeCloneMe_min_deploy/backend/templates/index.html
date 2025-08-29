@@ -1,6 +1,11 @@
 
 {% extends "base.html" %}{% block content %}
-<h1>MeCloneMe — API</h1>
-<div class="card"><p>✔ Live</p>
-<p class="hint">Szybkie linki: <a href="/alerts/ui">/alerts/ui</a> • <a href="/alerts">/alerts</a> • <a href="/alerts/health">/alerts/health</a> • <a href="/comm/mobile">/comm/mobile</a></p></div>
+<div class="grid">
+  {% for href, label in links %}
+  <div class="card">
+    <div class="row"><div>{{ label }}</div><a class="btn" href="{{ href }}">Otwórz</a></div>
+    <div class="small">{{ href }}</div>
+  </div>
+  {% endfor %}
+</div>
 {% endblock %}

@@ -1,11 +1,11 @@
 
 {% extends "base.html" %}{% block content %}
-<h1>Postęp MeCloneMe</h1>
 <div class="grid">
-{% for item in bars %}
-  <div class="card"><div class="kpi"><div><strong>{{ item.code }}</strong> — {{ item.title }}</div><span>{{ item.pct }}%</span></div>
-  <div class="progress"><i style="width:{{ item.pct }}%"></i></div></div>
-{% endfor %}
+  {% for label, pct in items %}
+    <div class="kpi-card">
+      <div class="row"><div class="kpi-title">{{ label }}</div><div class="small">{{ pct }}%</div></div>
+      <div class="bar"><i style="width: {{ pct }}%"></i></div>
+    </div>
+  {% endfor %}
 </div>
-<p class="hint">Szybkie linki: <a href="/alerts/ui">/alerts/ui</a> • <a href="/docs">/docs</a></p>
 {% endblock %}

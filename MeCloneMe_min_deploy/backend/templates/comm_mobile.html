@@ -1,17 +1,20 @@
 
 {% extends "base.html" %}{% block content %}
-<h1>Mobile (dark)</h1>
-<div class="card"><p class="hint">Mock widoku + Start/Stop „nasłuch oryginału”.</p>
-<div style="display:flex;gap:12px;flex-wrap:wrap">
-  <button class="btn ok" onclick="toggleListen()"><span id="btnLabel">Start nasłuchu</span></button>
-  <a class="btn" href="/progress">Podgląd postępów</a>
-</div></div>
+<div class="mic-wrap card">
+  <div class="hint">Naciśnij przycisk i mów do klona. GLOW sygnalizuje nasłuch.</div>
+  <div class="mic" id="mic"><img src="/static/img/mic_button.png" alt="mic"></div>
+  <div><button class="btn" id="btn">Start / Stop</button></div>
+  <div class="small">MVP stub – POST /ingest/listen</div>
+</div>
 <script>
-let listening=false;
-async function toggleListen(){
-  listening=!listening;
-  document.getElementById('btnLabel').textContent = listening? "Stop nasłuchu":"Start nasłuchu";
-  try{ await fetch('/ingest/listen',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({listening})}); }catch(e){}
-}
+  let listening=false;
+  const mic = document.getElementById('mic'), btn = document.getElementById('btn');
+  btn.onclick = () => {
+    listening = !listening;
+    mic.classList.toggle('listening', listening);
+    if(listening){
+      fetch('/ingest/listen', {method:'POST'}).then(()=>{});
+    }
+  };
 </script>
 {% endblock %}

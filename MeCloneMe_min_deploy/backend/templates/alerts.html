@@ -1,0 +1,15 @@
+
+{% extends "base.html" %}{% block content %}
+<div class="card"><h3>Alerts</h3>
+  <div class="grid">
+    {% for a in alerts %}
+    <div class="kpi-card">
+      <div class="kpi-title">{{ a.title }}</div>
+      <div class="small">Score: {{ a.score }} • Source: {{ a.source }}</div>
+      <div style="margin:8px 0" class="bar"><i style="width: {{ a.score }}%"></i></div>
+      <div>{% for t in a.tags %}<span class="pill">{{ t }}</span>{% endfor %}</div>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endblock %}

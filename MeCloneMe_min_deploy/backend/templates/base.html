@@ -1,16 +1,20 @@
 
 <!doctype html><html lang="pl"><head>
-<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>{{ title or "MeCloneMe — API" }}</title>
-<link rel="stylesheet" href="/static/styles.css"/>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ title or "MeCloneMe" }}</title>
+<link rel="stylesheet" href="/static/css/styles.css">
 </head><body>
-<nav class="nav">
-  <span class="logo">Me<i>Clone</i>Me</span>
-  <a href="/start" class="primary">START</a>
-  <a href="/progress">Postęp</a>
-  <a href="/alerts/ui">Alerts</a>
-  <a href="/docs">Docs</a>
-  <span class="badge">v0.3.10</span>
-</nav>
-<main class="wrap">{% block content %}{% endblock %}<div class="footer">© MeCloneMe — The New Age Communication</div></main>
+<div class="wrap">
+  <header>
+    <img src="/static/img/logo_mecloneme.png" class="logo" alt="MeCloneMe">
+    <nav>
+      <a href="/start">START</a>
+      <a href="/progress">Postęp</a>
+      <a href="/finanse">Finanse</a>
+      <a href="/alerts/ui">Alerts</a>
+      <a href="/comm/mobile">Komunikator</a>
+    </nav>
+  </header>
+  {% block content %}{% endblock %}
+</div>
 </body></html>
