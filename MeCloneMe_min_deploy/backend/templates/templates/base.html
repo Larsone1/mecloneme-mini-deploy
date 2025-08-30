@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="pl">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+    <title>{% block title %}MeCloneMe{% endblock %}</title>
+
+    <!-- PWA / iOS -->
+    <link rel="manifest" href="/static/manifest.webmanifest">
+    <meta name="theme-color" content="#0b1525">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="MeCloneMe">
+    <link rel="apple-touch-icon" href="/static/icons/apple-touch-icon-180.png">
+
+    <!-- Main stylesheet (keep your existing one) -->
+    <link rel="stylesheet" href="/static/css/styles.css">
+
+    <script>
+      // Service Worker register: try root /sw.js, fallback to /static/js/sw.js if needed
+      (function() {
+        if (!('serviceWorker' in navigator)) return;
+        const tryRegister = async () => {
+          try {
+            // Root scope – best for PWA install
+            const reg = await navigator.serviceWorker.register('/sw.js');
+            try { reg.update(); } catch(e) {}
+          } catch (e) {
+            try {
+              // Fallback – still caches static assets
+              const reg2 = await navigator.serviceWorker.register('/static/js/sw.js');
+              try { reg2.update(); } catch(e2) {}
+            } catch (e2) {
+              console.warn('SW registration failed both at /sw.js and /static/js/sw.js');
+            }
+          }
+        };
+        window.addEventListener('load', tryRegister, { once: true });
+      })();
+    </script>
+
+    {% block head %}{% endblock %}
+    <style>
+      /* Basic container to preserve existing look if child template has just block content */
+      body{background:#0b1525;color:#e9eef7;margin:0}
+      .container{max-width:1100px;margin:0 auto;padding:16px}
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      {% block content %}{% endblock %}
+    </div>
+    {% block scripts %}{% endblock %}
+  </body>
+</html>
