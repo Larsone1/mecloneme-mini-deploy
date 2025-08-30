@@ -1,1 +1,91 @@
-{% extends 'base.html' %}{% block content %}Start{% endblock %}
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>MeCloneMe — start</title>
+  <meta name="theme-color" content="#000000">
+  <style>
+    :root{
+      --splash-angle:166.7deg;
+      --splash-mid:51%;
+      --splash-c1:#000000;
+      --splash-c2:#00296b; /* HSL(217,100%,21%) */
+      --splash-c3:#000000;
+      --logo-delay:1.5s;
+      --logo-dur:4s;
+      --idle-after:3s;
+      --powered-dur:1.2s;
+      --powered-bottom:6.5vh; /* ≈ 93.5% ekranu od góry */
+    }
+    html,body{height:100%;margin:0}
+    body{
+      background:linear-gradient(var(--splash-angle),
+        var(--splash-c1) 0%,
+        var(--splash-c2) var(--splash-mid),
+        var(--splash-c3) 100%
+      );
+      min-height:100svh;
+      overflow:hidden;
+      color:#fff;
+      font-family:system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    }
+    .wrap{
+      position:relative;
+      height:100%;
+      width:100%;
+    }
+    .logo{
+      position:absolute;
+      left:50%; top:50%;
+      width:66vw; max-width:880px;
+      transform:translate(-50%,-50%) scale(.98);
+      opacity:0;
+      animation:logoFade var(--logo-dur) ease forwards;
+      animation-delay:var(--logo-delay);
+      will-change:opacity,transform;
+      filter:drop-shadow(0 12px 24px rgba(0,0,0,.45));
+    }
+    @keyframes logoFade{
+      0%{opacity:0; transform:translate(-50%,-50%) scale(.98)}
+      100%{opacity:1; transform:translate(-50%,-50%) scale(1)}
+    }
+    .powered{
+      position:absolute;
+      left:50%;
+      bottom:var(--powered-bottom);
+      transform:translate(-50%,120%);
+      opacity:0;
+      font-size:clamp(12px,1.8vw,14px);
+      letter-spacing:.04em;
+      color:#e5c13a;
+      text-shadow:0 0 8px rgba(0,0,0,.45);
+      animation:poweredUp var(--powered-dur) ease-out forwards;
+      animation-delay:calc(var(--logo-delay) + var(--logo-dur) + var(--idle-after));
+    }
+    .powered .brand{font-weight:600}
+    @keyframes poweredUp{
+      0%{transform:translate(-50%,120%);opacity:0}
+      100%{transform:translate(-50%,0%);opacity:1}
+    }
+    /* bezpieczny obszar dla telefonów z notchem */
+    @supports(padding: env(safe-area-inset-top)){
+      .wrap{ padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+    }
+  </style>
+  <link rel="preload" href="/static/img/logo_mecloneme.png" as="image">
+</head>
+<body>
+  <main class="wrap" aria-label="Ekran powitalny">
+    <img class="logo" src="/static/img/logo_mecloneme.png" alt="MeCloneMe" width="1050" height="210" />
+    <div class="powered" aria-hidden="true">powered by <span class="brand">Trustanica</span></div>
+  </main>
+  <script>
+    // Po animacjach przechodzimy do /onboarding
+    const totalMs = (1.5 + 4.0 + 3.0 + 1.2 + 0.3) * 1000; // +bufor
+    window.addEventListener('load', () => {
+      setTimeout(() => { window.location.assign('/onboarding'); }, totalMs);
+    });
+  </script>
+</body>
+</html>
