@@ -1,53 +1,61 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pathlib import Path
+import time, os
 
 app = FastAPI(title="MeCloneMe")
 BASE = Path(__file__).parent
+
+# statics
 app.mount("/static", StaticFiles(directory=str(BASE / "static")), name="static")
 templates = Jinja2Templates(directory=str(BASE / "templates"))
 
-# --- Health (Render) ---
+# VERSION for cache busting
+templates.env.globals["version"] = str(int(time.time()))
+
+# health
 @app.get("/alerts/health")
 def health():
     return JSONResponse({"ok": True})
 
-def tpl(name: str, request: Request):
-    return templates.TemplateResponse(name, {"request": request})
+# root SW + manifest (ważne dla PWA)
+@app.get("/sw.js")
+def sw_root():
+    return FileResponse(BASE / "static" / "js" / "sw.js", media_type="application/javascript")
 
-# --- Standard pages ---
+@app.get("/manifest.webmanifest")
+def manifest_root():
+    return FileResponse(BASE / "static" / "manifest.webmanifest", media_type="application/manifest+json")
+
+# pages
 @app.get("/", response_class=HTMLResponse)
-def root(request: Request):           return tpl("index.html", request)
+def splash(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
 
-@app.get("/start", response_class=HTMLResponse)
-def start(request: Request):          return tpl("start.html", request)
+@app.get("/pwa", response_class=HTMLResponse)
+def pwa_page(request: Request):
+    return templates.TemplateResponse("pwa_boot.html", {"request": request})
 
-@app.get("/mobile", response_class=HTMLResponse)
-def mobile(request: Request):         return tpl("mobile.html", request)
-
-@app.get("/comm/mobile", response_class=HTMLResponse)
-def comm_mobile(request: Request):    return tpl("comm_mobile.html", request)
-
-@app.get("/marketing", response_class=HTMLResponse)
-def marketing(request: Request):      return tpl("marketing.html", request)
-
-@app.get("/finanse", response_class=HTMLResponse)
-def finanse(request: Request):        return tpl("finanse.html", request)
-
-@app.get("/progress", response_class=HTMLResponse)
-def progress(request: Request):       return tpl("progress.html", request)
-
-# --- Onboarding (inline) ---
 @app.get("/onboarding", response_class=HTMLResponse)
 def onboarding(request: Request):
-    # użyjemy gotowego szablonu z templates/
-    return tpl("onboarding_mobile.html", request)
+    return templates.TemplateResponse("onboarding_mobile.html", {"request": request})
 
-# --- Optional: include router if present (routes_onboarding.py) ---
-try:
-    from .routes_onboarding import router as onboarding_router  # type: ignore
-    app.include_router(onboarding_router)
-except Exception:
-    pass
+@app.get("/start", response_class=HTMLResponse)
+def start(request: Request): return templates.TemplateResponse("start.html", {"request": request})
+
+@app.get("/mobile", response_class=HTMLResponse)
+def mobile(request: Request): return templates.TemplateResponse("mobile.html", {"request": request})
+
+@app.get("/comm/mobile", response_class=HTMLResponse)
+def comm_mobile(request: Request): return templates.TemplateResponse("comm_mobile.html", {"request": request})
+
+@app.get("/marketing", response_class=HTMLResponse)
+def marketing(request: Request): return templates.TemplateResponse("marketing.html", {"request": request})
+
+@app.get("/finanse", response_class=HTMLResponse)
+def finanse(request: Request): return templates.TemplateResponse("finanse.html", {"request": request})
+
+@app.get("/progress", response_class=HTMLResponse)
+def progress(request: Request): return templates.TemplateResponse("progress.html", {"request": request})

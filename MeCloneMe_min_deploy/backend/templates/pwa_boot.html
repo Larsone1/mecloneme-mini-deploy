@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>MeCloneMe — Zainstaluj</title>
+  <link rel="manifest" href="/manifest.webmanifest?v={{ version }}">
+  <meta name="theme-color" content="#0b1525">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="MeCloneMe">
+  <link rel="apple-touch-icon" href="/static/icons/apple-touch-icon-180.png">
+  <style>
+    body{margin:0;min-height:100svh;display:grid;place-items:center;background:#0b1525;color:#eaf2ff;
+         font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+    .card{max-width:640px;background:rgba(255,255,255,.08);border-radius:16px;padding:20px;
+          box-shadow:0 12px 40px rgba(0,0,0,.45)}
+    h1{margin:.2em 0 0.4em 0}
+    ol{line-height:1.6}
+    .btn{display:inline-block;background:#ff4fa3;color:#fff;border:none;border-radius:999px;padding:10px 16px;cursor:pointer}
+    .small{opacity:.8;font-size:13px}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Zainstaluj MeCloneMe</h1>
+    <p>Pełnoekranowo, bez pasków przeglądarki. 1 minuta:</p>
+    <h3>iPhone (Safari)</h3>
+    <ol>
+      <li>Stuknij <b>Udostępnij</b> (ikona strzałki w górę).</li>
+      <li>Wybierz <b>Do ekranu początkowego</b>.</li>
+      <li>Otwórz z ikony — wygląd jak natywna apka.</li>
+    </ol>
+    <h3>Android (Chrome)</h3>
+    <ol>
+      <li>Stuknij <b>⋮</b> → <b>Zainstaluj aplikację</b> lub <b>Dodaj do ekranu głównego</b>.</li>
+      <li>Otwórz z ikony — pełny ekran.</li>
+    </ol>
+    <p class="small">Jeśli nie pojawia się opcja instalacji, odśwież tę stronę i pozwól na rejestrację service workera.</p>
+    <div style="margin-top:10px">
+      <button class="btn" id="open">Otwórz aplikację</button>
+    </div>
+  </div>
+  <script>
+    if ('serviceWorker' in navigator) {{ navigator.serviceWorker.register('/sw.js?v={{ version }}').catch(console.warn); }}
+    document.getElementById('open').onclick = () => location.assign('/onboarding?v={{ version }}');
+  </script>
+</body>
+</html>
