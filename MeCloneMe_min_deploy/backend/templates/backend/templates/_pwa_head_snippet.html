@@ -1,0 +1,20 @@
+<!-- MeCloneMe — PWA & Cache-busting (paste inside <head> of templates/base.html) -->
+<link rel="manifest" href="{{ url_for('static', path='manifest.webmanifest') }}?v=2025-08-30-2130">
+<meta name="theme-color" content="#0a1c3a">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="MeCloneMe">
+<link rel="apple-touch-icon" href="/static/img/logo_mecloneme.png">
+
+<!-- Add ?v to your CSS/JS to hard-bust caches after deploy -->
+<!--
+<link rel="stylesheet" href="{{ url_for('static', path='css/mc_p10.css') }}?v=2025-08-30-2130">
+<script defer src="{{ url_for('static', path='js/onboarding.js') }}?v=2025-08-30-2130"></script>
+-->
+
+<script>
+if ('serviceWorker' in navigator) {
+  const v = '2025-08-30-2130';
+  navigator.serviceWorker.register('/static/js/sw.js?v=' + v).catch(console.error);
+}
+</script>
