@@ -1,0 +1,102 @@
+{% set title = "Onboarding Klona (MVP)" %}
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title }}</title>
+  <link rel="stylesheet" href="/static/css/mc_p10.css">
+  <script>
+  // Fallback: wymuś gradient JS-em, gdyby CSS nie doszedł
+  document.addEventListener('DOMContentLoaded', ()=>{
+    if(getComputedStyle(document.body).backgroundImage==='none'){
+      const s=document.body.style;
+      s.background='linear-gradient(346.7deg,#000 0%,#00296B 51%,#000 100%)'; s.backgroundAttachment='fixed';
+    }
+  });
+  </script>
+  <script defer src="/static/js/onboarding.js"></script>
+</head>
+<body>
+  <div class="header">
+    <img src="/static/img/logo_mecloneme.png" alt="MeCloneMe" style="height:22px">
+    <h1>Onboarding klona · MVP</h1>
+  </div>
+  <main class="content">
+    <!-- step: welcome + consents -->
+    <section id="step-welcome" class="card">
+      <h3>Witamy! Zgody i start</h3>
+      <label><input type="checkbox" id="c_tou"> Akceptuję Regulamin/RODO</label>
+      <label><input type="checkbox" id="c_listen"> Zgadzam się na „nasłuch oryginału”</label>
+      <label><input type="checkbox" id="c_posthumous"> Zgadzam się na pośmiertne udostępnienie (opcjonalnie)</label>
+      <div class="row">
+        <input class="input" id="email" type="email" placeholder="E-mail (do powiadomień)">
+        <input class="input" id="dob" type="date" placeholder="Data urodzenia">
+        <input class="input" id="ref" type="text" placeholder="Skąd wiesz o MeCloneMe?">
+      </div>
+      <button class="btn" id="startBtn">Rozpocznij</button>
+    </section>
+
+    <!-- step: voice -->
+    <section id="step-voice" class="card hidden">
+      <h3>Głos — nagraj 3 krótkie próbki</h3>
+      <p class="small">Neutralny · Emocjonalny · Szybki (łącznie 45–90s)</p>
+      <div class="grid">
+        <div><button class="mic" data-idx="1">🎤</button><div class="small">Próbka 1</div></div>
+        <div><button class="mic" data-idx="2">🎤</button><div class="small">Próbka 2</div></div>
+        <div><button class="mic" data-idx="3">🎤</button><div class="small">Próbka 3</div></div>
+        <div><label>lub wgraj pliki: <input type="file" id="voiceFiles" accept="audio/*" multiple></label></div>
+      </div>
+      <div class="progress"><i id="pVoice"></i></div>
+      <div class="row"><button class="btn sec" data-back="#step-welcome">Wstecz</button><button class="btn" data-next="#step-face">Dalej</button></div>
+    </section>
+
+    <!-- step: face/photo/video -->
+    <section id="step-face" class="card hidden">
+      <h3>Wizerunek</h3>
+      <p class="small">Wgraj 5–8 zdjęć (różne kąty/światło) lub 10–15s wideo</p>
+      <div class="row">
+        <input type="file" id="photos" accept="image/*" multiple>
+        <input type="file" id="video" accept="video/*">
+      </div>
+      <div class="progress"><i id="pFace"></i></div>
+      <div class="row"><button class="btn sec" data-back="#step-voice">Wstecz</button><button class="btn" data-next="#step-text">Dalej</button></div>
+    </section>
+
+    <!-- step: writing style -->
+    <section id="step-text" class="card hidden">
+      <h3>Styl pisania — 3 szybkie próbki</h3>
+      <label>Próbka 1<textarea id="t1" rows="2" placeholder="2–3 zdania"></textarea></label>
+      <label>Próbka 2<textarea id="t2" rows="2" placeholder="2–3 zdania"></textarea></label>
+      <label>Próbka 3<textarea id="t3" rows="2" placeholder="2–3 zdania"></textarea></label>
+      <div class="row"><button class="btn sec" data-back="#step-face">Wstecz</button><button class="btn" data-next="#step-summary">Dalej</button></div>
+    </section>
+
+    <!-- step: summary -->
+    <section id="step-summary" class="card hidden">
+      <h3>Podsumowanie & start treningu</h3>
+      <div id="summaryBox" class="small"></div>
+      <button class="btn" id="trainBtn">Rozpocznij trening</button>
+    </section>
+
+    <!-- step: status -->
+    <section id="step-status" class="card hidden">
+      <h3>Status treningu</h3>
+      <div class="progress"><i id="pTrain"></i></div>
+      <div id="statusText" class="small">Oczekiwanie…</div>
+      <div class="row"><button class="btn" id="toTest">Przejdź do testu klona</button></div>
+    </section>
+
+    <!-- step: quick test -->
+    <section id="step-test" class="card hidden">
+      <h3>Szybki test klona</h3>
+      <div class="row">
+        <input class="input" id="testInput" placeholder="Zadaj pytanie">
+        <button class="btn" id="askBtn">Wyślij</button>
+      </div>
+      <div id="chatBox" class="card small"></div>
+      <div class="row"><button class="btn sec" data-back="#step-status">Wstecz</button></div>
+    </section>
+  </main>
+</body>
+</html>
