@@ -4,24 +4,21 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}MeCloneMe{% endblock %}</title>
-
-  <!-- Hard cache-bust + no-cache to force fresh assets on mobile -->
-  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate"/>
-  <meta http-equiv="Pragma" content="no-cache"/>
-  <meta http-equiv="Expires" content="0"/>
-
-  <link rel="stylesheet" href="/static/css/styles.css?v=25083104">
-  <link rel="stylesheet" href="/static/css/mc_p10.css?v=25083104">
-  <link rel="stylesheet" href="/static/css/main.css?v=25083104">
-  <link rel="stylesheet" href="/static/css/mc_next.css?v=25083104">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  <link rel="stylesheet" href="/static/css/styles.css?v=25083109">
+  <link rel="stylesheet" href="/static/css/mc_p10.css?v=25083109">
+  <link rel="stylesheet" href="/static/css/main.css?v=25083109">
+  <link rel="stylesheet" href="/static/css/mc_next.css?v=25083109">
   {% block head_extra %}{% endblock %}
 </head>
 <body>
   {% block body %}{% endblock %}
-  <script defer src="/static/js/force_refresh.js?v=25083104"></script>
-  <script defer src="/static/js/main.js?v=25083104"></script>
-  <script defer src="/static/js/mc_next.js?v=25083104"></script>
-  <script defer src="/static/js/onboarding.js?v=25083104"></script>
-  <script defer src="/static/js/pwa.js?v=25083104"></script>
+  <script defer src="/static/js/main.js?v=25083109"></script>
+  <script defer src="/static/js/mc_next.js?v=25083109"></script>
+  <script defer src="/static/js/onboarding.js?v=25083109"></script>
+  <!-- <script defer src="/static/js/force_refresh_once.js?v=25083109"></script> -->
+  <script defer src="/static/js/pwa.js?v=25083109"></script>
 </body>
 </html>
