@@ -1,102 +1,112 @@
-{% set title = "Onboarding Klona (MVP)" %}
-<!doctype html>
-<html lang="pl">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{ title }}</title>
-  <link rel="stylesheet" href="/static/css/mc_p10.css">
-  <script>
-  // Fallback: wymuś gradient JS-em, gdyby CSS nie doszedł
-  document.addEventListener('DOMContentLoaded', ()=>{
-    if(getComputedStyle(document.body).backgroundImage==='none'){
-      const s=document.body.style;
-      s.background='linear-gradient(346.7deg,#000 0%,#00296B 51%,#000 100%)'; s.backgroundAttachment='fixed';
-    }
-  });
-  </script>
-  <script defer src="/static/js/onboarding.js"></script>
-</head>
-<body>
-  <div class="header">
-    <img src="/static/img/logo_mecloneme.png" alt="MeCloneMe" style="height:22px">
-    <h1>Onboarding klona · MVP</h1>
-  </div>
-  <main class="content">
-    <!-- step: welcome + consents -->
-    <section id="step-welcome" class="card">
-      <h3>Witamy! Zgody i start</h3>
-      <label><input type="checkbox" id="c_tou"> Akceptuję Regulamin/RODO</label>
-      <label><input type="checkbox" id="c_listen"> Zgadzam się na „nasłuch oryginału”</label>
-      <label><input type="checkbox" id="c_posthumous"> Zgadzam się na pośmiertne udostępnienie (opcjonalnie)</label>
-      <div class="row">
-        <input class="input" id="email" type="email" placeholder="E-mail (do powiadomień)">
-        <input class="input" id="dob" type="date" placeholder="Data urodzenia">
-        <input class="input" id="ref" type="text" placeholder="Skąd wiesz o MeCloneMe?">
+{% extends "base.html" %}
+{% block content %}
+<section class="mcm-steps">
+  <div class="mcm-meter" id="mcmMeter"></div>
+  <!-- STEP 1 -->
+  <article class="mcm-step active" data-step="1">
+    <div class="mcm-card">
+      <h2>Witaj w <span style="color:#ff3bac">MeCloneMe</span>!</h2>
+      <p>Jesteśmy pierwszą platformą, która tworzy Twojego cyfrowego klona do rozmów, prezentacji i kampanii.</p>
+      <label>Jak masz na imię?</label>
+      <input id="inpName" placeholder="Twoje imię" style="width:100%;padding:12px 14px;border-radius:12px;border:1.5px solid #cbd5e1;background:#f8fafc">
+      <div class="mcm-actions">
+        <button class="mcm-btn" id="step1next">Dalej</button>
       </div>
-      <button class="btn" id="startBtn">Rozpocznij</button>
-    </section>
+    </div>
+  </article>
 
-    <!-- step: voice -->
-    <section id="step-voice" class="card hidden">
-      <h3>Głos — nagraj 3 krótkie próbki</h3>
-      <p class="small">Neutralny · Emocjonalny · Szybki (łącznie 45–90s)</p>
-      <div class="grid">
-        <div><button class="mic" data-idx="1">🎤</button><div class="small">Próbka 1</div></div>
-        <div><button class="mic" data-idx="2">🎤</button><div class="small">Próbka 2</div></div>
-        <div><button class="mic" data-idx="3">🎤</button><div class="small">Próbka 3</div></div>
-        <div><label>lub wgraj pliki: <input type="file" id="voiceFiles" accept="audio/*" multiple></label></div>
+  <!-- STEP 2 -->
+  <article class="mcm-step" data-step="2">
+    <div class="mcm-card">
+      <h3>Po co Ci klon? <small class="hint">(możesz wybrać kilka)</small></h3>
+      <div class="mcm-choice" data-field="goals">
+        <button class="mcm-chip">Komunikator Klona (rozmowy)</button>
+        <button class="mcm-chip">Kampanie marketingowe</button>
+        <button class="mcm-chip">Panel CEO i raporty</button>
+        <button class="mcm-chip">Obsługa klientów</button>
+        <button class="mcm-chip">Edukacja / kursy</button>
       </div>
-      <div class="progress"><i id="pVoice"></i></div>
-      <div class="row"><button class="btn sec" data-back="#step-welcome">Wstecz</button><button class="btn" data-next="#step-face">Dalej</button></div>
-    </section>
-
-    <!-- step: face/photo/video -->
-    <section id="step-face" class="card hidden">
-      <h3>Wizerunek</h3>
-      <p class="small">Wgraj 5–8 zdjęć (różne kąty/światło) lub 10–15s wideo</p>
-      <div class="row">
-        <input type="file" id="photos" accept="image/*" multiple>
-        <input type="file" id="video" accept="video/*">
+      <div class="mcm-actions">
+        <button class="mcm-btn secondary" data-prev>Wstecz</button>
+        <button class="mcm-btn" data-next>Dalej</button>
       </div>
-      <div class="progress"><i id="pFace"></i></div>
-      <div class="row"><button class="btn sec" data-back="#step-voice">Wstecz</button><button class="btn" data-next="#step-text">Dalej</button></div>
-    </section>
+    </div>
+  </article>
 
-    <!-- step: writing style -->
-    <section id="step-text" class="card hidden">
-      <h3>Styl pisania — 3 szybkie próbki</h3>
-      <label>Próbka 1<textarea id="t1" rows="2" placeholder="2–3 zdania"></textarea></label>
-      <label>Próbka 2<textarea id="t2" rows="2" placeholder="2–3 zdania"></textarea></label>
-      <label>Próbka 3<textarea id="t3" rows="2" placeholder="2–3 zdania"></textarea></label>
-      <div class="row"><button class="btn sec" data-back="#step-face">Wstecz</button><button class="btn" data-next="#step-summary">Dalej</button></div>
-    </section>
-
-    <!-- step: summary -->
-    <section id="step-summary" class="card hidden">
-      <h3>Podsumowanie & start treningu</h3>
-      <div id="summaryBox" class="small"></div>
-      <button class="btn" id="trainBtn">Rozpocznij trening</button>
-    </section>
-
-    <!-- step: status -->
-    <section id="step-status" class="card hidden">
-      <h3>Status treningu</h3>
-      <div class="progress"><i id="pTrain"></i></div>
-      <div id="statusText" class="small">Oczekiwanie…</div>
-      <div class="row"><button class="btn" id="toTest">Przejdź do testu klona</button></div>
-    </section>
-
-    <!-- step: quick test -->
-    <section id="step-test" class="card hidden">
-      <h3>Szybki test klona</h3>
-      <div class="row">
-        <input class="input" id="testInput" placeholder="Zadaj pytanie">
-        <button class="btn" id="askBtn">Wyślij</button>
+  <!-- STEP 3 -->
+  <article class="mcm-step" data-step="3">
+    <div class="mcm-card">
+      <h3>Forma klona</h3>
+      <div class="mcm-choice" data-field="modes">
+        <button class="mcm-chip">Głos</button>
+        <button class="mcm-chip">Wideo</button>
+        <button class="mcm-chip">Tekst</button>
       </div>
-      <div id="chatBox" class="card small"></div>
-      <div class="row"><button class="btn sec" data-back="#step-status">Wstecz</button></div>
-    </section>
-  </main>
-</body>
-</html>
+      <div class="mcm-actions">
+        <button class="mcm-btn secondary" data-prev>Wstecz</button>
+        <button class="mcm-btn" data-next>Dalej</button>
+      </div>
+    </div>
+  </article>
+
+  <!-- STEP 4 -->
+  <article class="mcm-step" data-step="4">
+    <div class="mcm-card">
+      <h3>Preferencje</h3>
+      <div class="mcm-choice" style="grid-template-columns:1fr 1fr">
+        <label>Język klona
+          <select id="lang" style="width:100%;padding:10px;border-radius:10px;border:1.5px solid #cbd5e1;background:#f8fafc">
+            <option value="pl">Polski</option>
+            <option value="en">English</option>
+          </select>
+        </label>
+        <label>Styl wypowiedzi
+          <select id="tone" style="width:100%;padding:10px;border-radius:10px;border:1.5px solid #cbd5e1;background:#f8fafc">
+            <option>Neutralny, profesjonalny</option>
+            <option>Przyjazny i ciepły</option>
+            <option>Energiczny, sprzedażowy</option>
+          </select>
+        </label>
+      </div>
+      <div class="mcm-actions">
+        <button class="mcm-btn secondary" data-prev>Wstecz</button>
+        <button class="mcm-btn" data-next>Dalej</button>
+      </div>
+    </div>
+  </article>
+
+  <!-- STEP 5 (zgody) -->
+  <article class="mcm-step" data-step="5">
+    <div class="mcm-card">
+      <h3>Zgody</h3>
+      <label style="display:flex;gap:10px;align-items:center;margin:.4rem 0">
+        <input type="checkbox" id="g1"> Akceptuję Regulamin / RODO
+      </label>
+      <label style="display:flex;gap:10px;align-items:center;margin:.4rem 0">
+        <input type="checkbox" id="g2"> Zgadzam się na nasłuch oryginału (dla jakości klona)
+      </label>
+      <label style="display:flex;gap:10px;align-items:center;margin:.4rem 0">
+        <input type="checkbox" id="g3"> Pośmiertne udostępnienie (opcjonalnie)
+      </label>
+      <div class="mcm-actions">
+        <button class="mcm-btn secondary" data-prev>Wstecz</button>
+        <button class="mcm-btn" data-next id="finishBtn">Zakończ</button>
+      </div>
+    </div>
+  </article>
+
+  <!-- STEP 6 (summary/status) -->
+  <article class="mcm-step" data-step="6">
+    <div class="mcm-card">
+      <h3>Gotowe! <span id="summaryName"></span>, Twój profil jest utworzony.</h3>
+      <p>Wyliczony status konta: <b id="accountTier">Creator</b></p>
+      <p>Możesz od razu nagrać próbkę głosu lub wrócić później.</p>
+      <div class="mcm-actions">
+        <a class="mcm-btn" href="/comm_mobile">Idź do Komunikatora</a>
+        <a class="mcm-btn secondary" href="/">Strona główna</a>
+      </div>
+    </div>
+  </article>
+</section>
+<script src="/static/js/onboarding.js?v=25083101"></script>
+{% endblock %}

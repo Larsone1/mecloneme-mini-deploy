@@ -1,15 +1,8 @@
-{% extends "base.html" %}{% block content %}
-  <div class="grid">
-    <div class="card">
-      <h3>Witaj w MeCloneMe</h3>
-      <p>Wybierz moduł. Każdy panel ma swojego AI do rozmowy (MVP: Komunikator).</p>
-      <p>
-        <a class="nav" href="/finanse">Finanse</a>
-        <a class="nav" href="/marketing">Marketing</a>
-        <a class="nav" href="/progress">Projekty</a>
-        <a class="nav" href="/alerts/ui">Alerty</a>
-        <a class="nav" href="/comm/mobile">Komunikator</a>
-      </p>
-    </div>
-  </div>
+{% extends "base.html" %}
+{% block content %}
+<main class="mcm-splash">
+  <img src="/static/img/logo_mecloneme.png?v=25083101" alt="MeCloneMe" class="mcm-logo" id="mcmLogo"/>
+  <div class="mcm-powered" id="mcmPowered">powered by Trustanica</div>
+</main>
+<script src="/static/js/splash.js?v=25083101"></script>
 {% endblock %}

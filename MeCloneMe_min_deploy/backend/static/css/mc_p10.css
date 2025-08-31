@@ -1,35 +1,47 @@
+/* === mcm_patch additions === */
 :root{
-  --accent:#ff4fa3; --ok:#16c784; --warn:#ffbf47; --err:#ff4b4b;
-  --glass: rgba(255,255,255,0.06);
+  --mcm-blue-1:#071e3a;
+  --mcm-blue-2:#0d3271;
+  --mcm-neon:#ff3bac;
+  --mcm-gold:#f2cf52;
 }
-*{box-sizing:border-box}
-html,body{height:100%}
-body{
-  margin:0;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#eae;
-  background:linear-gradient(346.7deg,#000 0%,#00296B 51%,#000 100%);
-  background-attachment:fixed;
+.mcm-splash{
+  position:relative;min-height:100vh;display:flex;align-items:center;justify-content:center;
+  background: radial-gradient(120% 120% at 85% 15%, rgba(0,0,0,.95) 0%, rgba(0,0,0,.75) 35%, rgba(2,10,22,.9) 46%),
+              linear-gradient(115deg, var(--mcm-blue-1) 10%, var(--mcm-blue-2) 60%, #00172e 90%);
+  overflow:hidden;
 }
-.header{position:sticky;top:0;padding:12px 16px;background:rgba(0,0,0,.35);
-  backdrop-filter:blur(8px);display:flex;align-items:center;gap:12px}
-.header h1{font-size:16px;margin:0}
-.content{padding:16px}
-.card{background:var(--glass);border:1px solid rgba(255,255,255,.1);
-  border-radius:16px;padding:14px 16px;margin:12px 0}
-.btn{display:inline-block;padding:10px 14px;border-radius:999px;border:none;
-  background:var(--accent);color:#fff;cursor:pointer}
-.btn.sec{background:#1f1f25}
-.btn:disabled{opacity:.5}
-.row{display:flex;gap:8px;flex-wrap:wrap}
-.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
-.input, textarea{width:100%;padding:10px;border-radius:12px;
-  border:1px solid rgba(255,255,255,.15);background:#0f0f14;color:#eee}
-label{display:block;font-size:14px;margin:6px 0}
-.mic{width:72px;height:72px;border-radius:50%;border:none;background:#1d1d22;color:#fff;font-size:26px;cursor:pointer;
-     box-shadow:0 0 0 0 rgba(255,79,163,.7);animation:pulse 2s infinite}
-.mic.active{box-shadow:0 0 0 12px rgba(255,79,163,.35),0 0 24px 8px rgba(255,79,163,.5)}
-@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(255,79,163,.65)}70%{box-shadow:0 0 0 20px rgba(255,79,163,0)}100%{box-shadow:0 0 0 0 rgba(255,79,163,0)}}
-.progress{height:10px;background:#1e1e24;border-radius:999px;overflow:hidden}
-.progress>i{display:block;height:100%;background:var(--ok);width:0%}
-.small{font-size:12px;opacity:.8}
-.center{text-align:center}
-.hidden{display:none!important}
+.mcm-splash .mcm-logo{
+  width:min(66vw,560px);
+  opacity:0; transition:opacity 4s ease; filter: drop-shadow(0 10px 40px rgba(255,59,172,.25));
+}
+.mcm-splash .mcm-logo.show{ opacity:1; }
+
+.mcm-powered{
+  position:absolute; left:50%; transform:translateX(-50%) translateY(120%);
+  bottom:5vh; color:var(--mcm-gold); font-size:clamp(12px,1.9vw,14px); letter-spacing:.4px;
+  opacity:0; transition:transform 800ms ease, opacity 800ms ease;
+}
+.mcm-powered.show{ transform:translateX(-50%) translateY(0%); opacity:1; }
+
+/* Onboarding container */
+.mcm-card{
+  background:rgba(255,255,255,.85); border-radius:22px; padding:18px; 
+  box-shadow:0 8px 34px rgba(0,0,0,.25), inset 0 1px 0 rgba(255,255,255,.35);
+  color:#111;
+}
+.mcm-steps{max-width:900px;margin:0 auto;padding:18px;}
+.mcm-step{display:none;animation:fade .35s ease;}
+.mcm-step.active{display:block;}
+@keyframes fade{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.mcm-actions{display:flex;gap:12px;justify-content:flex-end;margin-top:14px;flex-wrap:wrap}
+.mcm-btn{
+  appearance:none;border:0;border-radius:14px;padding:12px 18px;font-weight:700;
+  background:#121826;color:white;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.25);
+}
+.mcm-btn.secondary{background:#2b2f3a}
+.mcm-choice{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-top:10px}
+.mcm-chip{padding:12px 14px;border-radius:12px;border:1.5px solid rgba(0,0,0,.15);background:rgba(255,255,255,.8);cursor:pointer}
+.mcm-chip.active{border-color:var(--mcm-neon);box-shadow:0 0 0 3px rgba(255,59,172,.15)}
+.mcm-meter{height:8px;border-radius:20px;background:linear-gradient(90deg,#ff3bac,#7a62ff,#00e0ff);filter:saturate(1.1)}
+small.hint{opacity:.7}
