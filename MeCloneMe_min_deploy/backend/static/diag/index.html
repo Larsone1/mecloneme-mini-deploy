@@ -1,11 +1,51 @@
-<!doctype html><html lang="pl"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MCM · Diag</title>
-<style>body{font-family:system-ui;background:#0b0b10;color:#eae;margin:0;padding:24px}a{color:#9ad1ff} .card{max-width:720px;margin:0 auto;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.08);border-radius:14px;padding:16px 18px}</style>
-<div class="card"><h1>MeCloneMe · Szybka diagnostyka</h1>
-<p>Klikalne linki:</p><ul>
-<li><a href="/" target="_blank">/</a></li>
-<li><a href="/start" target="_blank">/start</a></li>
-<li><a href="/comm/mobile" target="_blank">/comm/mobile</a></li>
-<li><a href="/alerts/health" target="_blank">/alerts/health</a></li>
-<li><a href="/static/manifest.webmanifest" target="_blank">/static/manifest.webmanifest</a></li>
-</ul><p>Adres tej strony: <code>/static/diag/index.html</code></p></div>
+<!doctype html>
+<html lang="pl">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>MCM · Narzędzia diagnostyczne</title>
+    <style>
+      body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial,sans-serif;background:#0b1220;color:#e6e6e6;margin:0;padding:32px}
+      .card{max-width:720px;margin:0 auto;background:#121a2b;border-radius:16px;padding:24px;box-shadow:0 10px 30px rgba(0,0,0,.35)}
+      h1{font-size:22px;margin:0 0 12px}
+      p{opacity:.85;line-height:1.5}
+      button{padding:14px 18px;border-radius:10px;border:none;cursor:pointer;font-weight:600}
+      .primary{background:#ff43a1;color:white}
+      .muted{background:#1f2a44;color:#d4d8e7;margin-left:8px}
+      .row{margin-top:16px}
+      code{background:#0b1327;padding:2px 6px;border-radius:6px}
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>MeCloneMe · Narzędzia diagnostyczne</h1>
+      <p>
+        Jeśli widzisz czarny ekran, stare style albo aplikacja „miga” – to zwykle efekt
+        <b>Service Workera</b> oraz pamięci podręcznej przeglądarki (PWA).
+      </p>
+      <p>
+        Kliknij <b>„Wyczyść cache i SW”</b> – wyrejestrujemy SW, czyścimy cache i wracamy do aplikacji
+        z odświeżonym adresem (<code>?bust=...</code>).
+      </p>
+      <div class="row">
+        <button class="primary" id="nuke">Wyczyść cache i SW</button>
+        <button class="muted" id="home">Powrót do aplikacji</button>
+      </div>
+      <p style="opacity:.7;margin-top:20px">
+        Tip: to narzędzie działa też bez tego ekranu – wystarczy dopisać do URL aplikacji
+        <code>?nuke=1</code>. Ten mechanizm jest bezpieczny w codziennym działaniu –
+        nic nie robi, jeśli <code>?nuke=1</code> nie jest obecne.
+      </p>
+    </div>
+    <script>
+      document.getElementById('nuke').onclick = () => {
+        const u = new URL(location.origin + '/');
+        u.searchParams.set('nuke', '1');
+        location.href = u.toString();
+      };
+      document.getElementById('home').onclick = () => {
+        location.href = location.origin + '/';
+      };
+    </script>
+  </body>
+</html>
