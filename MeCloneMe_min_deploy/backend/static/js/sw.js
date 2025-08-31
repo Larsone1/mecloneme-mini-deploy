@@ -1,25 +1,33 @@
-const CACHE = 'mcm-v-25083101';
-self.addEventListener('install', e => {
+// Minimal SW: single-version cache, aggressive update/claim
+const CACHE = 'mcm-25083104';
+
+self.addEventListener('install', (e) => {
   self.skipWaiting();
-  e.waitUntil(caches.open(CACHE));
 });
-self.addEventListener('activate', e => {
+
+self.addEventListener('activate', (e) => {
   e.waitUntil(
-    caches.keys().then(keys => Promise.all(keys.filter(k=>k!==CACHE).map(k=>caches.delete(k)))) 
-    .then(()=> self.clients.claim())
+    caches.keys().then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))) 
+    .then(() => self.clients.claim())
   );
 });
-self.addEventListener('fetch', e => {
-  const url = new URL(e.request.url);
-  if (e.request.mode === 'navigate' || (e.request.method === 'GET' && url.pathname.endsWith('.html'))) {
-    return;
+
+self.addEventListener('fetch', (e) => {
+  const req = e.request;
+  // Network-first for HTML, cache-first for static
+  if (req.headers.get('accept') && req.headers.get('accept').includes('text/html')) {
+    e.respondWith(fetch(req).catch(() => caches.match(req)));
+  } else {
+    e.respondWith(
+      caches.open(CACHE).then(cache =>
+        cache.match(req).then(hit => hit || fetch(req).then(res => {
+          // Only cache ok GET responses
+          if (req.method === 'GET' && res.status === 200) {
+            cache.put(req, res.clone());
+          }
+          return res;
+        }))
+      )
+    );
   }
-  e.respondWith(
-    caches.open(CACHE).then(cache => 
-      cache.match(e.request).then(res => res || fetch(e.request).then(r => {
-        if(r.ok && (url.pathname.startsWith('/static/'))) cache.put(e.request, r.clone());
-        return r;
-      }))
-    )
-  );
 });
