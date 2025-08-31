@@ -1,19 +1,16 @@
-// Unregister any old Service Workers once per version, then reload once.
-(function(){
-  const V = '25083104';
-  try {
-    if (localStorage.getItem('mcm_swfix') !== V) {
-      if ('serviceWorker' in navigator) {
-        navigator.serviceWorker.getRegistrations().then(rs => {
-          return Promise.all(rs.map(r => r.unregister()));
-        }).then(()=>{
-          localStorage.setItem('mcm_swfix', V);
-          // Force network reload
-          location.replace(location.pathname + location.search + (location.search ? '&' : '?') + 'cb=' + V);
-        });
-      }
-    }
-  } catch(e) {
-    console.warn('SW fix error', e);
+// mcm hotfix mcm-20250831-110605-utc
+// Open /static/js/force_refresh.js directly to nuke caches & SW on this device.
+(async () => {
+  if ('serviceWorker' in navigator) {
+    try {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      for (const r of regs) try { await r.unregister(); } catch(_){}
+    } catch(_) {}
   }
+  if ('caches' in window) {
+    const keys = await caches.keys();
+    await Promise.all(keys.map(k => caches.delete(k)));
+  }
+  // Hard reload
+  location.replace(location.pathname + '?bust=mcm-20250831-110605-utc');
 })();
