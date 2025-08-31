@@ -2,45 +2,24 @@
 <html lang="pl">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-  <title>MeCloneMe — start</title>
-
-  <!-- PWA head -->
-  <link rel="manifest" href="/manifest.webmanifest?v={{ version }}">
-  <meta name="theme-color" content="#0b1525">
-  <meta name="apple-mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <meta name="apple-mobile-web-app-title" content="MeCloneMe">
-  <link rel="apple-touch-icon" href="/static/icons/apple-touch-icon-180.png">
-
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MeCloneMe</title>
+  <meta name="theme-color" content="#0b1b3e">
+  <link rel="manifest" href="/static/manifest.webmanifest">
   <style>
-    :root{ --angle:166.7deg; --mid:51%; --c1:#000; --c2:#00296b; --c3:#000;
-           --logo-delay:1.5s; --logo-dur:4s; --idle:3s; --powered-dur:1.2s; --powered-bottom:6.5vh; }
-    html,body{{height:100%;margin:0}}
-    body{{background:linear-gradient(var(--angle),var(--c1) 0%,var(--c2) var(--mid),var(--c3) 100%);overflow:hidden;
-         font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#fff}}
-    .wrap{{position:relative;height:100%;width:100%}}
-    .logo{{position:absolute;left:50%;top:50%;width:66vw;max-width:880px;transform:translate(-50%,-50%) scale(.98);
-          opacity:0;animation:logo var(--logo-dur) ease forwards;animation-delay:var(--logo-delay);
-          filter:drop-shadow(0 12px 24px rgba(0,0,0,.45))}}
-    @keyframes logo{{0%{{opacity:0;transform:translate(-50%,-50%) scale(.98)}}100%{{opacity:1;transform:translate(-50%,-50%) scale(1)}}}}
-    .powered{{position:absolute;left:50%;bottom:var(--powered-bottom);transform:translate(-50%,120%);opacity:0;
-             font-size:clamp(12px,1.8vw,14px);letter-spacing:.04em;color:#e5c13a;text-shadow:0 0 8px rgba(0,0,0,.45);
-             animation:pow var(--powered-dur) ease-out forwards;animation-delay:calc(var(--logo-delay)+var(--logo-dur)+var(--idle))}}
-    @keyframes pow{{0%{{transform:translate(-50%,120%);opacity:0}}100%{{transform:translate(-50%,0%);opacity:1}}}}
+    html,body{height:100%;margin:0;background:#0b1b3e;color:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+    .box{display:flex;align-items:center;justify-content:center;height:100%;}
+    .msg{opacity:.8}
   </style>
+  <script>
+    // natychmiast na onboarding z cache-busterem
+    window.location.replace("/onboarding?v="+Date.now());
+  </script>
+  <noscript>
+    <meta http-equiv="refresh" content="0; url=/onboarding">
+  </noscript>
 </head>
 <body>
-  <main class="wrap">
-    <img class="logo" src="/static/img/logo_mecloneme.png" alt="MeCloneMe" width="1050" height="210">
-    <div class="powered" aria-hidden="true">powered by <strong>Trustanica</strong></div>
-  </main>
-  <script>
-    // register SW at root
-    if ('serviceWorker' in navigator) {{ navigator.serviceWorker.register('/sw.js?v={{ version }}').catch(console.warn); }}
-    // redirect to onboarding after animations
-    const ms = (1.5 + 4.0 + 3.0 + 1.2 + 0.3) * 1000;
-    window.addEventListener('load', () => setTimeout(() => location.assign('/onboarding?v={{ version }}'), ms));
-  </script>
+  <div class="box"><div class="msg">Przekierowuję…</div></div>
 </body>
 </html>
