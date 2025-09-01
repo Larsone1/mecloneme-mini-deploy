@@ -45,3 +45,7 @@
 .mcm-chip.active{border-color:var(--mcm-neon);box-shadow:0 0 0 3px rgba(255,59,172,.15)}
 .mcm-meter{height:8px;border-radius:20px;background:linear-gradient(90deg,#ff3bac,#7a62ff,#00e0ff);filter:saturate(1.1)}
 small.hint{opacity:.7}
+/* --- MCM Hotfix 2025-09-01: Ensure step 1 is visible even if JS is broken or cached --- */
+.mcm-step { display: block !important; }
+.mcm-step:not(.active) { display: none !important; }
+/* --- End hotfix --- */

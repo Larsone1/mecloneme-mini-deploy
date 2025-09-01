@@ -1,7 +1,24 @@
-<!doctype html><html lang="pl"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MeCloneMe · przekierowuję…</title>
-<meta http-equiv="refresh" content="0;url=/onboarding">
-<script>try{location.replace('/onboarding?v='+Date.now())}catch(e){}</script>
-<style>html,body{height:100%;margin:0;display:grid;place-items:center;background:#0b2b5a;color:#eaf2ff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial}</style>
-</head><body>Przekierowuję…</body></html>
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>MeCloneMe — Ładowanie…</title>
+  <!-- Fallback meta refresh (gdy JS wyłączony) -->
+  <meta http-equiv="refresh" content="0;url=/onboarding">
+  <script>
+    // Bezpieczne przekierowanie do Onboarding z bustem cache
+    (function() {
+      try {
+        const u = new URL('/onboarding', location);
+        u.searchParams.set('v', String(Date.now()));
+        location.replace(u);
+      } catch (e) { /* meta-refresh zrobi resztę */ }
+    })();
+  </script>
+  <link rel="manifest" href="/static/manifest.webmanifest">
+</head>
+<body style="margin:0;background:radial-gradient(60% 120% at 50% -10%, #02254d 0%, #062b61 45%, #001229 86%); color:#fff; display:grid; place-items:center; height:100vh; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;">
+  <div style="opacity:.8; font-size:clamp(16px,2.6vw,20px)">Przekierowuję do MeCloneMe…</div>
+</body>
+</html>
