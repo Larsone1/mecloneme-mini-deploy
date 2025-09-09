@@ -1,6 +1,6 @@
-
 from typing import List, Tuple
-PROGRESS: List[Tuple[str,int]] = [
+
+PROGRESS: List[Tuple[str, int]] = [
     ("N01 — SSOT / Router-README", 55),
     ("N04 — Mobile (Camera/Mic)", 20),
     ("N05 — Desktop (Bridge)", 20),
@@ -11,16 +11,20 @@ PROGRESS: List[Tuple[str,int]] = [
     ("N27 — Docs & OpenAPI", 30),
     ("N30 — Core (Live+AR+Guardian)", 40),
 ]
+
+
 def progress_html() -> str:
     items = []
     for label, pct in PROGRESS:
-        items.append(f"""
+        items.append(
+            f"""
         <div class="card">
           <div class="row">
             <div class="label">{label}</div><div class="pct">{pct}%</div>
           </div>
           <div class="bar"><div class="fill" style="width:{pct}%;"></div></div>
-        </div>""")
+        </div>"""
+        )
     return f"""
 <!doctype html>
 <html>

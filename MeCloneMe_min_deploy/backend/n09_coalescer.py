@@ -1,5 +1,11 @@
 from __future__ import annotations
-import json, os, threading, time, uuid, csv, io
+import json
+import os
+import threading
+import time
+import uuid
+import csv
+import io
 from typing import List, Dict, Any
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -11,6 +17,7 @@ router = APIRouter(prefix="/alerts", tags=["alerts"])
 _LOCK = threading.Lock()
 _PATH = os.environ.get("MC_ALERTS_PATH", "/tmp/mecloneme_alerts.json")
 
+
 class Alert(BaseModel):
     id: str
     title: str
@@ -21,43 +28,76 @@ class Alert(BaseModel):
     muted_until: float = 0.0
     updated_at: str
 
+
 def _now() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
 
 def _seed() -> Dict[str, Any]:
     now = _now()
     return {
-        "a": {"id":"a","title":"High error rate","source":"backend","score":88,"tags":["api","errors"],"status":"open","muted_until":0,"updated_at":now},
-        "b": {"id":"b","title":"New signups drop","source":"analytics","score":72,"tags":["funnel"],"status":"open","muted_until":0,"updated_at":now},
-        "c": {"id":"c","title":"Abandoned carts","source":"checkout","score":61,"tags":["shop"],"status":"open","muted_until":0,"updated_at":now},
+        "a": {
+            "id": "a",
+            "title": "High error rate",
+            "source": "backend",
+            "score": 88,
+            "tags": ["api", "errors"],
+            "status": "open",
+            "muted_until": 0,
+            "updated_at": now,
+        },
+        "b": {
+            "id": "b",
+            "title": "New signups drop",
+            "source": "analytics",
+            "score": 72,
+            "tags": ["funnel"],
+            "status": "open",
+            "muted_until": 0,
+            "updated_at": now,
+        },
+        "c": {
+            "id": "c",
+            "title": "Abandoned carts",
+            "source": "checkout",
+            "score": 61,
+            "tags": ["shop"],
+            "status": "open",
+            "muted_until": 0,
+            "updated_at": now,
+        },
     }
+
 
 def _load() -> Dict[str, Any]:
     with _LOCK:
         try:
-            with open(_PATH,"r",encoding="utf-8") as f:
-                data=json.load(f)
+            with open(_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
                 if isinstance(data, dict) and data:
                     return data
         except Exception:
             pass
-        data=_seed()
+        data = _seed()
         try:
-            with open(_PATH,"w",encoding="utf-8") as f:
-                json.dump(data,f)
+            with open(_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
         except Exception:
             pass
         return data
 
+
 def _save(data: Dict[str, Any]):
     with _LOCK:
-        with open(_PATH,"w",encoding="utf-8") as f:
-            json.dump(data,f)
+        with open(_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
 
 @router.get("", response_model=List[Alert])
 def list_alerts():
-    data=_load()
-    return [Alert(**v) for _,v in sorted(data.items())]
+    data = _load()
+    return [Alert(**v) for _, v in sorted(data.items())]
+
 
 class Ingest(BaseModel):
     title: str
@@ -65,43 +105,80 @@ class Ingest(BaseModel):
     score: int = 50
     tags: List[str] = []
 
+
 @router.post("/ingest", response_model=List[Alert])
 def ingest(items: List[Ingest]):
-    data=_load()
+    data = _load()
     for it in items:
-        i=str(uuid.uuid4())[:8]
-        data[i]={"id":i,"title":it.title,"source":it.source,"score":int(it.score),"tags":it.tags,"status":"open","muted_until":0,"updated_at":_now()}
+        i = str(uuid.uuid4())[:8]
+        data[i] = {
+            "id": i,
+            "title": it.title,
+            "source": it.source,
+            "score": int(it.score),
+            "tags": it.tags,
+            "status": "open",
+            "muted_until": 0,
+            "updated_at": _now(),
+        }
     _save(data)
-    return [Alert(**v) for _,v in sorted(data.items())]
+    return [Alert(**v) for _, v in sorted(data.items())]
+
 
 @router.post("/{id}/resolve", response_model=Alert)
 def resolve(id: str):
-    data=_load()
-    if id not in data: raise HTTPException(404,"not found")
-    data[id]["status"]="resolved"; data[id]["updated_at"]=_now(); _save(data)
+    data = _load()
+    if id not in data:
+        raise HTTPException(404, "not found")
+    data[id]["status"] = "resolved"
+    data[id]["updated_at"] = _now()
+    _save(data)
     return Alert(**data[id])
+
 
 @router.post("/{id}/mute", response_model=Alert)
 def mute(id: str, minutes: int = 15):
-    data=_load()
-    if id not in data: raise HTTPException(404,"not found")
-    data[id]["muted_until"]=time.time()+minutes*60; data[id]["updated_at"]=_now(); _save(data)
+    data = _load()
+    if id not in data:
+        raise HTTPException(404, "not found")
+    data[id]["muted_until"] = time.time() + minutes * 60
+    data[id]["updated_at"] = _now()
+    _save(data)
     return Alert(**data[id])
+
 
 @router.post("/seed")
 def seed():
-    data=_seed(); _save(data); return {"ok": True, "count": len(data)}
+    data = _seed()
+    _save(data)
+    return {"ok": True, "count": len(data)}
+
 
 @router.get("/export")
 def export_csv():
-    data=_load()
+    data = _load()
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["id","title","source","score","status","tags","updated_at"])
-    for _,v in sorted(data.items()):
-        w.writerow([v["id"], v["title"], v["source"], v["score"], v["status"], "|".join(v.get("tags",[])), v["updated_at"]])
+    w.writerow(["id", "title", "source", "score", "status", "tags", "updated_at"])
+    for _, v in sorted(data.items()):
+        w.writerow(
+            [
+                v["id"],
+                v["title"],
+                v["source"],
+                v["score"],
+                v["status"],
+                "|".join(v.get("tags", [])),
+                v["updated_at"],
+            ]
+        )
     buf.seek(0)
-    return StreamingResponse(iter([buf.read()]), media_type="text/csv", headers={"Content-Disposition":"attachment; filename=alerts.csv"})
+    return StreamingResponse(
+        iter([buf.read()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=alerts.csv"},
+    )
+
 
 @router.get("/ui", response_class=HTMLResponse)
 def ui():

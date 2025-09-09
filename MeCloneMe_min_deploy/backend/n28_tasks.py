@@ -1,5 +1,10 @@
 from __future__ import annotations
-import json, os, threading, uuid, csv, io
+import json
+import os
+import threading
+import uuid
+import csv
+import io
 from datetime import datetime, timedelta, date
 from typing import List, Dict, Any
 from fastapi import APIRouter, HTTPException
@@ -11,6 +16,7 @@ router = APIRouter(prefix="/tasks", tags=["tasks"])
 _LOCK = threading.Lock()
 _PATH = os.environ.get("MC_TASKS_PATH", "/tmp/mecloneme_tasks.json")
 
+
 class Task(BaseModel):
     id: str
     title: str
@@ -21,46 +27,80 @@ class Task(BaseModel):
     progress: int = Field(0, ge=0, le=100)
     updated_at: str
 
+
 def _now() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
+
 def _today(n=0) -> str:
-    from datetime import date, timedelta
+
     return (date.today() + timedelta(days=n)).isoformat()
+
 
 def _seed() -> Dict[str, Any]:
     return {
-        "t1": {"id":"t1","title":"Start w Brazylii (jurysdykcja)","owner":"CEO","assignee":"Prawnik AI","status":"in_progress","due":_today(7),"progress":35,"updated_at":_now()},
-        "t2": {"id":"t2","title":"Kampania launch (IG/TikTok)","owner":"CEO","assignee":"Marketing AI","status":"todo","due":_today(10),"progress":10,"updated_at":_now()},
-        "t3": {"id":"t3","title":"Integracja płatności Pix","owner":"CTO","assignee":"Dev AI","status":"blocked","due":_today(14),"progress":20,"updated_at":_now()},
+        "t1": {
+            "id": "t1",
+            "title": "Start w Brazylii (jurysdykcja)",
+            "owner": "CEO",
+            "assignee": "Prawnik AI",
+            "status": "in_progress",
+            "due": _today(7),
+            "progress": 35,
+            "updated_at": _now(),
+        },
+        "t2": {
+            "id": "t2",
+            "title": "Kampania launch (IG/TikTok)",
+            "owner": "CEO",
+            "assignee": "Marketing AI",
+            "status": "todo",
+            "due": _today(10),
+            "progress": 10,
+            "updated_at": _now(),
+        },
+        "t3": {
+            "id": "t3",
+            "title": "Integracja płatności Pix",
+            "owner": "CTO",
+            "assignee": "Dev AI",
+            "status": "blocked",
+            "due": _today(14),
+            "progress": 20,
+            "updated_at": _now(),
+        },
     }
+
 
 def _load() -> Dict[str, Any]:
     with _LOCK:
         try:
-            with open(_PATH,"r",encoding="utf-8") as f:
-                data=json.load(f)
-                if isinstance(data,dict) and data:
+            with open(_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict) and data:
                     return data
         except Exception:
             pass
-        data=_seed()
+        data = _seed()
         try:
-            with open(_PATH,"w",encoding="utf-8") as f:
-                json.dump(data,f)
+            with open(_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
         except Exception:
             pass
         return data
 
+
 def _save(data: Dict[str, Any]) -> None:
     with _LOCK:
-        with open(_PATH,"w",encoding="utf-8") as f:
-            json.dump(data,f)
+        with open(_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
 
 @router.get("", response_model=List[Task])
 def list_tasks() -> List[Task]:
-    data=_load()
-    return [Task(**v) for _,v in sorted(data.items())]
+    data = _load()
+    return [Task(**v) for _, v in sorted(data.items())]
+
 
 class TaskIn(BaseModel):
     title: str
@@ -70,38 +110,75 @@ class TaskIn(BaseModel):
     due: str = _today(7)
     progress: int = 0
 
+
 @router.post("", response_model=Task)
 def create_task(it: TaskIn) -> Task:
-    data=_load()
-    i=str(uuid.uuid4())[:8]
-    data[i]={"id":i,"title":it.title,"owner":it.owner,"assignee":it.assignee,"status":it.status,"due":it.due,"progress":int(it.progress),"updated_at":_now()}
+    data = _load()
+    i = str(uuid.uuid4())[:8]
+    data[i] = {
+        "id": i,
+        "title": it.title,
+        "owner": it.owner,
+        "assignee": it.assignee,
+        "status": it.status,
+        "due": it.due,
+        "progress": int(it.progress),
+        "updated_at": _now(),
+    }
     _save(data)
     return Task(**data[i])
 
+
 @router.post("/{id}/status", response_model=Task)
 def set_status(id: str, value: str) -> Task:
-    data=_load()
-    if id not in data: raise HTTPException(404,"not found")
-    data[id]["status"]=value; data[id]["updated_at"]=_now(); _save(data)
+    data = _load()
+    if id not in data:
+        raise HTTPException(404, "not found")
+    data[id]["status"] = value
+    data[id]["updated_at"] = _now()
+    _save(data)
     return Task(**data[id])
+
 
 @router.post("/{id}/progress", response_model=Task)
 def set_progress(id: str, value: int) -> Task:
-    data=_load()
-    if id not in data: raise HTTPException(404,"not found")
-    data[id]["progress"]=int(value); data[id]["updated_at"]=_now(); _save(data)
+    data = _load()
+    if id not in data:
+        raise HTTPException(404, "not found")
+    data[id]["progress"] = int(value)
+    data[id]["updated_at"] = _now()
+    _save(data)
     return Task(**data[id])
+
 
 @router.get("/export")
 def export_csv():
-    data=_load()
+    data = _load()
     buf = io.StringIO()
     wr = csv.writer(buf)
-    wr.writerow(["id","title","owner","assignee","status","due","progress","updated_at"])
-    for _,v in sorted(data.items()):
-        wr.writerow([v["id"],v["title"],v["owner"],v["assignee"],v["status"],v["due"],v["progress"],v["updated_at"]])
+    wr.writerow(
+        ["id", "title", "owner", "assignee", "status", "due", "progress", "updated_at"]
+    )
+    for _, v in sorted(data.items()):
+        wr.writerow(
+            [
+                v["id"],
+                v["title"],
+                v["owner"],
+                v["assignee"],
+                v["status"],
+                v["due"],
+                v["progress"],
+                v["updated_at"],
+            ]
+        )
     buf.seek(0)
-    return StreamingResponse(iter([buf.read()]), media_type="text/csv", headers={"Content-Disposition":"attachment; filename=tasks.csv"})
+    return StreamingResponse(
+        iter([buf.read()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=tasks.csv"},
+    )
+
 
 @router.get("/ui", response_class=HTMLResponse)
 def ui():

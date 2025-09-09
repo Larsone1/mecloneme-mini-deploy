@@ -4,26 +4,31 @@ from fastapi.responses import HTMLResponse
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
+
 def _safe_load():
     alerts = []
     progress = []
     tasks = []
     try:
         from backend import n09_coalescer as A
+
         alerts = list(A._load().values())  # type: ignore
     except Exception:
         pass
     try:
         from backend import n27_progress as P
+
         progress = list(P._load().values())  # type: ignore
     except Exception:
         pass
     try:
         from backend import n28_tasks as T
+
         tasks = list(T._load().values())  # type: ignore
     except Exception:
         pass
     return alerts, progress, tasks
+
 
 @router.get("/ui", response_class=HTMLResponse)
 def ui():
@@ -32,7 +37,9 @@ def ui():
     resolved_alerts = sum(1 for a in alerts if a.get("status") == "resolved")
     avg_progress = 0
     if progress:
-        avg_progress = int(sum(int(p.get("percent", 0)) for p in progress) / len(progress))
+        avg_progress = int(
+            sum(int(p.get("percent", 0)) for p in progress) / len(progress)
+        )
     t_todo = sum(1 for t in tasks if t.get("status") == "todo")
     t_prog = sum(1 for t in tasks if t.get("status") == "in_progress")
     t_block = sum(1 for t in tasks if t.get("status") == "blocked")

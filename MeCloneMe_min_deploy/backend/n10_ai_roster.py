@@ -1,5 +1,7 @@
 from __future__ import annotations
-import json, os, threading
+import json
+import os
+import threading
 from typing import Dict, Any
 from fastapi import APIRouter
 from fastapi.responses import HTMLResponse
@@ -10,39 +12,81 @@ router = APIRouter(prefix="/ai", tags=["ai"])
 _LOCK = threading.Lock()
 _PATH = os.environ.get("MC_AI_PATH", "/tmp/mecloneme_ai_roster.json")
 
+
 def _now():
-    return datetime.utcnow().isoformat(timespec="seconds")+"Z"
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
 
 def _seed() -> Dict[str, Any]:
     return {
-        "ceo": {"id":"ceo","name":"CEO Klon AI","role":"Zarząd","online":True,"notes":"Nadzór nad całością","updated_at":_now()},
-        "legal": {"id":"legal","name":"Prawnik AI","role":"Prawny","online":True,"notes":"Umowy, jurysdykcje","updated_at":_now()},
-        "marketing": {"id":"marketing","name":"Julia — Marketing AI","role":"Marketing","online":True,"notes":"Kampanie, ROI","updated_at":_now()},
-        "log": {"id":"log","name":"Logistyka AI","role":"Operacje","online":False,"notes":"Dostawy","updated_at":_now()},
-        "fin": {"id":"fin","name":"Finanse AI","role":"Finanse","online":True,"notes":"Budżety, cashflow","updated_at":_now()},
+        "ceo": {
+            "id": "ceo",
+            "name": "CEO Klon AI",
+            "role": "Zarząd",
+            "online": True,
+            "notes": "Nadzór nad całością",
+            "updated_at": _now(),
+        },
+        "legal": {
+            "id": "legal",
+            "name": "Prawnik AI",
+            "role": "Prawny",
+            "online": True,
+            "notes": "Umowy, jurysdykcje",
+            "updated_at": _now(),
+        },
+        "marketing": {
+            "id": "marketing",
+            "name": "Julia — Marketing AI",
+            "role": "Marketing",
+            "online": True,
+            "notes": "Kampanie, ROI",
+            "updated_at": _now(),
+        },
+        "log": {
+            "id": "log",
+            "name": "Logistyka AI",
+            "role": "Operacje",
+            "online": False,
+            "notes": "Dostawy",
+            "updated_at": _now(),
+        },
+        "fin": {
+            "id": "fin",
+            "name": "Finanse AI",
+            "role": "Finanse",
+            "online": True,
+            "notes": "Budżety, cashflow",
+            "updated_at": _now(),
+        },
     }
+
 
 def _load() -> Dict[str, Any]:
     with _LOCK:
         try:
-            with open(_PATH,"r",encoding="utf-8") as f:
-                data=json.load(f)
-                if data: return data
+            with open(_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if data:
+                    return data
         except Exception:
             pass
-        data=_seed()
+        data = _seed()
         try:
-            with open(_PATH,"w",encoding="utf-8") as f: json.dump(data,f)
-        except Exception: pass
+            with open(_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
         return data
+
 
 @router.get("/ui", response_class=HTMLResponse)
 def ui():
     data = _load()
     roles = {}
     for v in data.values():
-      roles.setdefault(v["role"], 0)
-      roles[v["role"]] += 1
+        roles.setdefault(v["role"], 0)
+        roles[v["role"]] += 1
     html = f"""
 <!doctype html><html><head>
   <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>

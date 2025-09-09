@@ -17,7 +17,7 @@ export default function App() {
   // TTS
   const [sayText, setSayText] = useState('Cześć! Jestem superklon MeCloneMe.')
   const [voices, setVoices] = useState([]); const [voiceName, setVoiceName] = useState('')
-  const [rate, setRate] = useState(1.0); const [pitch, setPitch] = useState(1.0)
+  const [rate, setRate] = useState(1.0); const [pitch = 1.0, setPitch] = useState(1.0)
   const [speakOnReply, setSpeakOnReply] = useState(true)
 
   // STT
@@ -140,6 +140,21 @@ export default function App() {
     URL.revokeObjectURL(url);
   }
 
+  const handleImageUpload = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file || !sid) return;
+    const fd = new FormData();
+    fd.append('file', file, file.name);
+    fd.append('sid', sid);
+    const r = await fetch(`${API}/api/upload/image`, {
+      method: 'POST',
+      body: fd,
+    });
+    const j = await r.json();
+    alert(j.url ? `✅ Zapisano: ${j.url}` : 'OK');
+    fetch(`${API}/api/files?sid=${sid}`).then(r => r.json()).then(setFiles).catch(() => {});
+  };
+
   return (
     <div style={{minHeight:'100vh',display:'grid',placeItems:'center',background:'#0b0f17',color:'#fff',fontFamily:'Inter, system-ui, sans-serif'}}>
       <div style={{width:'min(960px,92vw)',background:'#111827',border:'1px solid #1f2937',borderRadius:16,boxShadow:'0 10px 40px rgba(0,0,0,.3)'}}>
@@ -163,73 +178,69 @@ export default function App() {
           <h2 style={{margin:'4px 0 8px 0'}}>{s.title}</h2>
           <p style={{opacity:.85,margin:'0 0 6px 0'}}>{s.desc}</p>
 
-          {i===0 && (<div style={{display:'grid',gap:10}}><button style={btn}>Nadaj zgodę (demo)</button><small style={{opacity:.7}}>Makieta — nic nie zapisujemy.</small></div>)}
+          <> {/* Added Fragment */}
+            {i===0 && (<div style={{display:'grid',gap:10}}><button style={btn}>Nadaj zgodę (demo)</button><small style={{opacity:.7}}>Makieta — nic nie zapisujemy.</small></div>)}
 
-          {i===1 && (<div style={{display:'grid',gap:10}>
-            <div style={drop}>
-              <div>Upuść zdjęcie tutaj lub kliknij</div>
-              <input type="file" accept="image/*" style={{display:'none'}} id="f" onChange={async e=>{
-                const file = e.target.files?.[0]; if(!file || !sid) return
-                const fd = new FormData(); fd.append('file', file, file.name); fd.append('sid', sid)
-                const r = await fetch(`${API}/api/upload/image`, {method:'POST', body: fd})
-                const j = await r.json(); alert(j.url ? `✅ Zapisano: ${j.url}` : 'OK')
-                fetch(`${API}/api/files?sid=${sid}`).then(r=>r.json()).then(setFiles).catch(()=>{})
-              }}/>
-            </div>
-          </div>)}
+            {i===1 && (<div style={{display:'grid',gap:10}>
+              <div style={drop}>
+                <div>Upuść zdjęcie tutaj lub kliknij</div>
+                <input type="file" accept="image/*" style={{display:'none'}} id="f" onChange={handleImageUpload}/>
+              </div>
+            </div>)}
 
-          {i===2 && (
-            <div style={{display:'grid',gap:14}}>
-              <section style={card}>
-                <label style={label}>Chat — wyślij do klona</label>
-                <div style={{display:'flex',gap:10}}>
-                  <input value={input} onChange={e=>setInput(e.target.value)} placeholder="Napisz wiadomość…" style={{...inputBox, flex:1}}/>
-                  <button style={btn} onClick={()=>send()}>Wyślij</button>
-                </div>
-                <div style={{display:'grid',gap:8,marginTop:6}}>
-                  {messages.map((m,idx)=>(<div key={idx} style={{opacity:.95}}><b>{m.who==='user'?'Ty':'Klon'}:</b> {m.text}</div>))}
-                </div>
-              </section>
+            {i===2 && (
+              <div style={{display:'grid',gap:14}}>
+                <section style={card}>
+                  <label style={label}>Chat — wyślij do klona</label>
+                  <div style={{display:'flex',gap:10}}>
+                    <input value={input} onChange={e=>setInput(e.target.value)} placeholder="Napisz wiadomość…" style={{...inputBox, flex:1}}/>
+                    <button style={btn} onClick={()=>send()}>Wyślij</button>
+                  </div>
+                  <div style={{display:'grid',gap:8,marginTop:6}}>
+                    {messages.map((m,idx)=>(<div key={idx} style={{opacity:.95}}><b>{m.who==='user'?'Ty':'Klon'}:</b> {m.text}</div>))}
+                  </div>
+                </section>
 
-              <section style={card}>
-                <label style={label}>Pliki w sesji</label>
-                <div style={{display:'grid',gap:6}}>
-                  <b>Audio ({files.audio?.length||0}):</b>
-                  {files.audio.length? files.audio.map(f=><div key={f.url}><a href={f.url} target="_blank">{f.name}</a> — {Math.round(f.bytes/1024)} KB</div>): <span>—</span>}
-                  <b style={{marginTop:8}}>Obrazy ({files.image?.length||0}):</b>
-                  {files.image.length? files.image.map(f=><div key={f.url}><a href={f.url} target="_blank">{f.name}</a> — {Math.round(f.bytes/1024)} KB</div>): <span>—</span>}
-                </div>
-              </section>
+                <section style={card}>
+                  <label style={label}>Pliki w sesji</label>
+                  <div style={{display:'grid',gap:6}}>
+                    <b>Audio ({files.audio?.length||0}):</b>
+                    {files.audio.length? files.audio.map(f=><div key={f.url}><a href={f.url} target="_blank">{f.name}</a> — {Math.round(f.bytes/1024)} KB</div>): <span>—</span>}
+                    <b style={{marginTop:8}}>Obrazy ({files.image?.length||0}):</b>
+                    {files.image.length? files.image.map(f=><div key={f.url}><a href={f.url} target="_blank">{f.name}</a> — {Math.round(f.bytes/1024)} KB</div>): <span>—</span>}
+                  </div>
+                </section>
 
-              <section style={card}>
-                <label style={label}>TTS / STT / Nagranie</label>
-                <div style={{display:'grid',gap:8,gridTemplateColumns:'1fr 1fr 1fr'}}>
-                  <select value={voiceName} onChange={e=>setVoiceName(e.target.value)} style={input}>
-                    {voices.map(v => <option key={v.name} value={v.name}>{v.name} ({v.lang})</option>)}
-                  </select>
-                  <label style={mini}>Rate {rate.toFixed(2)}<input type="range" min="0.75" max="1.25" step="0.01" value={rate} onChange={e=>setRate(+e.target.value)} /></label>
-                  <label style={mini}>Pitch {pitch.toFixed(2)}<input type="range" min="0.8" max="1.2" step="0.01" value={pitch} onChange={e=>setPitch(+e.target.value)} /></label>
-                </div>
-                <div style={{display:'flex',gap:10}}>
-                  <button style={btn} onClick={()=>speak()}>▶️ Powiedz</button>
-                  {!recogOn ? <button style={btn} onClick={startSTT}>🎤 Start STT</button> : <button style={{...btn,background:'#b91c1c'}} onClick={stopSTT}>■ Stop STT</button>}
-                  <button style={btn} onClick={()=>setInput(transcript)}>↗️ Użyj transkrypcji</button>
-                  <button style={{...btn,background: recState==='rec' ? '#b91c1c' : '#1f2937'}} onClick={recState==='rec' ? stopRec : startRec}>{recState==='rec' ? '■ Stop' : '🎙️ Start'}</button>
-                </div>
-                <small style={{opacity:.8}}>{uploadMsg}</small>
-              </section>
+                <section style={card}>
+                  <label style={label}>TTS / STT / Nagranie</label>
+                  <div style={{display:'grid',gap:8,gridTemplateColumns:'1fr 1fr 1fr'}}>
+                    <select value={voiceName} onChange={e=>setVoiceName(e.target.value)} style={input}>
+                      {voices.map(v => <option key={v.name} value={v.name}>{v.name} ({v.lang})</option>)}
+                    </select>
+                    <label style={mini}>Rate {rate.toFixed(2)}<input type="range" min="0.75" max="1.25" step="0.01" value={rate} onChange={e=>setRate(+e.target.value)} /></label>
+                    <label style={mini}>Pitch {pitch.toFixed(2)}<input type="range" min="0.8" max="1.2" step="0.01" value={pitch} onChange={e=>setPitch(+e.target.value)} /></label>
+                  </div>
+                  <div style={{display:'flex',gap:10}}>
+                    <button style={btn} onClick={()=>speak()}>▶️ Powiedz</button>
+                    {!recogOn ? <button style={btn} onClick={startSTT}>🎤 Start STT</button> : <button style={{...btn,background:'#b91c1c'}} onClick={stopSTT}>■ Stop STT</button>}
+                    <button style={btn} onClick={()=>setInput(transcript)}>↗️ Użyj transkrypcji</button>
+                    <button style={{...btn,background: recState==='rec' ? '#b91c1c' : '#1f2937'}} onClick={recState==='rec' ? stopRec : startRec}>{recState==='rec' ? '■ Stop' : '🎙️ Start'}</button>
+                  </div>
+                  <small style={{opacity:.8}}>{uploadMsg}</small>
+                </section>
 
-              <section style={card}>
-                <label style={label}>Debug</label>
-                <div style={{display:'grid',gap:6}}>
-                  <div>API: <code>{API}</code></div>
-                  <div>SID: <code>{sid||'...'}</code></div>
-                  <button style={btn} onClick={()=>navigator.clipboard?.writeText(API)}>Kopiuj API URL</button>
-                  <button style={btn} onClick={downloadExport}>Pobierz transkrypt (.json)</button>
-                </div>
-              </section>
-            </div>
-          )}
+                <section style={card}>
+                  <label style={label}>Debug</label>
+                  <div style={{display:'grid',gap:6}}>
+                    <div>API: <code>{API}</code></div>
+                    <div>SID: <code>{sid||'...'}</code></div>
+                    <button style={btn} onClick={()=>navigator.clipboard?.writeText(API)}>Kopiuj API URL</button>
+                    <button style={btn} onClick={downloadExport}>Pobierz transkrypt (.json)</button>
+                  </div>
+                </section>
+              </div>
+            )}
+          </> {/* Added Fragment */}
         </div>
 
         <div style={{display:'flex',gap:10,justifyContent:'space-between',padding:20,borderTop:'1px solid #1f2937'}}>
