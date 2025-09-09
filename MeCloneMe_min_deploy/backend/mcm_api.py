@@ -7,7 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 import yaml, os
 
-app = FastAPI(title="MeCloneMe API", version="0.3")
+app = FastAPI(title="MeCloneMe API", version="0.4")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ---------- Paths / Persona ----------
@@ -28,8 +28,14 @@ PROFILE = load_profile()
 def persona():
     return PROFILE or {"name": "Superclone", "persona": {"role": "Asystent", "tone": "konkretny"}}
 
-# serwowanie plików
+# serwowanie plików (publicznie)
 app.mount("/files", StaticFiles(directory=str(DATA_DIR)), name="files")
+
+# ---------- Prosta pamięć sesji (RAM) ----------
+SESS: Dict[str, Dict[str, Any]] = {}  # sid -> {"history": [{"who": "user|bot", "text": "..."}]}
+
+def get_hist(sid: str) -> List[Dict[str, str]]:
+    return SESS.setdefault(sid, {"history": []})["history"]
 
 # ---------- Utils ----------
 STOPWORDS: List[str] = ["i","oraz","ale","że","to","na","w","we","o","u","z","za","do","dla","po","od",
@@ -65,27 +71,45 @@ def generate_reply(user_text: str) -> str:
     raw = [f"{role}. Ton: {tone}.", "Plan: 1) wybierz mikro-krok, 2) 10 min, 3) wróć z wynikiem", f"Fokus: {fokus}", "Jestem przy Tobie — działamy"]
     return style_compact(raw)
 
-# ---------- API ----------
+# ---------- API: health ----------
 @app.get("/api/health")
 def health():
     return {"ok": True, "service": "mcm_api", "profile": (PROFILE.get("name") or "Superclone")}
 
-class Msg(BaseModel):
-    text: str
-
-@app.post("/api/reply")
-def reply(msg: Msg):
-    return {"reply": generate_reply(msg.text), "keywords": extract_keywords(msg.text or "")}
-
-# sesja
+# ---------- API: sesje ----------
 @app.post("/api/session/new")
 def new_session():
     sid = uuid4().hex
     (DATA_DIR / sid / "audio").mkdir(parents=True, exist_ok=True)
     (DATA_DIR / sid / "image").mkdir(parents=True, exist_ok=True)
+    SESS[sid] = {"history": []}
     return {"sid": sid}
 
-# uploady
+@app.post("/api/session/reset")
+def reset_session(sid: str = Form(...)):
+    SESS[sid] = {"history": []}
+    return {"ok": True}
+
+@app.get("/api/session/{sid}/history")
+def get_history(sid: str):
+    return {"sid": sid, "history": get_hist(sid)}
+
+# ---------- API: chat z pamięcią ----------
+class Msg(BaseModel):
+    sid: str
+    text: str
+
+@app.post("/api/chat/send")
+def chat_send(msg: Msg):
+    if not msg.sid:
+        raise HTTPException(400, "sid required")
+    hist = get_hist(msg.sid)
+    hist.append({"who": "user", "text": msg.text})
+    bot = generate_reply(msg.text)
+    hist.append({"who": "bot", "text": bot})
+    return {"reply": bot, "history": hist}
+
+# ---------- API: uploady + listing ----------
 @app.post("/api/upload/audio")
 async def upload_audio(file: UploadFile = File(...), sid: str = Form(None)):
     if not sid: raise HTTPException(400, "sid required")
@@ -93,8 +117,7 @@ async def upload_audio(file: UploadFile = File(...), sid: str = Form(None)):
     fname = file.filename or f"audio-{uuid4().hex}.webm"
     path = target_dir / fname
     with path.open("wb") as f:
-        while chunk := await file.read(8192):
-            f.write(chunk)
+        while chunk := await file.read(8192): f.write(chunk)
     return {"ok": True, "filename": fname, "bytes": path.stat().st_size, "url": f"/files/{sid}/audio/{fname}"}
 
 @app.post("/api/upload/image")
@@ -104,6 +127,21 @@ async def upload_image(file: UploadFile = File(...), sid: str = Form(None)):
     fname = file.filename or f"image-{uuid4().hex}.png"
     path = target_dir / fname
     with path.open("wb") as f:
-        while chunk := await file.read(8192):
-            f.write(chunk)
+        while chunk := await file.read(8192): f.write(chunk)
     return {"ok": True, "filename": fname, "bytes": path.stat().st_size, "url": f"/files/{sid}/image/{fname}"}
+
+@app.get("/api/files")
+def list_files(sid: str):
+    base = DATA_DIR / sid
+    out = {"audio": [], "image": []}
+    for kind in out.keys():
+        d = base / kind
+        if d.exists():
+            for p in sorted(d.iterdir()):
+                out[kind].append({"name": p.name, "bytes": p.stat().st_size, "url": f"/files/{sid}/{kind}/{p.name}"})
+    return out
+
+# ---------- legacy / simple endpoints ----------
+@app.post("/api/echo")
+async def echo(text: str):
+    return {"echo": text}
