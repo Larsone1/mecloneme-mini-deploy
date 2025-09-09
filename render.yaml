@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: mecloneme-backend
+    env: docker
+    plan: free
+    autoDeploy: false
+    rootDir: MeCloneMe_min_deploy
+  - type: static
+    name: mecloneme-frontend
+    plan: free
+    autoDeploy: false
+    rootDir: web
+    buildCommand: npm install && npm run build
+    publishDir: dist
