@@ -1,16 +1,16 @@
 import { useEffect, useRef, useState } from 'react'
-
 const API = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 const steps = [
   { id: 1, title: 'Zgody', desc: 'Nadaj uprawnienia: kamera + mikrofon (demo).' },
-  { id: 2, title: 'Selfie', desc: 'Zrób selfie / wybierz plik (UI placeholder).' },
-  { id: 3, title: 'Głos',  desc: 'Chat + TTS/STT + nagranie i upload (demo).' },
+  { id: 2, title: 'Selfie', desc: 'Zrób selfie / wybierz plik; zapis w sesji.' },
+  { id: 3, title: 'Głos',  desc: 'Chat + TTS/STT + nagranie i upload (sesja).' },
 ]
 
 export default function App() {
   const [i, setI] = useState(0)
   const [health, setHealth] = useState('⏳ sprawdzam…')
-  const [persona, setPersona] = useState({ name: 'Superclone', persona: { role: '', tone: '' } })
+  const [sid, setSid] = useState(()=> localStorage.getItem('mcm_sid') || '')
+  const [speaking, setSpeaking] = useState(false)
 
   // TTS
   const [sayText, setSayText] = useState('Cześć! Jestem superklon MeCloneMe.')
@@ -39,12 +39,16 @@ export default function App() {
       () => setHealth('✅ backend OK'),
       () => setHealth('❌ backend OFF')
     )
-    fetch(`${API}/api/persona`).then(r=>r.json()).then(p=>setPersona(p)).catch(()=>{})
+    if (!sid) {
+      fetch(`${API}/api/session/new`, {method:'POST'}).then(r=>r.json()).then(j=>{
+        setSid(j.sid); localStorage.setItem('mcm_sid', j.sid)
+      })
+    }
   }, [])
 
-  useEffect(() => { localStorage.setItem('mcm_messages', JSON.stringify(messages)) }, [messages])
+  useEffect(()=> localStorage.setItem('mcm_messages', JSON.stringify(messages)), [messages])
 
-  // Load TTS voices
+  // TTS voices
   useEffect(() => {
     const load = () => {
       const v = window.speechSynthesis?.getVoices?.() || []
@@ -59,6 +63,8 @@ export default function App() {
   const speak = (text) => {
     const u = new SpeechSynthesisUtterance(text ?? sayText)
     u.rate = rate; u.pitch = pitch
+    u.onstart = ()=> setSpeaking(true)
+    u.onend = ()=> setSpeaking(false)
     const v = voices.find(v => v.name === voiceName); if (v) u.voice = v
     window.speechSynthesis.cancel(); window.speechSynthesis.speak(u)
   }
@@ -72,9 +78,8 @@ export default function App() {
     r.onend = () => setRecogOn(false); recogRef.current = r; setRecogOn(true); r.start()
   }
   const stopSTT = () => recogRef.current?.stop?.()
-  useEffect(() => { if (!recogOn) recogRef.current?.stop?.() }, [recogOn])
 
-  // Mic record + upload
+  // Mic record + upload (z SID)
   const startRec = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
@@ -83,9 +88,11 @@ export default function App() {
       mr.onstop = async () => {
         try {
           const blob = new Blob(chunksRef.current, { type: mr.mimeType || 'audio/webm' })
-          setUploadMsg('⏳ wysyłam…'); const fd = new FormData(); fd.append('file', blob, `sample-${Date.now()}.webm`)
+          setUploadMsg('⏳ wysyłam…'); const fd = new FormData()
+          fd.append('file', blob, `sample-${Date.now()}.webm`)
+          if (sid) fd.append('sid', sid)
           const r = await fetch(`${API}/api/upload/audio`, { method: 'POST', body: fd })
-          const j = await r.json(); setUploadMsg(`✅ ${Math.round(blob.size/1024)} KB → serwer: ${j.received_bytes} B`); setRecState('sent')
+          const j = await r.json(); setUploadMsg(`✅ ${Math.round(blob.size/1024)} KB → ${j.url}`); setRecState('sent')
         } catch { setUploadMsg('❌ błąd uploadu'); setRecState('idle') }
         finally { stream.getTracks().forEach(t=>t.stop()) }
       }
@@ -104,18 +111,18 @@ export default function App() {
       setMessages(m => [...m, {who:'bot', text: bot}]); if (speakOnReply) speak(bot)
     } catch { const bot='❌ Błąd połączenia'; setMessages(m => [...m, {who:'bot', text: bot}]) }
   }
-
   const resetChat = () => { setMessages([]); localStorage.removeItem('mcm_messages') }
 
   return (
     <div style={{minHeight:'100vh',display:'grid',placeItems:'center',background:'#0b0f17',color:'#fff',fontFamily:'Inter, system-ui, sans-serif'}}>
-      <div style={{width:'min(880px,92vw)',background:'#111827',border:'1px solid #1f2937',borderRadius:16,boxShadow:'0 10px 40px rgba(0,0,0,.3)'}}>
+      <div style={{width:'min(900px,92vw)',background:'#111827',border:'1px solid #1f2937',borderRadius:16,boxShadow:'0 10px 40px rgba(0,0,0,.3)'}}>
         <div style={{padding:'12px 16px',borderBottom:'1px solid #1f2937',display:'flex',justifyContent:'space-between',alignItems:'center',gap:10}}>
-          <div style={{fontWeight:700,letterSpacing:.3,display:'grid',gap:2}}>
-            <span>MeCloneMe — Onboarding</span>
-            <small style={{opacity:.75}}>{persona?.persona?.role || 'Klon'} • {persona?.persona?.tone || 'ton'}</small>
+          <div style={{display:'grid'}}>
+            <strong>MeCloneMe — Onboarding</strong>
+            <small style={{opacity:.75}}>SID: {sid || '⏳'}</small>
           </div>
-          <div style={{display:'flex',gap:10,alignItems:'center'}}>
+          <div style={{display:'flex',gap:12,alignItems:'center'}}>
+            <SpeakingDot on={speaking}/>
             <label style={{fontSize:12,opacity:.85,display:'flex',gap:6,alignItems:'center'}}>
               <input type="checkbox" checked={speakOnReply} onChange={e=>setSpeakOnReply(e.target.checked)} /> Autoodczyt
             </label>
@@ -131,7 +138,17 @@ export default function App() {
 
           {i===0 && (<div style={{display:'grid',gap:10}}><button style={btn}>Nadaj zgodę (demo)</button><small style={{opacity:.7}}>Makieta — nic nie zapisujemy.</small></div>)}
 
-          {i===1 && (<div style={{display:'grid',gap:10}}><div style={drop}><div>Upuść zdjęcie tutaj lub kliknij</div><input type="file" accept="image/*" style={{display:'none'}} id="f" onChange={()=>{}}/></div></div>)}
+          {i===1 && (<div style={{display:'grid',gap:10}>
+            <div style={drop}>
+              <div>Upuść zdjęcie tutaj lub kliknij</div>
+              <input type="file" accept="image/*" style={{display:'none'}} id="f" onChange={async e=>{
+                const file = e.target.files?.[0]; if(!file) return
+                const fd = new FormData(); fd.append('file', file, file.name); if (sid) fd.append('sid', sid)
+                const r = await fetch(`${API}/api/upload/image`, {method:'POST', body: fd})
+                const j = await r.json(); alert(j.url ? `✅ Zapisano: ${j.url}` : 'OK')
+              }}/>
+            </div>
+          </div>)}
 
           {i===2 && (
             <div style={{display:'grid',gap:14}}>
@@ -161,21 +178,6 @@ export default function App() {
               </section>
 
               <section style={card}>
-                <label style={label}>STT — rozpoznawanie mowy</label>
-                <div style={{display:'flex',gap:10,alignItems:'center'}}>
-                  <select value={recogLang} onChange={e=>setRecogLang(e.target.value)} style={inputSm}>
-                    <option value="pl-PL">pl-PL</option><option value="en-US">en-US</option>
-                  </select>
-                  {!recogOn ? <button style={btn} onClick={startSTT}>🎤 Start STT</button>
-                            : <button style={{...btn,background:'#b91c1c'}} onClick={stopSTT}>■ Stop STT</button>}
-                  <button style={btn} onClick={()=>setInput(transcript)}>↗️ Użyj transkrypcji</button>
-                </div>
-                <div style={{minHeight:60,background:'#0b1220',border:'1px dashed #23304a',borderRadius:12,padding:'10px 12px',opacity:.9}}>
-                  {transcript || '—'}
-                </div>
-              </section>
-
-              <section style={card}>
                 <label style={label}>Nagranie + upload</label>
                 <div style={{display:'flex',gap:10}}>
                   <button style={{...btn,background: recState==='rec' ? '#b91c1c' : '#1f2937'}}
@@ -199,11 +201,20 @@ export default function App() {
   )
 }
 
+function SpeakingDot({on}) {
+  return <span style={{
+    width:10,height:10,borderRadius:'50%',
+    background: on ? '#22d3ee' : '#334155',
+    boxShadow: on ? '0 0 12px #22d3ee' : 'none',
+    display:'inline-block'
+  }}/>
+}
+
 const baseBox = { border:'1px solid #23304a', borderRadius:12, background:'#0b1220' }
 const btn = { background:'#1f2937', color:'#fff', border:'1px solid #2b364a', padding:'10px 14px', borderRadius:12, cursor:'pointer' }
 const drop = { height:120, ...baseBox, display:'grid', placeItems:'center', cursor:'pointer' }
 const card = { display:'grid', gap:10, padding:12, ...baseBox }
 const label = { opacity:.85, fontSize:13 }
 const input = { background:'#0b1220', border:'1px solid #23304a', color:'#fff', padding:'10px 12px', borderRadius:12 }
-const inputSm = { ...input, padding:'8px 10px' }
+const mini = { ...input, padding:'6px 8px' }
 const inputBox = { background:'#0b1220', border:'1px solid #23304a', color:'#fff', padding:'10px 12px', borderRadius:12 }
