@@ -1,14 +1,31 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List, Dict, Any
 from pathlib import Path
 from uuid import uuid4
-import yaml
+import yaml, json, os
 
-app = FastAPI(title="MeCloneMe API", version="0.4.1")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+VERSION = "0.4.2"
+
+# ---------- CORS (konfig z env) ----------
+_origins = os.environ.get("ALLOWED_ORIGINS", "*").strip()
+if _origins == "*":
+    ALLOW_ORIGINS = ["*"]; ALLOW_CREDS = False
+elif _origins == "":
+    ALLOW_ORIGINS = []; ALLOW_CREDS = False
+else:
+    ALLOW_ORIGINS = [o.strip() for o in _origins.split(",") if o.strip()]
+    ALLOW_CREDS = True
+
+app = FastAPI(title="MeCloneMe API", version=VERSION)
+app.add_middleware(CORSMiddleware,
+                   allow_origins=ALLOW_ORIGINS,
+                   allow_methods=["*"],
+                   allow_headers=["*"],
+                   allow_credentials=ALLOW_CREDS)
 
 # ---------- Paths / Persona ----------
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,19 +40,31 @@ def load_profile() -> Dict[str, Any]:
     return {}
 
 PROFILE = load_profile()
-
-@app.get("/api/persona")
-def persona():
-    return PROFILE or {"name": "Superclone", "persona": {"role": "Asystent", "tone": "konkretny"}}
-
-# Pliki publiczne
 app.mount("/files", StaticFiles(directory=str(DATA_DIR)), name="files")
 
-# ---------- Prosta pamięć sesji (RAM) ----------
+# ---------- Sesje: RAM + dysk ----------
 SESS: Dict[str, Dict[str, Any]] = {}  # sid -> {"history": [...]} 
 
-def get_hist(sid: str) -> List[Dict[str, str]]:
-    return SESS.setdefault(sid, {"history": []})["history"]
+def hist_path(sid: str) -> Path:
+    return DATA_DIR / sid / "history.json"
+
+def get_hist(sid: str) -> List[Dict[str, str]:
+    if sid not in SESS:
+        # spróbuj doczytać z dysku
+        hp = hist_path(sid)
+        if hp.exists():
+            try:
+                SESS[sid] = {"history": json.loads(hp.read_text(encoding="utf-8"))}
+            except Exception:
+                SESS[sid] = {"history": []}
+        else:
+            SESS[sid] = {"history": []}
+    return SESS[sid]["history"]
+
+def save_hist(sid: str) -> None:
+    hp = hist_path(sid)
+    hp.parent.mkdir(parents=True, exist_ok=True)
+    hp.write_text(json.dumps(SESS[sid]["history"], ensure_ascii=False, indent=2), encoding="utf-8")
 
 # ---------- Utils ----------
 STOPWORDS: List[str] = ["i","oraz","ale","że","to","na","w","we","o","u","z","za","do","dla","po","od","jest","są","być","mam","mamy","czy","jak","co","się","nie","tak"]
@@ -77,7 +106,7 @@ def health():
 
 @app.get("/api/version")
 def version():
-    return {"version": "0.4.1", "service": "mcm_api"}
+    return {"version": VERSION, "service": "mcm_api"}
 
 # Sesje
 @app.post("/api/session/new")
@@ -86,16 +115,19 @@ def new_session():
     (DATA_DIR / sid / "audio").mkdir(parents=True, exist_ok=True)
     (DATA_DIR / sid / "image").mkdir(parents=True, exist_ok=True)
     SESS[sid] = {"history": []}
+    save_hist(sid)
     return {"sid": sid}
 
 @app.post("/api/session/reset")
 def reset_session(sid: str = Form(...)):
     SESS[sid] = {"history": []}
+    save_hist(sid)
     return {"ok": True}
 
 @app.post("/api/session/soft-reset")
 def soft_reset(sid: str = Form(...)):
     SESS.setdefault(sid, {"history": []})["history"] = []
+    save_hist(sid)
     return {"ok": True}
 
 @app.get("/api/session/{sid}/history")
@@ -115,11 +147,10 @@ def chat_send(msg: Msg):
     hist.append({"who": "user", "text": msg.text})
     bot = generate_reply(msg.text)
     hist.append({"who": "bot", "text": bot})
+    save_hist(msg.sid)
     return {"reply": bot, "history": hist}
 
 # Uploady + listing
-from fastapi import HTTPException  # (import po to, by nie gubić z raise)
-
 @app.post("/api/upload/audio")
 async def upload_audio(file: UploadFile = File(...), sid: str = Form(None)):
     if not sid: raise HTTPException(400, "sid required")
@@ -153,6 +184,15 @@ def list_files(sid: str):
                 out[kind].append({"name": p.name, "bytes": p.stat().st_size, "url": f"/files/{sid}/{kind}/{p.name}"})
     return out
 
+# Eksport historii
+@app.get("/api/session/export")
+def export_history(sid: str):
+    hp = hist_path(sid)
+    if not hp.exists():
+        raise HTTPException(404, "no history")
+    return FileResponse(path=hp, media_type="application/json", filename=f"{sid}-history.json")
+
+# Echo
 @app.post("/api/echo")
 async def echo(text: str):
     return {"echo": text}
