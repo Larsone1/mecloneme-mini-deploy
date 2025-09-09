@@ -145,3 +145,7 @@ def list_files(sid: str):
 @app.post("/api/echo")
 async def echo(text: str):
     return {"echo": text}
+
+@app.get("/api/version")
+def version():
+    return {"version": "0.4", "service": "mcm_api"}
