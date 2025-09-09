@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from 'react'
 const API = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 console.info('MCM API URL:', API)
+
 const steps = [
   { id: 1, title: 'Zgody', desc: 'Nadaj uprawnienia: kamera + mikrofon (demo).' },
   { id: 2, title: 'Selfie', desc: 'Zrób selfie / wybierz plik; zapis w sesji.' },
   { id: 3, title: 'Głos',  desc: 'Chat + TTS/STT + nagranie i upload (sesja).' },
 ]
+
 export default function App() {
   const [i, setI] = useState(0)
   const [sid, setSid] = useState(()=> localStorage.getItem('mcm_sid') || '')
@@ -105,7 +107,7 @@ export default function App() {
   }
   const stopRec = () => { if (mediaRef.current && mediaRef.current.state==='recording') mediaRef.current.stop() }
 
-  // Chat send via /api/chat/send
+  // Chat via API
   const send = async (text) => {
     const msg = (text ?? input ?? '').trim(); if (!msg || !sid) return
     setInput('')
@@ -189,15 +191,6 @@ export default function App() {
               </section>
 
               <section style={card}>
-                <label style={label}>Debug</label>
-                <div style={{display:'grid',gap:6}}>
-                  <div>API: <code>{API}</code></div>
-                  <div>SID: <code>{sid||'...'}</code></div>
-                  <button style={btn} onClick={()=>navigator.clipboard?.writeText(API)}>Kopiuj API URL</button>
-                </div>
-              </section>
-
-              <section style={card}>
                 <label style={label}>TTS / STT / Nagranie</label>
                 <div style={{display:'grid',gap:8,gridTemplateColumns:'1fr 1fr 1fr'}}>
                   <select value={voiceName} onChange={e=>setVoiceName(e.target.value)} style={input}>
@@ -213,6 +206,15 @@ export default function App() {
                   <button style={{...btn,background: recState==='rec' ? '#b91c1c' : '#1f2937'}} onClick={recState==='rec' ? stopRec : startRec}>{recState==='rec' ? '■ Stop' : '🎙️ Start'}</button>
                 </div>
                 <small style={{opacity:.8}}>{uploadMsg}</small>
+              </section>
+
+              <section style={card}>
+                <label style={label}>Debug</label>
+                <div style={{display:'grid',gap:6}}>
+                  <div>API: <code>{API}</code></div>
+                  <div>SID: <code>{sid||'...'}</code></div>
+                  <button style={btn} onClick={()=>navigator.clipboard?.writeText(API)}>Kopiuj API URL</button>
+                </div>
               </section>
             </div>
           )}
@@ -234,6 +236,7 @@ export default function App() {
     </div>
   )
 }
+
 function SpeakingDot({on}){return <span style={{width:10,height:10,borderRadius:'50%',background:on?'#22d3ee':'#334155',boxShadow:on?'0 0 12px #22d3ee':'none',display:'inline-block'}}/>}
 const baseBox = { border:'1px solid #23304a', borderRadius:12, background:'#0b1220' }
 const btn = { background:'#1f2937', color:'#fff', border:'1px solid #2b364a', padding:'10px 14px', borderRadius:12, cursor:'pointer' }
