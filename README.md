@@ -15,3 +15,9 @@ npm run dev -- --host
 - Upload audio: `POST /api/upload/audio (file, sid)`
 - Upload image: `POST /api/upload/image (file, sid)`
 - Publiczny podgląd: `/files/{sid}/...`
+
+## Backend (Render, darmowy)
+1. Połącz repo z Render → New + Web Service → Deploy from repo (Blueprint `render.yaml`).
+2. Po deployu skopiuj publiczny URL backendu (np. https://mecloneme-backend.onrender.com).
+3. Włącz CORS (jest w API).
+4. W Pages ustaw `VITE_API_URL` w build time: Settings → Pages → Build → Environment variables → `VITE_API_URL=<Twój URL>`. Zrób redeploy.
