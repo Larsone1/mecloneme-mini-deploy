@@ -5,11 +5,10 @@ const steps = [
   { id: 2, title: 'Selfie', desc: 'Zrób selfie / wybierz plik; zapis w sesji.' },
   { id: 3, title: 'Głos',  desc: 'Chat + TTS/STT + nagranie i upload (sesja).' },
 ]
-
 export default function App() {
   const [i, setI] = useState(0)
-  const [health, setHealth] = useState('⏳ sprawdzam…')
   const [sid, setSid] = useState(()=> localStorage.getItem('mcm_sid') || '')
+  const [health, setHealth] = useState('⏳ sprawdzam…')
   const [speaking, setSpeaking] = useState(false)
 
   // TTS
@@ -26,11 +25,10 @@ export default function App() {
   const [recState, setRecState] = useState('idle'); const [uploadMsg, setUploadMsg] = useState('')
   const mediaRef = useRef(null); const chunksRef = useRef([])
 
-  // Chat
+  // Chat + files
   const [input, setInput] = useState('')
-  const [messages, setMessages] = useState(() => {
-    try { return JSON.parse(localStorage.getItem('mcm_messages') || '[]') } catch { return [] }
-  })
+  const [messages, setMessages] = useState([])
+  const [files, setFiles] = useState({audio:[], image:[]})
 
   const s = steps[i]; const pct = ((i + 1) / steps.length) * 100
 
@@ -46,7 +44,11 @@ export default function App() {
     }
   }, [])
 
-  useEffect(()=> localStorage.setItem('mcm_messages', JSON.stringify(messages)), [messages])
+  useEffect(() => {
+    if (!sid) return
+    fetch(`${API}/api/session/${sid}/history`).then(r=>r.json()).then(j=>setMessages(j.history||[])).catch(()=>{})
+    fetch(`${API}/api/files?sid=${sid}`).then(r=>r.json()).then(setFiles).catch(()=>{})
+  }, [sid])
 
   // TTS voices
   useEffect(() => {
@@ -79,7 +81,7 @@ export default function App() {
   }
   const stopSTT = () => recogRef.current?.stop?.()
 
-  // Mic record + upload (z SID)
+  // Upload z SID
   const startRec = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
@@ -93,6 +95,7 @@ export default function App() {
           if (sid) fd.append('sid', sid)
           const r = await fetch(`${API}/api/upload/audio`, { method: 'POST', body: fd })
           const j = await r.json(); setUploadMsg(`✅ ${Math.round(blob.size/1024)} KB → ${j.url}`); setRecState('sent')
+          fetch(`${API}/api/files?sid=${sid}`).then(r=>r.json()).then(setFiles).catch(()=>{})
         } catch { setUploadMsg('❌ błąd uploadu'); setRecState('idle') }
         finally { stream.getTracks().forEach(t=>t.stop()) }
       }
@@ -101,21 +104,23 @@ export default function App() {
   }
   const stopRec = () => { if (mediaRef.current && mediaRef.current.state==='recording') mediaRef.current.stop() }
 
-  // Chat send
+  // Chat send via /api/chat/send
   const send = async (text) => {
-    const msg = (text ?? input ?? '').trim(); if (!msg) return
-    setMessages(m => [...m, {who:'user', text: msg}]); setInput('')
+    const msg = (text ?? input ?? '').trim(); if (!msg || !sid) return
+    setInput('')
     try {
-      const r = await fetch(`${API}/api/reply`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text: msg}) })
-      const j = await r.json(); const bot = j.reply || 'OK — zapisane.'
-      setMessages(m => [...m, {who:'bot', text: bot}]); if (speakOnReply) speak(bot)
-    } catch { const bot='❌ Błąd połączenia'; setMessages(m => [...m, {who:'bot', text: bot}]) }
+      const r = await fetch(`${API}/api/chat/send`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({sid, text: msg}) })
+      const j = await r.json()
+      setMessages(j.history || [])
+      if (speakOnReply) speak(j.reply || '')
+    } catch {
+      setMessages(m => [...m, {who:'user', text: msg}, {who:'bot', text:'❌ Błąd połączenia'}])
+    }
   }
-  const resetChat = () => { setMessages([]); localStorage.removeItem('mcm_messages') }
 
   return (
     <div style={{minHeight:'100vh',display:'grid',placeItems:'center',background:'#0b0f17',color:'#fff',fontFamily:'Inter, system-ui, sans-serif'}}>
-      <div style={{width:'min(900px,92vw)',background:'#111827',border:'1px solid #1f2937',borderRadius:16,boxShadow:'0 10px 40px rgba(0,0,0,.3)'}}>
+      <div style={{width:'min(960px,92vw)',background:'#111827',border:'1px solid #1f2937',borderRadius:16,boxShadow:'0 10px 40px rgba(0,0,0,.3)'}}>
         <div style={{padding:'12px 16px',borderBottom:'1px solid #1f2937',display:'flex',justifyContent:'space-between',alignItems:'center',gap:10}}>
           <div style={{display:'grid'}}>
             <strong>MeCloneMe — Onboarding</strong>
@@ -142,10 +147,11 @@ export default function App() {
             <div style={drop}>
               <div>Upuść zdjęcie tutaj lub kliknij</div>
               <input type="file" accept="image/*" style={{display:'none'}} id="f" onChange={async e=>{
-                const file = e.target.files?.[0]; if(!file) return
-                const fd = new FormData(); fd.append('file', file, file.name); if (sid) fd.append('sid', sid)
+                const file = e.target.files?.[0]; if(!file || !sid) return
+                const fd = new FormData(); fd.append('file', file, file.name); fd.append('sid', sid)
                 const r = await fetch(`${API}/api/upload/image`, {method:'POST', body: fd})
                 const j = await r.json(); alert(j.url ? `✅ Zapisano: ${j.url}` : 'OK')
+                fetch(`${API}/api/files?sid=${sid}`).then(r=>r.json()).then(setFiles).catch(()=>{})
               }}/>
             </div>
           </div>)}
@@ -157,7 +163,6 @@ export default function App() {
                 <div style={{display:'flex',gap:10}}>
                   <input value={input} onChange={e=>setInput(e.target.value)} placeholder="Napisz wiadomość…" style={{...inputBox, flex:1}}/>
                   <button style={btn} onClick={()=>send()}>Wyślij</button>
-                  <button style={{...btn,background:'#b91c1c'}} onClick={resetChat}>Reset</button>
                 </div>
                 <div style={{display:'grid',gap:8,marginTop:6}}>
                   {messages.map((m,idx)=>(<div key={idx} style={{opacity:.95}}><b>{m.who==='user'?'Ty':'Klon'}:</b> {m.text}</div>))}
@@ -165,8 +170,17 @@ export default function App() {
               </section>
 
               <section style={card}>
-                <label style={label}>TTS — mowa klona</label>
-                <input value={sayText} onChange={e=>setSayText(e.target.value)} style={input}/>
+                <label style={label}>Pliki w sesji</label>
+                <div style={{display:'grid',gap:6}}>
+                  <b>Audio:</b>
+                  {files.audio.length? files.audio.map(f=><div key={f.url}><a href={f.url} target="_blank">{f.name}</a> — {Math.round(f.bytes/1024)} KB</div>): <span>—</span>}
+                  <b style={{marginTop:8}}>Obrazy:</b>
+                  {files.image.length? files.image.map(f=><div key={f.url}><a href={f.url} target="_blank">{f.name}</a> — {Math.round(f.bytes/1024)} KB</div>): <span>—</span>}
+                </div>
+              </section>
+
+              <section style={card}>
+                <label style={label}>TTS / STT / Nagranie</label>
                 <div style={{display:'grid',gap:8,gridTemplateColumns:'1fr 1fr 1fr'}}>
                   <select value={voiceName} onChange={e=>setVoiceName(e.target.value)} style={input}>
                     {voices.map(v => <option key={v.name} value={v.name}>{v.name} ({v.lang})</option>)}
@@ -174,16 +188,11 @@ export default function App() {
                   <label style={mini}>Rate {rate.toFixed(2)}<input type="range" min="0.75" max="1.25" step="0.01" value={rate} onChange={e=>setRate(+e.target.value)} /></label>
                   <label style={mini}>Pitch {pitch.toFixed(2)}<input type="range" min="0.8" max="1.2" step="0.01" value={pitch} onChange={e=>setPitch(+e.target.value)} /></label>
                 </div>
-                <button style={btn} onClick={()=>speak()}>▶️ Powiedz</button>
-              </section>
-
-              <section style={card}>
-                <label style={label}>Nagranie + upload</label>
                 <div style={{display:'flex',gap:10}}>
-                  <button style={{...btn,background: recState==='rec' ? '#b91c1c' : '#1f2937'}}
-                          onClick={recState==='rec' ? stopRec : startRec}>
-                    {recState==='rec' ? '■ Stop' : '🎙️ Start'}
-                  </button>
+                  <button style={btn} onClick={()=>speak()}>▶️ Powiedz</button>
+                  {!recogOn ? <button style={btn} onClick={startSTT}>🎤 Start STT</button> : <button style={{...btn,background:'#b91c1c'}} onClick={stopSTT}>■ Stop STT</button>}
+                  <button style={btn} onClick={()=>setInput(transcript)}>↗️ Użyj transkrypcji</button>
+                  <button style={{...btn,background: recState==='rec' ? '#b91c1c' : '#1f2937'}} onClick={recState==='rec' ? stopRec : startRec}>{recState==='rec' ? '■ Stop' : '🎙️ Start'}</button>
                 </div>
                 <small style={{opacity:.8}}>{uploadMsg}</small>
               </section>
@@ -200,16 +209,7 @@ export default function App() {
     </div>
   )
 }
-
-function SpeakingDot({on}) {
-  return <span style={{
-    width:10,height:10,borderRadius:'50%',
-    background: on ? '#22d3ee' : '#334155',
-    boxShadow: on ? '0 0 12px #22d3ee' : 'none',
-    display:'inline-block'
-  }}/>
-}
-
+function SpeakingDot({on}){return <span style={{width:10,height:10,borderRadius:'50%',background:on?'#22d3ee':'#334155',boxShadow:on?'0 0 12px #22d3ee':'none',display:'inline-block'}}/>}
 const baseBox = { border:'1px solid #23304a', borderRadius:12, background:'#0b1220' }
 const btn = { background:'#1f2937', color:'#fff', border:'1px solid #2b364a', padding:'10px 14px', borderRadius:12, cursor:'pointer' }
 const drop = { height:120, ...baseBox, display:'grid', placeItems:'center', cursor:'pointer' }
