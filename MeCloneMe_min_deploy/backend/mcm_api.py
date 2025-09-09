@@ -5,16 +5,16 @@ from pydantic import BaseModel
 from typing import List, Dict, Any
 from pathlib import Path
 from uuid import uuid4
-import yaml, os
+import yaml
 
-app = FastAPI(title="MeCloneMe API", version="0.4")
+app = FastAPI(title="MeCloneMe API", version="0.4.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ---------- Paths / Persona ----------
 ROOT = Path(__file__).resolve().parents[1]
 PROFILE_PATH = ROOT / "clone" / "profile.yml"
 DATA_DIR = ROOT / "data"
-(DATA_DIR).mkdir(parents=True, exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 def load_profile() -> Dict[str, Any]:
     if PROFILE_PATH.exists():
@@ -28,18 +28,17 @@ PROFILE = load_profile()
 def persona():
     return PROFILE or {"name": "Superclone", "persona": {"role": "Asystent", "tone": "konkretny"}}
 
-# serwowanie plików (publicznie)
+# Pliki publiczne
 app.mount("/files", StaticFiles(directory=str(DATA_DIR)), name="files")
 
 # ---------- Prosta pamięć sesji (RAM) ----------
-SESS: Dict[str, Dict[str, Any]] = {}  # sid -> {"history": [{"who": "user|bot", "text": "..."}]}
+SESS: Dict[str, Dict[str, Any]] = {}  # sid -> {"history": [...]} 
 
 def get_hist(sid: str) -> List[Dict[str, str]]:
     return SESS.setdefault(sid, {"history": []})["history"]
 
 # ---------- Utils ----------
-STOPWORDS: List[str] = ["i","oraz","ale","że","to","na","w","we","o","u","z","za","do","dla","po","od",
-                        "jest","są","być","mam","mamy","czy","jak","co","się","nie","tak"]
+STOPWORDS: List[str] = ["i","oraz","ale","że","to","na","w","we","o","u","z","za","do","dla","po","od","jest","są","być","mam","mamy","czy","jak","co","się","nie","tak"]
 
 def extract_keywords(text: str, n: int = 3) -> List[str]:
     words = [w.strip(".,!?;:()[]\"'").lower() for w in (text or "").split()]
@@ -71,12 +70,16 @@ def generate_reply(user_text: str) -> str:
     raw = [f"{role}. Ton: {tone}.", "Plan: 1) wybierz mikro-krok, 2) 10 min, 3) wróć z wynikiem", f"Fokus: {fokus}", "Jestem przy Tobie — działamy"]
     return style_compact(raw)
 
-# ---------- API: health ----------
+# ---------- API ----------
 @app.get("/api/health")
 def health():
     return {"ok": True, "service": "mcm_api", "profile": (PROFILE.get("name") or "Superclone")}
 
-# ---------- API: sesje ----------
+@app.get("/api/version")
+def version():
+    return {"version": "0.4.1", "service": "mcm_api"}
+
+# Sesje
 @app.post("/api/session/new")
 def new_session():
     sid = uuid4().hex
@@ -90,17 +93,16 @@ def reset_session(sid: str = Form(...)):
     SESS[sid] = {"history": []}
     return {"ok": True}
 
+@app.post("/api/session/soft-reset")
+def soft_reset(sid: str = Form(...)):
+    SESS.setdefault(sid, {"history": []})["history"] = []
+    return {"ok": True}
+
 @app.get("/api/session/{sid}/history")
 def get_history(sid: str):
     return {"sid": sid, "history": get_hist(sid)}
 
-@app.post("/api/session/soft-reset")
-def soft_reset(sid: str = Form(...)):
-    # czyści RAM-ową historię, nie usuwa plików
-    SESS.setdefault(sid, {"history": []})["history"] = []
-    return {"ok": True}
-
-# ---------- API: chat z pamięcią ----------
+# Chat
 class Msg(BaseModel):
     sid: str
     text: str
@@ -115,7 +117,9 @@ def chat_send(msg: Msg):
     hist.append({"who": "bot", "text": bot})
     return {"reply": bot, "history": hist}
 
-# ---------- API: uploady + listing ----------
+# Uploady + listing
+from fastapi import HTTPException  # (import po to, by nie gubić z raise)
+
 @app.post("/api/upload/audio")
 async def upload_audio(file: UploadFile = File(...), sid: str = Form(None)):
     if not sid: raise HTTPException(400, "sid required")
@@ -123,7 +127,8 @@ async def upload_audio(file: UploadFile = File(...), sid: str = Form(None)):
     fname = file.filename or f"audio-{uuid4().hex}.webm"
     path = target_dir / fname
     with path.open("wb") as f:
-        while chunk := await file.read(8192): f.write(chunk)
+        while chunk := await file.read(8192):
+            f.write(chunk)
     return {"ok": True, "filename": fname, "bytes": path.stat().st_size, "url": f"/files/{sid}/audio/{fname}"}
 
 @app.post("/api/upload/image")
@@ -133,7 +138,8 @@ async def upload_image(file: UploadFile = File(...), sid: str = Form(None)):
     fname = file.filename or f"image-{uuid4().hex}.png"
     path = target_dir / fname
     with path.open("wb") as f:
-        while chunk := await file.read(8192): f.write(chunk)
+        while chunk := await file.read(8192):
+            f.write(chunk)
     return {"ok": True, "filename": fname, "bytes": path.stat().st_size, "url": f"/files/{sid}/image/{fname}"}
 
 @app.get("/api/files")
@@ -147,11 +153,6 @@ def list_files(sid: str):
                 out[kind].append({"name": p.name, "bytes": p.stat().st_size, "url": f"/files/{sid}/{kind}/{p.name}"})
     return out
 
-# ---------- legacy / simple endpoints ----------
 @app.post("/api/echo")
 async def echo(text: str):
     return {"echo": text}
-
-@app.get("/api/version")
-def version():
-    return {"version": "0.4", "service": "mcm_api"}
