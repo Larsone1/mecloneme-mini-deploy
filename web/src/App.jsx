@@ -119,6 +119,14 @@ export default function App() {
     }
   }
 
+  async function softReset() {
+    if (!sid) return;
+    const fd = new FormData(); fd.append('sid', sid);
+    await fetch(`${API}/api/session/soft-reset`, { method: 'POST', body: fd }).catch(()=>{});
+    const j = await (await fetch(`${API}/api/session/${sid}/history`)).json().catch(()=>({history:[]}));
+    setMessages(j.history || []);
+  }
+
   return (
     <div style={{minHeight:'100vh',display:'grid',placeItems:'center',background:'#0b0f17',color:'#fff',fontFamily:'Inter, system-ui, sans-serif'}}>
       <div style={{width:'min(960px,92vw)',background:'#111827',border:'1px solid #1f2937',borderRadius:16,boxShadow:'0 10px 40px rgba(0,0,0,.3)'}}>
@@ -181,6 +189,15 @@ export default function App() {
               </section>
 
               <section style={card}>
+                <label style={label}>Debug</label>
+                <div style={{display:'grid',gap:6}}>
+                  <div>API: <code>{API}</code></div>
+                  <div>SID: <code>{sid||'...'}</code></div>
+                  <button style={btn} onClick={()=>navigator.clipboard?.writeText(API)}>Kopiuj API URL</button>
+                </div>
+              </section>
+
+              <section style={card}>
                 <label style={label}>TTS / STT / Nagranie</label>
                 <div style={{display:'grid',gap:8,gridTemplateColumns:'1fr 1fr 1fr'}}>
                   <select value={voiceName} onChange={e=>setVoiceName(e.target.value)} style={input}>
@@ -202,9 +219,16 @@ export default function App() {
         </div>
 
         <div style={{display:'flex',gap:10,justifyContent:'space-between',padding:20,borderTop:'1px solid #1f2937'}}>
-          <button style={{...btn,opacity:i===0?.5:1}} disabled={i===0} onClick={()=>setI(x=>Math.max(0,x-1))}>← Wstecz</button>
-          {i<steps.length-1 ? (<button style={btn} onClick={()=>setI(x=>Math.min(steps.length-1,x+1))}>Dalej →</button>)
-                            : (<button style={{...btn,background:'#22c55e'}} onClick={()=>alert('Superklon: DEMO zakończone ✅')}>Zakończ</button>)}
+          <div style={{display:'flex',gap:10}}>
+            <button style={{...btn,opacity:i===0?.5:1}} disabled={i===0} onClick={()=>setI(x=>Math.max(0,x-1))}>← Wstecz</button>
+            {i<steps.length-1
+              ? <button style={btn} onClick={()=>setI(x=>Math.min(steps.length-1,x+1))}>Dalej →</button>
+              : <button style={{...btn,background:'#22c55e'}} onClick={()=>alert('Superklon: DEMO zakończone ✅')}>Zakończ</button>}
+          </div>
+          <div style={{display:'flex',gap:10}}>
+            <button style={{...btn,background:'#b45309'}} onClick={softReset}>Reset sesji (zostaw pliki)</button>
+            <button style={{...btn,background:'#0e7490'}} onClick={()=>localStorage.removeItem('mcm_sid') || location.reload()}>Nowa sesja (nowy SID)</button>
+          </div>
         </div>
       </div>
     </div>

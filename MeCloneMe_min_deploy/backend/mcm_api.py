@@ -94,6 +94,12 @@ def reset_session(sid: str = Form(...)):
 def get_history(sid: str):
     return {"sid": sid, "history": get_hist(sid)}
 
+@app.post("/api/session/soft-reset")
+def soft_reset(sid: str = Form(...)):
+    # czyści RAM-ową historię, nie usuwa plików
+    SESS.setdefault(sid, {"history": []})["history"] = []
+    return {"ok": True}
+
 # ---------- API: chat z pamięcią ----------
 class Msg(BaseModel):
     sid: str
