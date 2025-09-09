@@ -1,0 +1,7 @@
+- [ ] Pages live (link)
+- [x] Onboarding web (MVP)
+- [x] API health/echo/upload
+- [ ] STT (Whisper or browser) — TBA
+- [ ] TTS (SpeechSynthesis / Piper) — TBA
+- [x] Persona → clone/profile.yml
+- [x] Integracja UI ↔ API (health)
