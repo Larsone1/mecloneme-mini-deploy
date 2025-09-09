@@ -5,3 +5,4 @@
 - [ ] TTS (SpeechSynthesis / Piper) — TBA
 - [x] Persona → clone/profile.yml
 - [x] Integracja UI ↔ API (health)
+- [x] Voice MVP (TTS + mic upload)
