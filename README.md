@@ -9,3 +9,9 @@ MeCloneMe to system klonów-asystentów (web + mobile), który łączy onboardin
 cd web
 npm install
 npm run dev -- --host
+
+## Sesje i pliki
+- Endpoint: `POST /api/session/new` → `{ sid }`
+- Upload audio: `POST /api/upload/audio (file, sid)`
+- Upload image: `POST /api/upload/image (file, sid)`
+- Publiczny podgląd: `/files/{sid}/...`
