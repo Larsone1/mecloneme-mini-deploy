@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 const API = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+console.info('MCM API URL:', API)
 const steps = [
   { id: 1, title: 'Zgody', desc: 'Nadaj uprawnienia: kamera + mikrofon (demo).' },
   { id: 2, title: 'Selfie', desc: 'Zrób selfie / wybierz plik; zapis w sesji.' },
