@@ -129,6 +129,17 @@ export default function App() {
     setMessages(j.history || []);
   }
 
+  async function downloadExport() {
+    if (!sid) return;
+    const r = await fetch(`${API}/api/session/export?sid=${sid}`);
+    if (!r.ok) { alert('❌ Brak transkryptu'); return; }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `${sid}-history.json`; a.click();
+    URL.revokeObjectURL(url);
+  }
+
   return (
     <div style={{minHeight:'100vh',display:'grid',placeItems:'center',background:'#0b0f17',color:'#fff',fontFamily:'Inter, system-ui, sans-serif'}}>
       <div style={{width:'min(960px,92vw)',background:'#111827',border:'1px solid #1f2937',borderRadius:16,boxShadow:'0 10px 40px rgba(0,0,0,.3)'}}>
@@ -183,9 +194,9 @@ export default function App() {
               <section style={card}>
                 <label style={label}>Pliki w sesji</label>
                 <div style={{display:'grid',gap:6}}>
-                  <b>Audio:</b>
+                  <b>Audio ({files.audio?.length||0}):</b>
                   {files.audio.length? files.audio.map(f=><div key={f.url}><a href={f.url} target="_blank">{f.name}</a> — {Math.round(f.bytes/1024)} KB</div>): <span>—</span>}
-                  <b style={{marginTop:8}}>Obrazy:</b>
+                  <b style={{marginTop:8}}>Obrazy ({files.image?.length||0}):</b>
                   {files.image.length? files.image.map(f=><div key={f.url}><a href={f.url} target="_blank">{f.name}</a> — {Math.round(f.bytes/1024)} KB</div>): <span>—</span>}
                 </div>
               </section>
@@ -214,6 +225,7 @@ export default function App() {
                   <div>API: <code>{API}</code></div>
                   <div>SID: <code>{sid||'...'}</code></div>
                   <button style={btn} onClick={()=>navigator.clipboard?.writeText(API)}>Kopiuj API URL</button>
+                  <button style={btn} onClick={downloadExport}>Pobierz transkrypt (.json)</button>
                 </div>
               </section>
             </div>
