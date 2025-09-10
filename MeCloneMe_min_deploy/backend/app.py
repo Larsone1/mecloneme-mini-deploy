@@ -8,15 +8,14 @@ from starlette.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="MeCloneMe")
 
-# --- CORS for GH Pages ---
+# CORS for GitHub Pages
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=['https://larsone1.github.io'],
+    allow_origins=["https://larsone1.github.io", "http://localhost:5173"],
     allow_credentials=True,
-    allow_methods=['*'],
-    allow_headers=['*'],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
-# -------------------------
 BASE = Path(__file__).parent
 
 # statics
