@@ -9,6 +9,9 @@ from uuid import uuid4
 import yaml
 import json
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 VERSION = "0.4.2"
 

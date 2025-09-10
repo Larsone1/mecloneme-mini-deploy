@@ -5,3 +5,4 @@ python-multipart
 pydantic==2.9.2
 sqlmodel==0.0.22
 PyYAML
+python-dotenv==1.0.1
