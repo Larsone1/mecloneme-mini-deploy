@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 from typing import List, Dict, Any
 from pathlib import Path
@@ -157,6 +157,23 @@ def generate_reply(user_text: str) -> str:
 
 
 # ---------- API ----------
+
+
+@app.get("/", include_in_schema=False, response_class=HTMLResponse)
+def root():
+    return """<!doctype html>
+<meta charset="utf-8">
+<title>MeCloneMe API</title>
+<style>body{font-family:ui-sans-serif,system-ui;background:#0b0f14;color:#e5e7eb;padding:3rem}a{color:#93c5fd}</style>
+<h1>MeCloneMe API działa ✅</h1>
+<ul>
+  <li><a href="/api/health">/api/health</a></li>
+  <li><a href="/api/version">/api/version</a></li>
+  <li><a href="/docs">/docs (Swagger)</a></li>
+</ul>
+"""
+
+
 @app.get("/api/health")
 def health():
     return {

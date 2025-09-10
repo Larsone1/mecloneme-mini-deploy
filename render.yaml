@@ -1,10 +1,10 @@
 services:
   - type: web
-    name: mecloneme-backend
-    env: docker
+    name: mcm-api
+    env: python
     plan: free
+    buildCommand: pip install -r MeCloneMe_min_deploy/backend/requirements.txt
+    startCommand: uvicorn MeCloneMe_min_deploy.backend.mcm_api:app --host 0.0.0.0 --port $PORT
     autoDeploy: true
-    dockerfilePath: ./Dockerfile
-    envVars:
-      - key: PYTHONUNBUFFERED
-        value: "1"
+    healthCheckPath: /api/health
+    rootDir: .
