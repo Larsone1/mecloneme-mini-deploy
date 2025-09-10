@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+
 const API = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 console.info('MCM API URL:', API)
 
@@ -36,12 +37,12 @@ export default function App() {
   const s = steps[i]; const pct = ((i + 1) / steps.length) * 100
 
   useEffect(() => {
-    fetch(`${API}/api/health`).then(r=>r.json()).then(
+    fetch(`${API_BASE}/api/health`).then(r=>r.json()).then(
       () => setHealth('✅ backend OK'),
       () => setHealth('❌ backend OFF')
     )
     if (!sid) {
-      fetch(`${API}/api/session/new`, {method:'POST'}).then(r=>r.json()).then(j=>{
+      fetch(`${API_BASE}/api`, {method:'POST'}).then(r=>r.json()).then(j=>{
         setSid(j.sid); localStorage.setItem('mcm_sid', j.sid)
       })
     }
