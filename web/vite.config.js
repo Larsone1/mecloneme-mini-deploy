@@ -1,9 +1,9 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-// https://vitejs.dev/config/
+// DLA GitHub Pages repo: larsonel/mecloneme-mini-deploy
 export default defineConfig({
-  plugins: [react()],
-  // GH Pages pod ścieżką /mecloneme-mini-deploy/
   base: "/mecloneme-mini-deploy/",
+  plugins: [react()],
+  build: { outDir: "dist", sourcemap: true },
 });
