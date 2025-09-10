@@ -1,11 +1,20 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware, Request
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pathlib import Path
 import time
 
-app = FastAPI(title="MeCloneMe")
+\1
+# CORS for GitHub Pages
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=['https://larsone1.github.io', 'http://localhost:5173'],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 BASE = Path(__file__).parent
 
 # statics
