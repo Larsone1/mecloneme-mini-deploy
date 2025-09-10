@@ -410,7 +410,7 @@ var require_react_development = __commonJS({
         childKey = "" === nameSoFar ? "." : nameSoFar + ":";
         if (isArrayImpl(children))
           for (var i = 0; i < children.length; i++)
-            (nameSoFar = children[i]),
+            ((nameSoFar = children[i]),
               (type = childKey + getElementKey(nameSoFar, i)),
               (invokeCallback += mapIntoArray(
                 nameSoFar,
@@ -418,7 +418,7 @@ var require_react_development = __commonJS({
                 escapedPrefix,
                 type,
                 callback,
-              ));
+              )));
         else if (((i = getIteratorFn(children)), "function" === typeof i))
           for (
             i === children.entries &&
@@ -432,7 +432,7 @@ var require_react_development = __commonJS({
             !(nameSoFar = children.next()).done;
 
           )
-            (nameSoFar = nameSoFar.value),
+            ((nameSoFar = nameSoFar.value),
               (type = childKey + getElementKey(nameSoFar, i++)),
               (invokeCallback += mapIntoArray(
                 nameSoFar,
@@ -440,7 +440,7 @@ var require_react_development = __commonJS({
                 escapedPrefix,
                 type,
                 callback,
-              ));
+              )));
         else if ("object" === type) {
           if ("function" === typeof children.then)
             return mapIntoArray(
@@ -477,11 +477,11 @@ var require_react_development = __commonJS({
           ctor.then(
             function (moduleObject) {
               if (0 === payload._status || -1 === payload._status)
-                (payload._status = 1), (payload._result = moduleObject);
+                ((payload._status = 1), (payload._result = moduleObject));
             },
             function (error) {
               if (0 === payload._status || -1 === payload._status)
-                (payload._status = 2), (payload._result = error);
+                ((payload._status = 2), (payload._result = error));
             },
           );
           -1 === payload._status &&
@@ -594,8 +594,8 @@ var require_react_development = __commonJS({
             }
             queue.length = 0;
           } catch (error) {
-            queue.splice(0, i + 1),
-              ReactSharedInternals.thrownErrors.push(error);
+            (queue.splice(0, i + 1),
+              ReactSharedInternals.thrownErrors.push(error));
           } finally {
             isFlushing = false;
           }
@@ -812,10 +812,10 @@ var require_react_development = __commonJS({
         }
         if (0 < ReactSharedInternals.thrownErrors.length)
           throw (
-            (popActScope(prevActQueue, prevActScopeDepth),
+            popActScope(prevActQueue, prevActScopeDepth),
             (callback = aggregateErrors(ReactSharedInternals.thrownErrors)),
             (ReactSharedInternals.thrownErrors.length = 0),
-            callback)
+            callback
           );
         if (
           null !== result &&
@@ -839,14 +839,14 @@ var require_react_development = __commonJS({
                   popActScope(prevActQueue, prevActScopeDepth);
                   if (0 === prevActScopeDepth) {
                     try {
-                      flushActQueue(queue),
+                      (flushActQueue(queue),
                         enqueueTask(function () {
                           return recursivelyFlushAsyncActWork(
                             returnValue,
                             resolve,
                             reject,
                           );
-                        });
+                        }));
                     } catch (error$0) {
                       ReactSharedInternals.thrownErrors.push(error$0);
                     }
@@ -889,9 +889,9 @@ var require_react_development = __commonJS({
           (ReactSharedInternals.actQueue = null));
         if (0 < ReactSharedInternals.thrownErrors.length)
           throw (
-            ((callback = aggregateErrors(ReactSharedInternals.thrownErrors)),
+            (callback = aggregateErrors(ReactSharedInternals.thrownErrors)),
             (ReactSharedInternals.thrownErrors.length = 0),
-            callback)
+            callback
           );
         return {
           then: function (resolve, reject) {
@@ -974,10 +974,10 @@ var require_react_development = __commonJS({
           element._debugTask,
         );
         for (key = 2; key < arguments.length; key++)
-          (owner = arguments[key]),
+          ((owner = arguments[key]),
             isValidElement(owner) &&
               owner._store &&
-              (owner._store.validated = 1);
+              (owner._store.validated = 1));
         return props;
       };
       exports.createContext = function (defaultValue) {
@@ -1155,7 +1155,7 @@ var require_react_development = __commonJS({
         } catch (error) {
           reportGlobalError(error);
         } finally {
-          null === prevTransition &&
+          (null === prevTransition &&
             currentTransition._updatedFibers &&
             ((scope = currentTransition._updatedFibers.size),
             currentTransition._updatedFibers.clear(),
@@ -1163,7 +1163,7 @@ var require_react_development = __commonJS({
               console.warn(
                 "Detected a large number of updates inside startTransition. If this is due to a subscription please re-write it to use React provided hooks. Otherwise concurrent mode guarantees are off the table.",
               )),
-            (ReactSharedInternals.T = prevTransition);
+            (ReactSharedInternals.T = prevTransition));
         }
       };
       exports.unstable_useCacheRefresh = function () {
