@@ -1,5 +1,9 @@
-web/force_refresh_once.js
-web/node_modules
-web/dist
-web/.vite
-*.min.js
+# --- Project ignores for Prettier ---
+node_modules/
+dist/
+build/
+coverage/
+
+# backend static assets are not part of the web build
+backend/static/
+backend/static/js/force_refresh_once.js
