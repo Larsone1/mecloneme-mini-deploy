@@ -27,7 +27,15 @@ else:
     ALLOW_ORIGINS = [o.strip() for o in _origins.split(",") if o.strip()]
     ALLOW_CREDS = True
 
-app = FastAPI(title="MeCloneMe API", version=VERSION)
+\1
+# CORS for GitHub Pages
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=['https://larsone1.github.io', 'http://localhost:5173'],
+    allow_credentials=True,
+    allow_methods=['*'],
+    allow_headers=['*'],
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOW_ORIGINS,
