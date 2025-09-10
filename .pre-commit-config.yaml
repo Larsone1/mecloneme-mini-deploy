@@ -13,9 +13,9 @@ repos:
     hooks:
       - id: prettier
         name: prettier
-        entry: web/node_modules/.bin/prettier --write
+        entry: npm run format
         language: system
-        files: ^web/.*\.(js|jsx|ts|tsx|css|html|json|md|yml|yaml)$
+        files: ^.*\.(md|json|yml|yaml)$
         types: [file]
-        pass_filenames: true
-        exclude: ^web/force_refresh_once\.js$|^web/src/App\.jsx$
+        pass_filenames: false
+        exclude: ^web/
