@@ -1,21 +1,20 @@
 repos:
-  - repo: https://github.com/psf/black
-    rev: 24.8.0
-    hooks:
-      - id: black
-        language_version: python3
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.6.4
-    hooks:
-      - id: ruff
-        args: [--fix]
   - repo: local
     hooks:
+      - id: black
+        name: black
+        entry: python3 -m black
+        language: system
+        types_or: [python]
+      - id: ruff
+        name: ruff
+        entry: python3 -m ruff check --fix
+        language: system
+        types_or: [python]
       - id: prettier
         name: prettier
-        entry: web/node_modules/.bin/prettier --write
+        entry: web/node_modules/.bin/prettier --write --ignore-unknown --ignore-path .prettierignore
         language: system
-        files: ^web/.*\.(js|jsx|ts|tsx|css|html|json|md|yml|yaml)$
-        types: [file]
+        # tylko frontend + pliki tekstowe w repo
+        files: ^web/|^.*\.(md|json|ya?ml)$
         pass_filenames: true
-        exclude: ^web/force_refresh_once\.js$|^web/src/App\.jsx$
